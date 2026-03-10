@@ -1,0 +1,119 @@
+version: "3.9"
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    volumes:
+      - ./prometheus/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro,Z
+      - ./prometheus/config/blackbox.yml:/etc/blackbox_exporter/blackbox.yml:ro,Z
+      - ./prometheus/config/snmp.yml:/etc/snmp_exporter/snmp.yml:ro,Z
+      - prometheus-data:/prometheus:Z
+    networks:
+      - proxy
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=false"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    env_file:
+      - ./grafana.env
+    environment:
+      - GF_SERVER_ROOT_URL=https://grafana.az-lab.dev
+    volumes:
+      - ./grafana/data:/var/lib/grafana:Z
+    networks:
+      - proxy
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+
+      # HTTPS router
+      - "traefik.http.routers.grafana.rule=Host(`grafana.az-lab.dev`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=le"
+      - "traefik.http.routers.grafana.priority=100"
+      - "traefik.http.routers.grafana.middlewares=authelia-auth@file,strip-www-auth@file"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+      # HTTP -> HTTPS redirect
+      - "traefik.http.routers.grafana-http.rule=Host(`grafana.az-lab.dev`)"
+      - "traefik.http.routers.grafana-http.entrypoints=web"
+      - "traefik.http.routers.grafana-http.priority=90"
+      - "traefik.http.routers.grafana-http.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+
+  node_exporter:
+    image: prom/node-exporter:latest
+    container_name: node_exporter
+    command:
+      - "--path.rootfs=/host"
+    pid: host
+    volumes:
+      - /:/host:ro,rslave,Z
+    networks:
+      - proxy
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=false"
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro,Z
+      - /var/run:/var/run:rw,Z
+      - /sys:/sys:ro,Z
+      - /var/lib/containers:/var/lib/containers:ro,Z
+      - /var/lib/cni:/var/lib/cni:ro,Z
+      - /run:/run:rw,Z
+    networks:
+      - proxy
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=false"
+
+  blackbox:
+    image: prom/blackbox-exporter:latest
+    container_name: blackbox
+    command:
+      - "--config.file=/etc/blackbox_exporter/blackbox.yml"
+    volumes:
+      - ./prometheus/config/blackbox.yml:/etc/blackbox_exporter/blackbox.yml:ro,Z
+    networks:
+      - proxy
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=false"
+
+  snmp_exporter:
+    image: prom/snmp-exporter:latest
+    container_name: snmp_exporter
+    command:
+      - "--config.file=/etc/snmp_exporter/snmp.yml"
+    volumes:
+      - ./prometheus/config/snmp.yml:/etc/snmp_exporter/snmp.yml:ro,Z
+    networks:
+      - proxy
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=false"
+
+  # podman_exporter runs standalone (requires --userns=keep-id, not supported by podman-compose)
+  # Managed by: ~/.config/systemd/user/podman-exporter.service
+
+networks:
+  proxy:
+    external: true
+
+volumes:
+  prometheus-data:

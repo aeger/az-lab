@@ -1,0 +1,26 @@
+services:
+  hbbs:
+    image: docker.io/rustdesk/rustdesk-server:latest
+    container_name: hbbs
+    restart: unless-stopped
+    command: ["hbbs", "-r", "remote.az-lab.dev:21117"]
+    environment:
+      - ALWAYS_USE_RELAY=Y
+    volumes:
+      - ./data:/root
+    ports:
+      - "21115:21115/tcp"      # NAT type test
+      - "21116:21116/tcp"      # TCP hole punching / connection service
+      - "21116:21116/udp"      # ID registration / heartbeat (UDP)
+      - "21118:21118/tcp"      # web client support (ws/id)
+
+  hbbr:
+    image: docker.io/rustdesk/rustdesk-server:latest
+    container_name: hbbr
+    restart: unless-stopped
+    command: ["hbbr"]
+    volumes:
+      - ./data:/root
+    ports:
+      - "21117:21117/tcp"      # relay
+      - "21119:21119/tcp"      # web client relay (ws/relay)

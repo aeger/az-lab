@@ -22,9 +22,15 @@ infrastructure/traefik/*.json
 infrastructure/traefik/*.txt
 
 # Service runtime data and volumes
-**/config/
 **/data/
 !docs/
+
+# Service config (runtime/user-specific)
+services/webtop/config/
+services/monitoring/grafana/
+
+# Authelia config (contains secrets)
+infrastructure/authelia/config/
 
 # Podman/Docker
 *.log

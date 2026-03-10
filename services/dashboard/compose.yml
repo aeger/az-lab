@@ -1,0 +1,127 @@
+name: az-lab-dashboard
+
+services:
+  # ─── Dashboard (Next.js) ─────────────────────────────────────────────────────
+  dashboard:
+    image: az-dashboard:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: az-dashboard
+    restart: unless-stopped
+    environment:
+      - IMMICH_URL=${IMMICH_URL:-http://immich-server:2283}
+      - IMMICH_API_KEY=${IMMICH_API_KEY:-}
+      - UPTIME_KUMA_URL=${UPTIME_KUMA_URL:-http://uptime-kuma:3001}
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-}
+      - ADGUARD_URL=${ADGUARD_URL:-}
+      - ADGUARD_USERNAME=${ADGUARD_USERNAME:-}
+      - ADGUARD_PASSWORD=${ADGUARD_PASSWORD:-}
+      - PORTAINER_URL=${PORTAINER_URL:-http://portainer:9000}
+      - PORTAINER_API_KEY=${PORTAINER_API_KEY:-}
+      - GOOGLE_CALENDAR_ICAL_URL=${GOOGLE_CALENDAR_ICAL_URL:-}
+      - GOOGLE_SERVICE_ACCOUNT_KEY=${GOOGLE_SERVICE_ACCOUNT_KEY:-}
+      - GOOGLE_CALENDAR_IDS=${GOOGLE_CALENDAR_IDS:-}
+      - ADMIN_SECRET=${ADMIN_SECRET:-changeme}
+      - RUSTDESK_HOST=${RUSTDESK_HOST:-}
+      - RUSTDESK_KEY=${RUSTDESK_KEY:-}
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data:rw
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`home.az-lab.dev`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls=true"
+      # TODO: Re-evaluate Authelia SSO for external access (photos, portainer, etc.)
+      - "traefik.http.routers.dashboard.middlewares=lan-allow@file"
+      - "traefik.http.services.dashboard.loadbalancer.server.port=3000"
+
+  # ─── Uptime Kuma ─────────────────────────────────────────────────────────────
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    restart: unless-stopped
+    volumes:
+      - uptime-kuma-data:/app/data
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.uptime-kuma.rule=Host(`uptime.az-lab.dev`)"
+      - "traefik.http.routers.uptime-kuma.entrypoints=websecure"
+      - "traefik.http.routers.uptime-kuma.tls=true"
+      - "traefik.http.routers.uptime-kuma.middlewares=lan-allow@file"
+      - "traefik.http.services.uptime-kuma.loadbalancer.server.port=3001"
+
+  # ─── Immich ──────────────────────────────────────────────────────────────────
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:release
+    container_name: immich-server
+    restart: unless-stopped
+    environment:
+      - DB_HOSTNAME=immich-postgres
+      - DB_USERNAME=${IMMICH_DB_USERNAME:-postgres}
+      - DB_PASSWORD=${IMMICH_DB_PASSWORD:-postgres}
+      - DB_DATABASE_NAME=${IMMICH_DB_NAME:-immich}
+      - REDIS_HOSTNAME=immich-redis
+      - UPLOAD_LOCATION=/usr/src/app/upload
+    volumes:
+      - immich-upload:/usr/src/app/upload
+    depends_on:
+      - immich-redis
+      - immich-postgres
+    networks:
+      - proxy
+      - immich-internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.immich.rule=Host(`photos.az-lab.dev`)"
+      - "traefik.http.routers.immich.entrypoints=websecure"
+      - "traefik.http.routers.immich.tls=true"
+      - "traefik.http.routers.immich.middlewares=lan-allow@file"
+      - "traefik.http.services.immich.loadbalancer.server.port=2283"
+      - "traefik.docker.network=proxy"
+
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:release
+    container_name: immich-machine-learning
+    restart: unless-stopped
+    volumes:
+      - immich-model-cache:/cache
+    networks:
+      - immich-internal
+
+  immich-redis:
+    image: redis:6.2-alpine
+    container_name: immich-redis
+    restart: unless-stopped
+    networks:
+      - immich-internal
+
+  immich-postgres:
+    image: tensorchord/pgvecto-rs:pg14-v0.2.0
+    container_name: immich-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${IMMICH_DB_USERNAME:-postgres}
+      - POSTGRES_PASSWORD=${IMMICH_DB_PASSWORD:-postgres}
+      - POSTGRES_DB=${IMMICH_DB_NAME:-immich}
+    volumes:
+      - immich-postgres:/var/lib/postgresql/data
+    networks:
+      - immich-internal
+
+volumes:
+  uptime-kuma-data:
+  immich-upload:
+  immich-model-cache:
+  immich-postgres:
+
+networks:
+  proxy:
+    external: true
+  immich-internal:
+    internal: true

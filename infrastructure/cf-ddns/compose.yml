@@ -1,0 +1,19 @@
+services:
+  cloudflare-ddns:
+    image: favonia/cloudflare-ddns:latest
+    container_name: cf-ddns
+    network_mode: host
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [all]
+    security_opt: [no-new-privileges:true]
+    environment:
+      - CLOUDFLARE_API_TOKEN=${CF_API_TOKEN}
+      - DOMAINS=${CF_DOMAINS:-az-lab.dev,*.az-lab.dev,hello.az-lab.dev}
+      - PROXIED=${CF_PROXIED:-true}
+      - IP6_PROVIDER=none
+      - UPDATE_CRON=@every 5m
+      - TZ=America/Phoenix
+    env_file:
+      - .env

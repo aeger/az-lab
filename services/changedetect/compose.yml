@@ -1,0 +1,24 @@
+services:
+  changedetection:
+    image: ghcr.io/dgtlmoon/changedetection.io
+    container_name: changedetection
+    restart: unless-stopped
+    networks:
+      - proxy
+    volumes:
+      - changedetection-data:/datastore:Z
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.changedetect.rule=Host(`changedetect.az-lab.dev`)"
+      - "traefik.http.routers.changedetect.entrypoints=websecure"
+      - "traefik.http.routers.changedetect.tls=true"
+      - "traefik.http.routers.changedetect.tls.certresolver=le"
+      - "traefik.http.services.changedetect.loadbalancer.server.port=5000"
+
+networks:
+  proxy:
+    external: true
+
+volumes:
+  changedetection-data:
+    external: true

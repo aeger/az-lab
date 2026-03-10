@@ -1,0 +1,21 @@
+modules:
+  mikrotik:
+    walk:
+      # system
+      - sysDescr
+      - sysUpTime
+      - sysName
+      # interfaces
+      - ifTable
+      - ifXTable
+      # add these:
+      - hrProcessorLoad
+      - hrStorageTable
+      - hrMemorySize
+    lookups:
+      - source_indexes: [ifIndex]
+        lookup: ifDescr
+      - source_indexes: [ifIndex]
+        lookup: ifName
+      - source_indexes: [ifIndex]
+        lookup: ifAlias

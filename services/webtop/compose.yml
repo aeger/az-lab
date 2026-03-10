@@ -25,6 +25,8 @@ services:
     volumes:
       - ./config:/config
       - /dev/shm:/dev/shm
+      - /home/almty1:/host/home:ro
+      - /home/almty1/azlab:/host/azlab
 
     shm_size: "1gb"
 
