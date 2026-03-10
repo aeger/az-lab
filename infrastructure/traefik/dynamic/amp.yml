@@ -1,0 +1,18 @@
+http:
+  routers:
+    amp-public:
+      rule: "Host(`games.az-lab.dev`)"
+      service: amp-service
+      entryPoints:
+        - websecure
+      middlewares:
+        - authelia-auth@file
+        - strip-www-auth@file
+      tls:
+        certResolver: le
+
+  services:
+    amp-service:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.130:8080"

@@ -1,0 +1,15 @@
+# Authelia SSO - Rootless Podman Compose
+# Place in ~/authelia/
+# Start: podman-compose up -d
+
+services:
+  authelia:
+    image: authelia/authelia:4
+    container_name: authelia
+    restart: unless-stopped
+    network_mode: host  # host network so Traefik can reach it at 127.0.0.1:9091
+    environment:
+      TZ: America/Phoenix
+    volumes:
+      - ./config:/config:Z
+      - ./data:/data:Z

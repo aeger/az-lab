@@ -1,0 +1,40 @@
+# Secrets and credentials
+.env
+*.env
+!.env.example
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+credentials.json
+token.json
+
+# Authelia sensitive data
+infrastructure/authelia/data/
+infrastructure/authelia/config/users_database.yml
+infrastructure/authelia/config/hash.txt
+
+# Traefik runtime data
+infrastructure/traefik/data/
+infrastructure/traefik/certs/
+infrastructure/traefik/*.json
+infrastructure/traefik/*.txt
+
+# Service runtime data and volumes
+**/config/
+**/data/
+!docs/
+
+# Podman/Docker
+*.log
+*.pid
+
+# OS
+.DS_Store
+Thumbs.db
+*~
+
+# IDE
+.vscode/
+.idea/

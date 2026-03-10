@@ -1,0 +1,36 @@
+http:
+  routers:
+    authelia:
+      rule: Host(`auth.az-lab.dev`)
+      entryPoints:
+        - websecure
+      priority: 100
+      service: authelia
+      tls:
+        certResolver: le
+
+  services:
+    authelia:
+      loadBalancer:
+        servers:
+          - url: http://192.168.1.181:9091
+        passHostHeader: true
+
+  middlewares:
+    authelia-auth:
+      forwardAuth:
+        address: http://192.168.1.181:9091/api/authz/forward-auth
+        trustForwardHeader: true
+        authResponseHeaders:
+          - Remote-User
+          - Remote-Groups
+          - Remote-Name
+          - Remote-Email
+        authRequestHeaders:
+          - Accept
+          - Cookie
+
+    strip-www-auth:
+      headers:
+        customResponseHeaders:
+          WWW-Authenticate: ""

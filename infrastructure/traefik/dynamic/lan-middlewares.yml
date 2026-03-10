@@ -1,0 +1,12 @@
+http:
+  middlewares:
+    lan-allow:
+      ipAllowList:
+        sourceRange:
+          - "192.168.1.0/24"
+          - "10.7.0.0/24"
+          - "10.89.0.0/16"
+
+    lan-auth:
+      basicAuth:
+        usersFile: "/secrets/traefik.htpasswd"

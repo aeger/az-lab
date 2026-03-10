@@ -1,0 +1,24 @@
+http:
+  routers:
+    portainer:
+      rule: "Host(`portainer.az-lab.dev`)"
+      entryPoints:
+        - websecure
+      service: portainer
+      tls:
+        certResolver: le
+      middlewares:
+        - authelia-auth@file
+        - strip-www-auth@file
+
+  services:
+    portainer:
+      loadBalancer:
+        serversTransport: portainer-transport
+        servers:
+          - url: "https://portainer:9443"
+        passHostHeader: true
+
+  serversTransports:
+    portainer-transport:
+      insecureSkipVerify: true
