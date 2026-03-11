@@ -1,0 +1,19 @@
+http:
+  routers:
+    lldap:
+      rule: Host(`lldap.az-lab.dev`)
+      entryPoints:
+        - websecure
+      service: lldap
+      tls:
+        certResolver: le
+      middlewares:
+        - lan-allow@file
+        - authelia-auth@file
+
+  services:
+    lldap:
+      loadBalancer:
+        servers:
+          - url: http://lldap:17170
+        passHostHeader: true

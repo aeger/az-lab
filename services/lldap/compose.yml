@@ -1,0 +1,16 @@
+services:
+  lldap:
+    image: lldap/lldap:latest
+    container_name: lldap
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3890:3890"
+    volumes:
+      - ./data:/data
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
