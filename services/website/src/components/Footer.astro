@@ -1,0 +1,53 @@
+---
+const year = new Date().getFullYear();
+---
+
+<footer class="footer">
+  <div class="container footer-inner">
+    <div class="footer-brand">
+      <span class="logo-mark">az</span><span class="logo-dot">.</span>lab
+    </div>
+    <p class="footer-copy">&copy; {year} Jeff Cook. Built with intention.</p>
+  </div>
+</footer>
+
+<style>
+  .footer {
+    padding: var(--space-2xl) 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .footer-inner {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .footer-brand {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+  }
+
+  .logo-mark {
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .logo-dot {
+    color: var(--accent-warm);
+  }
+
+  .footer-copy {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+  }
+
+  @media (max-width: 640px) {
+    .footer-inner {
+      flex-direction: column;
+      gap: var(--space-sm);
+      text-align: center;
+    }
+  }
+</style>

@@ -1,0 +1,60 @@
+---
+interface Props {
+  title: string;
+  description?: string;
+}
+
+const {
+  title,
+  description = 'Jeff Cook — Developer, Infrastructure Engineer, and Technology Consultant',
+} = Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <meta name="author" content="Jeff Cook" />
+
+    <!-- Open Graph -->
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://www.az-lab.dev" />
+
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+
+    <title>{title}</title>
+  </head>
+  <body>
+    <slot />
+
+    <script>
+      // Intersection Observer for reveal animations
+      const observer = new IntersectionObserver(
+        (entries) => {
+          entries.forEach((entry) => {
+            if (entry.isIntersecting) {
+              entry.target.classList.add('visible');
+            }
+          });
+        },
+        { threshold: 0.1, rootMargin: '0px 0px -40px 0px' }
+      );
+
+      document.querySelectorAll('.reveal').forEach((el) => observer.observe(el));
+    </script>
+  </body>
+</html>
+
+<style is:global>
+  @import '../styles/global.css';
+</style>

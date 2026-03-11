@@ -32,6 +32,10 @@ services/monitoring/grafana/
 # Authelia config (contains secrets)
 infrastructure/authelia/config/
 
+# Node.js
+node_modules/
+dist/
+
 # Podman/Docker
 *.log
 *.pid

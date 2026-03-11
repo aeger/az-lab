@@ -1,0 +1,150 @@
+---
+const services = [
+  {
+    icon: '01',
+    title: 'Infrastructure Design',
+    description:
+      'Container orchestration, reverse proxy configuration, monitoring stacks, and network architecture. I design systems that scale without the complexity tax.',
+    tags: ['Podman', 'Docker', 'Traefik', 'Networking'],
+  },
+  {
+    icon: '02',
+    title: 'Platform Engineering',
+    description:
+      'Self-hosted platforms that replace expensive SaaS. Auth systems, CI/CD pipelines, observability, and automated deployments — all on infrastructure you own.',
+    tags: ['SSO', 'Monitoring', 'CI/CD', 'Automation'],
+  },
+  {
+    icon: '03',
+    title: 'Development & Integration',
+    description:
+      'Full-stack web applications, API design, and system integration. From clean front-end interfaces to the backend services that power them.',
+    tags: ['TypeScript', 'Node.js', 'Python', 'APIs'],
+  },
+  {
+    icon: '04',
+    title: 'Consulting & Advisory',
+    description:
+      'Architecture reviews, migration planning, and technology strategy. I help teams make better infrastructure decisions before they become expensive mistakes.',
+    tags: ['Architecture', 'Migration', 'Strategy'],
+  },
+];
+---
+
+<section id="services" class="section">
+  <div class="container">
+    <div class="section-label reveal">Services</div>
+    <h2 class="section-title reveal">What I can build for you.</h2>
+    <p class="services-intro reveal">
+      Every engagement starts with understanding your problem.
+      I don't sell hours — I deliver outcomes.
+    </p>
+
+    <div class="services-grid reveal-stagger">
+      {services.map((service) => (
+        <div class="service-card reveal">
+          <div class="service-number">{service.icon}</div>
+          <h3 class="service-title">{service.title}</h3>
+          <p class="service-desc">{service.description}</p>
+          <div class="service-tags">
+            {service.tags.map((tag) => (
+              <span class="service-tag">{tag}</span>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  </div>
+</section>
+
+<style>
+  .services-intro {
+    color: var(--text-secondary);
+    font-size: var(--text-lg);
+    max-width: 480px;
+    margin-bottom: var(--space-2xl);
+  }
+
+  .services-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--space-lg);
+  }
+
+  .service-card {
+    padding: var(--space-2xl);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    transition: all var(--duration-base) var(--ease-out);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .service-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-warm));
+    opacity: 0;
+    transition: opacity var(--duration-base) var(--ease-out);
+  }
+
+  .service-card:hover {
+    background: var(--bg-card-hover);
+    border-color: var(--border-hover);
+    transform: translateY(-2px);
+  }
+
+  .service-card:hover::before {
+    opacity: 1;
+  }
+
+  .service-number {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--accent);
+    opacity: 0.6;
+    margin-bottom: var(--space-lg);
+    letter-spacing: 0.1em;
+  }
+
+  .service-title {
+    font-size: var(--text-xl);
+    font-weight: 600;
+    margin-bottom: var(--space-md);
+    letter-spacing: -0.01em;
+  }
+
+  .service-desc {
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    line-height: 1.8;
+    margin-bottom: var(--space-lg);
+  }
+
+  .service-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-xs);
+  }
+
+  .service-tag {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 100px;
+    background: rgba(255,255,255,0.04);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+  }
+
+  @media (max-width: 768px) {
+    .services-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

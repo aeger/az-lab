@@ -1,0 +1,177 @@
+/* ═══════════════════════════════════════════════════════════
+   az-lab.dev — Design System
+   Technical precision meets creative warmth
+   ═══════════════════════════════════════════════════════════ */
+
+:root {
+  /* Color palette — dark with warm accents */
+  --bg-primary: #0a0a0f;
+  --bg-secondary: #12121a;
+  --bg-card: #16161f;
+  --bg-card-hover: #1c1c28;
+
+  --text-primary: #e8e6e3;
+  --text-secondary: #9a9a9a;
+  --text-muted: #5a5a6a;
+
+  --accent: #4f8fea;
+  --accent-warm: #e8914f;
+  --accent-glow: rgba(79, 143, 234, 0.15);
+  --accent-warm-glow: rgba(232, 145, 79, 0.12);
+
+  --border: rgba(255, 255, 255, 0.06);
+  --border-hover: rgba(255, 255, 255, 0.12);
+
+  /* Typography */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 2rem;
+  --text-4xl: 2.75rem;
+  --text-5xl: 3.5rem;
+
+  /* Spacing */
+  --space-xs: 0.25rem;
+  --space-sm: 0.5rem;
+  --space-md: 1rem;
+  --space-lg: 1.5rem;
+  --space-xl: 2rem;
+  --space-2xl: 3rem;
+  --space-3xl: 5rem;
+  --space-4xl: 8rem;
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --duration-fast: 150ms;
+  --duration-base: 300ms;
+  --duration-slow: 600ms;
+
+  /* Layout */
+  --max-width: 1100px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+}
+
+/* ── Reset ──────────────────────────────────────────────── */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.7;
+  overflow-x: hidden;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  transition: color var(--duration-fast) var(--ease-out);
+}
+
+a:hover {
+  color: var(--accent-warm);
+}
+
+img {
+  max-width: 100%;
+  display: block;
+}
+
+/* ── Utilities ──────────────────────────────────────────── */
+
+.container {
+  width: 100%;
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: 0 var(--space-xl);
+}
+
+.section {
+  padding: var(--space-4xl) 0;
+}
+
+.section-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--accent);
+  margin-bottom: var(--space-md);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.section-label::before {
+  content: '';
+  display: block;
+  width: 24px;
+  height: 1px;
+  background: var(--accent);
+  opacity: 0.5;
+}
+
+.section-title {
+  font-size: var(--text-3xl);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  margin-bottom: var(--space-lg);
+}
+
+/* ── Reveal Animation ───────────────────────────────────── */
+
+.reveal {
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity var(--duration-slow) var(--ease-out),
+              transform var(--duration-slow) var(--ease-out);
+}
+
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Stagger children */
+.reveal-stagger > .reveal:nth-child(1) { transition-delay: 0ms; }
+.reveal-stagger > .reveal:nth-child(2) { transition-delay: 80ms; }
+.reveal-stagger > .reveal:nth-child(3) { transition-delay: 160ms; }
+.reveal-stagger > .reveal:nth-child(4) { transition-delay: 240ms; }
+.reveal-stagger > .reveal:nth-child(5) { transition-delay: 320ms; }
+
+/* ── Responsive ─────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  :root {
+    --text-4xl: 2rem;
+    --text-5xl: 2.5rem;
+    --text-3xl: 1.5rem;
+    --space-4xl: 4rem;
+  }
+
+  .container {
+    padding: 0 var(--space-lg);
+  }
+}

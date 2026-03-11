@@ -1,0 +1,163 @@
+---
+const projects = [
+  {
+    title: 'az-lab Infrastructure',
+    description:
+      'Production home lab running 10+ containerized services with zero-downtime deployments, automated TLS, SSO authentication, and full observability.',
+    stack: ['Podman', 'Traefik', 'Authelia', 'Prometheus', 'Grafana'],
+    link: 'https://github.com/aeger/az-lab',
+    status: 'Live',
+  },
+  {
+    title: 'Monitoring Pipeline',
+    description:
+      'End-to-end observability stack: Prometheus metrics collection, Grafana dashboards, SNMP polling for network gear, blackbox probes, and container resource tracking.',
+    stack: ['Prometheus', 'Grafana', 'SNMP', 'Node Exporter'],
+    status: 'Live',
+  },
+  {
+    title: 'Operations Dashboard',
+    description:
+      'Custom Next.js dashboard for daily operations — calendar integration, news aggregation, task tracking, and system status, all in a single unified interface.',
+    stack: ['Next.js', 'TypeScript', 'REST APIs'],
+    link: 'https://github.com/aeger/dashboard',
+    status: 'Live',
+  },
+];
+---
+
+<section id="work" class="section">
+  <div class="container">
+    <div class="section-label reveal">Selected Work</div>
+    <h2 class="section-title reveal">Things I've built.</h2>
+    <p class="work-intro reveal">
+      Real systems running in production — not tutorials, not toy projects.
+    </p>
+
+    <div class="work-list reveal-stagger">
+      {projects.map((project) => (
+        <div class="work-card reveal">
+          <div class="work-header">
+            <div class="work-status">
+              <span class="status-dot"></span>
+              {project.status}
+            </div>
+            {project.link && (
+              <a href={project.link} class="work-link" target="_blank" rel="noopener">
+                View on GitHub
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M7 17L17 7M17 7H7M17 7V17" />
+                </svg>
+              </a>
+            )}
+          </div>
+
+          <h3 class="work-title">{project.title}</h3>
+          <p class="work-desc">{project.description}</p>
+
+          <div class="work-stack">
+            {project.stack.map((tech) => (
+              <span class="stack-tag">{tech}</span>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  </div>
+</section>
+
+<style>
+  .work-intro {
+    color: var(--text-secondary);
+    font-size: var(--text-lg);
+    margin-bottom: var(--space-2xl);
+  }
+
+  .work-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-lg);
+  }
+
+  .work-card {
+    padding: var(--space-2xl);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    transition: all var(--duration-base) var(--ease-out);
+  }
+
+  .work-card:hover {
+    border-color: var(--border-hover);
+    background: var(--bg-card-hover);
+  }
+
+  .work-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--space-lg);
+  }
+
+  .work-status {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: #4ade80;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+
+  .status-dot {
+    width: 6px;
+    height: 6px;
+    background: #4ade80;
+    border-radius: 50%;
+  }
+
+  .work-link {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+    font-size: var(--text-sm);
+    color: var(--text-muted);
+    transition: color var(--duration-fast) var(--ease-out);
+  }
+
+  .work-link:hover {
+    color: var(--accent);
+  }
+
+  .work-title {
+    font-size: var(--text-2xl);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin-bottom: var(--space-md);
+  }
+
+  .work-desc {
+    color: var(--text-secondary);
+    font-size: var(--text-base);
+    max-width: 640px;
+    line-height: 1.8;
+    margin-bottom: var(--space-lg);
+  }
+
+  .work-stack {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+  }
+
+  .stack-tag {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    padding: 4px 12px;
+    border-radius: 100px;
+    background: var(--accent-glow);
+    color: var(--accent);
+    border: 1px solid rgba(79, 143, 234, 0.12);
+  }
+</style>

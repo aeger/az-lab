@@ -1,0 +1,137 @@
+---
+---
+
+<section id="about" class="section">
+  <div class="container">
+    <div class="about-grid">
+      <div class="about-text">
+        <div class="section-label reveal">About</div>
+        <h2 class="section-title reveal">
+          Engineer by practice,<br />problem-solver by nature.
+        </h2>
+        <div class="about-body reveal">
+          <p>
+            I'm Jeff — a developer and infrastructure engineer who got hooked on
+            building things that work reliably. What started as curiosity about how
+            systems fit together turned into a goal of building platforms that teams
+            and businesses can depend on.
+          </p>
+          <p>
+            My approach is deliberate: understand the problem deeply before writing
+            a line of code. I work across the full stack — from container orchestration
+            and reverse proxies to clean front-end interfaces — but my real value is
+            in making complex systems simple enough that someone else can maintain them.
+          </p>
+          <p>
+            When I'm not building production systems, I'm running a home lab where I
+            prototype, break things safely, and stay sharp on emerging tools. Every
+            solution I ship has been battle-tested first.
+          </p>
+        </div>
+      </div>
+
+      <div class="about-details reveal">
+        <div class="detail-card">
+          <h3 class="detail-title">Core Stack</h3>
+          <ul class="tag-list">
+            <li>Linux / Ubuntu</li>
+            <li>Podman / Docker</li>
+            <li>Traefik</li>
+            <li>Prometheus / Grafana</li>
+            <li>TypeScript / Node.js</li>
+            <li>Python</li>
+            <li>Bash / Automation</li>
+            <li>Git / CI-CD</li>
+          </ul>
+        </div>
+
+        <div class="detail-card">
+          <h3 class="detail-title">Interests</h3>
+          <ul class="tag-list muted">
+            <li>Self-hosted platforms</li>
+            <li>Infrastructure as Code</li>
+            <li>Observability</li>
+            <li>AI-assisted development</li>
+            <li>Network architecture</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .about-grid {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: var(--space-3xl);
+    align-items: start;
+  }
+
+  .about-body p {
+    color: var(--text-secondary);
+    margin-bottom: var(--space-lg);
+    font-size: var(--text-base);
+  }
+
+  .about-body p:last-child {
+    margin-bottom: 0;
+  }
+
+  .about-details {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xl);
+  }
+
+  .detail-card {
+    padding: var(--space-xl);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    transition: border-color var(--duration-base) var(--ease-out);
+  }
+
+  .detail-card:hover {
+    border-color: var(--border-hover);
+  }
+
+  .detail-title {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: var(--space-md);
+  }
+
+  .tag-list {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+  }
+
+  .tag-list li {
+    font-size: var(--text-sm);
+    padding: 4px 12px;
+    border-radius: 100px;
+    background: var(--accent-glow);
+    color: var(--accent);
+    border: 1px solid rgba(79, 143, 234, 0.15);
+  }
+
+  .tag-list.muted li {
+    background: rgba(255,255,255,0.04);
+    color: var(--text-secondary);
+    border-color: var(--border);
+  }
+
+  @media (max-width: 768px) {
+    .about-grid {
+      grid-template-columns: 1fr;
+      gap: var(--space-2xl);
+    }
+  }
+</style>

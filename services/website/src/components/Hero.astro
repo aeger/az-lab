@@ -1,0 +1,256 @@
+---
+---
+
+<section class="hero">
+  <div class="hero-bg">
+    <div class="grid-lines"></div>
+    <div class="glow glow-1"></div>
+    <div class="glow glow-2"></div>
+  </div>
+
+  <div class="container hero-content">
+    <div class="hero-badge reveal">
+      <span class="badge-dot"></span>
+      Available for projects
+    </div>
+
+    <h1 class="hero-title reveal">
+      I build systems that<br />
+      <span class="hero-accent">don't break at 3am.</span>
+    </h1>
+
+    <p class="hero-subtitle reveal">
+      Developer and infrastructure engineer specializing in self-hosted platforms,
+      container orchestration, and automation that actually works.
+      I turn complex infrastructure into something you can reason about.
+    </p>
+
+    <div class="hero-actions reveal">
+      <a href="#contact" class="btn btn-primary">Start a conversation</a>
+      <a href="#work" class="btn btn-ghost">See my work</a>
+    </div>
+
+    <div class="hero-meta reveal">
+      <div class="meta-item">
+        <span class="meta-value">Linux</span>
+        <span class="meta-label">Platform</span>
+      </div>
+      <div class="meta-divider"></div>
+      <div class="meta-item">
+        <span class="meta-value">Containers</span>
+        <span class="meta-label">Architecture</span>
+      </div>
+      <div class="meta-divider"></div>
+      <div class="meta-item">
+        <span class="meta-value">IaC</span>
+        <span class="meta-label">Methodology</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .hero {
+    position: relative;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    padding-top: 80px;
+    overflow: hidden;
+  }
+
+  /* Background grid effect */
+  .hero-bg {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+
+  .grid-lines {
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 60px 60px;
+    mask-image: radial-gradient(ellipse 70% 50% at 50% 50%, black, transparent);
+  }
+
+  .glow {
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(80px);
+    opacity: 0.4;
+  }
+
+  .glow-1 {
+    width: 500px;
+    height: 500px;
+    background: var(--accent);
+    top: -150px;
+    right: -100px;
+    opacity: 0.08;
+  }
+
+  .glow-2 {
+    width: 400px;
+    height: 400px;
+    background: var(--accent-warm);
+    bottom: -100px;
+    left: -100px;
+    opacity: 0.06;
+  }
+
+  .hero-content {
+    position: relative;
+    z-index: 1;
+  }
+
+  .hero-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--text-secondary);
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid var(--border);
+    border-radius: 100px;
+    margin-bottom: var(--space-2xl);
+    letter-spacing: 0.05em;
+  }
+
+  .badge-dot {
+    width: 6px;
+    height: 6px;
+    background: #4ade80;
+    border-radius: 50%;
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .hero-title {
+    font-size: var(--text-5xl);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.1;
+    margin-bottom: var(--space-xl);
+  }
+
+  .hero-accent {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-warm) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .hero-subtitle {
+    font-size: var(--text-lg);
+    color: var(--text-secondary);
+    max-width: 560px;
+    line-height: 1.8;
+    margin-bottom: var(--space-2xl);
+  }
+
+  .hero-actions {
+    display: flex;
+    gap: var(--space-md);
+    margin-bottom: var(--space-3xl);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 14px 28px;
+    font-size: var(--text-sm);
+    font-weight: 500;
+    border-radius: var(--radius-sm);
+    transition: all var(--duration-base) var(--ease-out);
+    cursor: pointer;
+    border: none;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+    box-shadow: 0 0 20px rgba(79, 143, 234, 0.25);
+  }
+
+  .btn-primary:hover {
+    background: #5c9af0;
+    color: #fff;
+    box-shadow: 0 0 30px rgba(79, 143, 234, 0.35);
+    transform: translateY(-1px);
+  }
+
+  .btn-ghost {
+    color: var(--text-secondary);
+    border: 1px solid var(--border-hover);
+  }
+
+  .btn-ghost:hover {
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+    background: rgba(255,255,255,0.03);
+  }
+
+  .hero-meta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xl);
+  }
+
+  .meta-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .meta-value {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    font-weight: 500;
+    color: var(--text-primary);
+  }
+
+  .meta-label {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+
+  .meta-divider {
+    width: 1px;
+    height: 32px;
+    background: var(--border);
+  }
+
+  @media (max-width: 768px) {
+    .hero {
+      min-height: auto;
+      padding: 120px 0 var(--space-4xl);
+    }
+
+    .hero-actions {
+      flex-direction: column;
+    }
+
+    .btn {
+      justify-content: center;
+    }
+
+    .hero-meta {
+      flex-wrap: wrap;
+      gap: var(--space-lg);
+    }
+
+    .meta-divider {
+      display: none;
+    }
+  }
+</style>

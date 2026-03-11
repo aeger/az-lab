@@ -1,0 +1,106 @@
+---
+---
+
+<nav class="nav">
+  <div class="container nav-inner">
+    <a href="/" class="nav-logo" aria-label="Home">
+      <span class="logo-mark">az</span><span class="logo-dot">.</span>lab
+    </a>
+    <div class="nav-links">
+      <a href="#about">About</a>
+      <a href="#services">Services</a>
+      <a href="#work">Work</a>
+      <a href="#contact" class="nav-cta">Get in Touch</a>
+    </div>
+  </div>
+</nav>
+
+<style>
+  .nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    padding: var(--space-lg) 0;
+    backdrop-filter: blur(12px);
+    background: rgba(10, 10, 15, 0.8);
+    border-bottom: 1px solid transparent;
+    transition: border-color var(--duration-base) var(--ease-out),
+                padding var(--duration-base) var(--ease-out);
+  }
+
+  .nav.scrolled {
+    padding: var(--space-md) 0;
+    border-bottom-color: var(--border);
+  }
+
+  .nav-inner {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .nav-logo {
+    font-family: var(--font-mono);
+    font-size: var(--text-lg);
+    font-weight: 500;
+    color: var(--text-primary);
+    letter-spacing: -0.02em;
+  }
+
+  .nav-logo:hover {
+    color: var(--text-primary);
+  }
+
+  .logo-mark {
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  .logo-dot {
+    color: var(--accent-warm);
+  }
+
+  .nav-links {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xl);
+  }
+
+  .nav-links a {
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
+    transition: color var(--duration-fast) var(--ease-out);
+  }
+
+  .nav-links a:hover {
+    color: var(--text-primary);
+  }
+
+  .nav-cta {
+    padding: var(--space-sm) var(--space-lg);
+    border: 1px solid var(--border-hover);
+    border-radius: var(--radius-sm);
+    transition: all var(--duration-fast) var(--ease-out) !important;
+  }
+
+  .nav-cta:hover {
+    background: var(--accent-glow);
+    border-color: var(--accent);
+    color: var(--accent) !important;
+  }
+
+  @media (max-width: 640px) {
+    .nav-links a:not(.nav-cta) {
+      display: none;
+    }
+  }
+</style>
+
+<script>
+  const nav = document.querySelector('.nav');
+  window.addEventListener('scroll', () => {
+    nav?.classList.toggle('scrolled', window.scrollY > 40);
+  });
+</script>
