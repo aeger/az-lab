@@ -1,0 +1,25 @@
+services:
+  drydock:
+    image: codeswhat/drydock:latest
+    container_name: drydock
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - DD_SERVER_TRUSTPROXY=1
+    ports:
+      - "192.168.1.181:3000:3000"
+    volumes:
+      - /run/user/1000/podman/podman.sock:/var/run/docker.sock
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.drydock.rule=Host(`drydock.az-lab.dev`)"
+      - "traefik.http.routers.drydock.entrypoints=websecure"
+      - "traefik.http.routers.drydock.tls.certresolver=le"
+      - "traefik.http.routers.drydock.middlewares=lan-allow@file"
+      - "traefik.http.services.drydock.loadbalancer.server.port=3000"
+
+networks:
+  proxy:
+    external: true

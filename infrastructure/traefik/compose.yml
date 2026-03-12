@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   traefik:
-    image: docker.io/traefik:v3.1
+    image: docker.io/traefik:v3.6
     container_name: traefik
     restart: unless-stopped
 
@@ -58,7 +58,7 @@ services:
       - "--certificatesresolvers.le.acme.storage=/data/acme.json"
       - "--certificatesresolvers.le.acme.dnschallenge=true"
       - "--certificatesresolvers.le.acme.dnschallenge.provider=cloudflare"
-      - "--certificatesresolvers.le.acme.dnschallenge.delaybeforecheck=10"
+      - "--certificatesresolvers.le.acme.dnschallenge.propagation.delaybeforechecks=10"
       - "--certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53"
 
 networks:
