@@ -41,3 +41,10 @@ lab:
     - { url: "https://www.reddit.com/r/homelab/.rss", name: "r/homelab" }
     - { url: "https://www.reddit.com/r/selfhosted/.rss", name: "r/selfhosted" }
     - { url: "https://hnrss.org/newest?points=100", name: "Hacker News" }
+
+homeassistant:
+  url: "https://ha.az-lab.dev"
+  default_dashboard: "/dashboard-test/0"
+  dashboards:
+    - { title: "Test", path: "/dashboard-test/0" }
+    - { title: "Overview", path: "/lovelace/0" }

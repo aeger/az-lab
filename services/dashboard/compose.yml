@@ -25,6 +25,8 @@ services:
       - ADMIN_SECRET=${ADMIN_SECRET:-changeme}
       - RUSTDESK_HOST=${RUSTDESK_HOST:-}
       - RUSTDESK_KEY=${RUSTDESK_KEY:-}
+      - HA_URL=${HA_URL:-}
+      - HA_ACCESS_TOKEN=${HA_ACCESS_TOKEN:-}
     volumes:
       - ./config:/app/config:ro
       - ./data:/app/data:rw

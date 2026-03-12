@@ -1,0 +1,17 @@
+http:
+  routers:
+    homeassistant:
+      rule: "Host(`ha.az-lab.dev`)"
+      entryPoints:
+        - websecure
+      service: homeassistant
+      tls:
+        certResolver: le
+      middlewares:
+        - lan-allow
+
+  services:
+    homeassistant:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.161:8123"
