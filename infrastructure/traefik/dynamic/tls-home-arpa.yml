@@ -6,7 +6,7 @@ tls:
 http:
   routers:
     home-arpa:
-      rule: HostRegexp(`{host:.+\.home\.arpa}`)
+      rule: HostRegexp(`.+\\.home\\.arpa`)
       entryPoints:
         - websecure
       priority: 40

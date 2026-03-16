@@ -8,7 +8,7 @@ http:
       tls:
         certResolver: le
       middlewares:
-        - lan-allow
+        - lan-allow@file
 
   services:
     homeassistant:
