@@ -13,6 +13,7 @@ services:
       - "traefik.http.routers.changedetect.entrypoints=websecure"
       - "traefik.http.routers.changedetect.tls=true"
       - "traefik.http.routers.changedetect.tls.certresolver=le"
+      - "traefik.http.routers.changedetect.middlewares=lan-allow@file"
       - "traefik.http.services.changedetect.loadbalancer.server.port=5000"
 
 networks:
