@@ -1,0 +1,18 @@
+http:
+  routers:
+    stirling-pdf:
+      rule: "Host(`pdf.az-lab.dev`)"
+      entryPoints:
+        - websecure
+      service: stirling-pdf
+      tls:
+        certResolver: le
+      middlewares:
+        - lan-allow@file
+
+  services:
+    stirling-pdf:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.158:8080"
+        passHostHeader: true

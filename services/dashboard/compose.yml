@@ -37,7 +37,7 @@ services:
       - "traefik.http.routers.dashboard.rule=Host(`home.az-lab.dev`)"
       - "traefik.http.routers.dashboard.entrypoints=websecure"
       - "traefik.http.routers.dashboard.tls=true"
-      # TODO: Re-evaluate Authelia SSO for external access (photos, portainer, etc.)
+      - "traefik.http.routers.dashboard.tls.certresolver=le"
       - "traefik.http.routers.dashboard.middlewares=lan-allow@file"
       - "traefik.http.services.dashboard.loadbalancer.server.port=3000"
 
@@ -55,6 +55,7 @@ services:
       - "traefik.http.routers.uptime-kuma.rule=Host(`uptime.az-lab.dev`)"
       - "traefik.http.routers.uptime-kuma.entrypoints=websecure"
       - "traefik.http.routers.uptime-kuma.tls=true"
+      - "traefik.http.routers.uptime-kuma.tls.certresolver=le"
       - "traefik.http.routers.uptime-kuma.middlewares=lan-allow@file"
       - "traefik.http.services.uptime-kuma.loadbalancer.server.port=3001"
 
@@ -83,6 +84,7 @@ services:
       - "traefik.http.routers.immich.rule=Host(`photos.az-lab.dev`)"
       - "traefik.http.routers.immich.entrypoints=websecure"
       - "traefik.http.routers.immich.tls=true"
+      - "traefik.http.routers.immich.tls.certresolver=le"
       - "traefik.http.routers.immich.middlewares=lan-allow@file"
       - "traefik.http.services.immich.loadbalancer.server.port=2283"
       - "traefik.docker.network=proxy"
