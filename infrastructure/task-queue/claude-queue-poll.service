@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Code Task Queue Poller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/claude-queue/poll_queue.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-queue-poll
+
+# Uncomment if claude is not on PATH
+# Environment=CLAUDE_CMD=%h/.local/bin/claude
+
+[Install]
+WantedBy=default.target

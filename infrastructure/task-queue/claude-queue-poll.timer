@@ -1,0 +1,11 @@
+[Unit]
+Description=Claude Code Task Queue Poll Timer
+After=network-online.target
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
