@@ -19,6 +19,8 @@ services:
       - PORT=3100
       - OLLAMA_URL=http://ollama:11434
       - EMBED_MODEL=nomic-embed-text
+      - HA_URL=${HA_URL}
+      - HA_TOKEN=${HA_TOKEN}
     ports:
       - "127.0.0.1:3100:3100"
     networks:

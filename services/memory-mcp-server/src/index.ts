@@ -18,6 +18,9 @@ const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "";
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || "";
 const R2_BUCKET = process.env.R2_BUCKET || "az-lab-memory";
 
+const HA_URL = process.env.HA_URL || "";
+const HA_TOKEN = process.env.HA_TOKEN || "";
+
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY");
   process.exit(1);
@@ -88,7 +91,7 @@ const r2 = r2Enabled
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.0.0",
+    version: "3.1.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -589,15 +592,105 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ── Home Assistant Tools ─────────────────────────────────────────────────────
+  if (HA_URL && HA_TOKEN) {
+    const haFetch = async (path: string, method = "GET", body?: object) => {
+      const res = await fetch(`${HA_URL}/api${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${HA_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) throw new Error(`HA API ${res.status}: ${await res.text()}`);
+      return res.json();
+    };
+
+    // ── Tool: ha_get_states ────────────────────────────────────────────────────
+    server.tool(
+      "ha_get_states",
+      "Get Home Assistant entity states. Optionally filter by domain (light, switch, climate, sensor, etc.) or entity_id prefix.",
+      {
+        domain: z.string().optional().describe("Filter by domain: light, switch, climate, sensor, binary_sensor, media_player, person, device_tracker, etc."),
+        search: z.string().optional().describe("Filter by entity_id substring or friendly_name"),
+      },
+      async ({ domain, search }) => {
+        const states = await haFetch("/states") as Array<{ entity_id: string; state: string; attributes: Record<string, unknown> }>;
+        let filtered = states;
+        if (domain) filtered = filtered.filter((s) => s.entity_id.startsWith(`${domain}.`));
+        if (search) {
+          const q = search.toLowerCase();
+          filtered = filtered.filter((s) =>
+            s.entity_id.includes(q) ||
+            String(s.attributes.friendly_name || "").toLowerCase().includes(q)
+          );
+        }
+        const lines = filtered.map((s) => {
+          const name = s.attributes.friendly_name || s.entity_id;
+          const extra: string[] = [];
+          if (s.attributes.temperature !== undefined) extra.push(`temp=${s.attributes.temperature}`);
+          if (s.attributes.brightness !== undefined) extra.push(`brightness=${s.attributes.brightness}`);
+          if (s.attributes.battery_level !== undefined) extra.push(`battery=${s.attributes.battery_level}%`);
+          return `${s.entity_id}: **${s.state}**  (${name})${extra.length ? "  " + extra.join(", ") : ""}`;
+        });
+        return { content: [{ type: "text" as const, text: filtered.length ? lines.join("\n") : "No matching entities." }] };
+      }
+    );
+
+    // ── Tool: ha_call_service ──────────────────────────────────────────────────
+    server.tool(
+      "ha_call_service",
+      "Call a Home Assistant service to control devices. Examples: turn on/off lights, set climate, trigger automations.",
+      {
+        domain: z.string().describe("Service domain: light, switch, climate, automation, script, media_player, etc."),
+        service: z.string().describe("Service name: turn_on, turn_off, toggle, set_temperature, trigger, etc."),
+        entity_id: z.string().optional().describe("Target entity ID, or comma-separated list. Omit for services that don't need one."),
+        data: z.record(z.unknown()).optional().describe("Additional service data (e.g. temperature, brightness, hvac_mode)"),
+      },
+      async ({ domain, service, entity_id, data }) => {
+        const payload: Record<string, unknown> = { ...data };
+        if (entity_id) payload.entity_id = entity_id;
+        await haFetch(`/services/${domain}/${service}`, "POST", payload);
+        const target = entity_id || `${domain}.${service}`;
+        return { content: [{ type: "text" as const, text: `Called ${domain}.${service} on ${target} ✅` }] };
+      }
+    );
+
+    // ── Tool: ha_get_history ───────────────────────────────────────────────────
+    server.tool(
+      "ha_get_history",
+      "Get state history for a Home Assistant entity over the past N hours.",
+      {
+        entity_id: z.string().describe("Entity ID to get history for"),
+        hours: z.number().optional().describe("Hours of history to fetch (default 24, max 168)"),
+      },
+      async ({ entity_id, hours = 24 }) => {
+        const start = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+        const data = await haFetch(`/history/period/${start}?filter_entity_id=${entity_id}`) as Array<Array<{ state: string; last_changed: string }>>;
+        const history = data?.[0] || [];
+        if (!history.length) return { content: [{ type: "text" as const, text: `No history for ${entity_id} in the last ${hours}h.` }] };
+        const lines = history.slice(-50).map((s) => {
+          const ts = new Date(s.last_changed).toLocaleString();
+          return `${ts}: ${s.state}`;
+        });
+        return { content: [{ type: "text" as const, text: `${entity_id} — last ${lines.length} state changes:\n\n${lines.join("\n")}` }] };
+      }
+    );
+  }
+
   return server;
 }
 
 // ── Express + Transport ─────────────────────────────────────────────────────
 const app = express();
 
+const haEnabled = !!(HA_URL && HA_TOKEN);
+
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = r2 ? 12 : 9;
-  res.json({ status: "ok", service: "memory-mcp-server", version: "3.0.0", tools: toolCount, r2: r2Enabled });
+  const toolCount = (r2 ? 12 : 9) + (haEnabled ? 3 : 0);
+  res.json({ status: "ok", service: "memory-mcp-server", version: "3.1.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
@@ -653,7 +746,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  const toolCount = r2 ? 8 : 5;
-  console.log(`Memory MCP Server v3.0.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"})`);
+  const toolCount = (r2 ? 12 : 9) + (haEnabled ? 3 : 0);
+  console.log(`Memory MCP Server v3.1.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
 });
