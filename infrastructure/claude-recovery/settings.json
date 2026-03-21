@@ -1,0 +1,53 @@
+{
+  "channelsEnabled": true,
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "WebFetch",
+      "WebSearch",
+      "Agent",
+      "Glob",
+      "Grep",
+      "TodoWrite",
+      "Skill",
+      "ToolSearch",
+      "mcp__claude_ai_Cloudflare_Developer_Platform__*",
+      "mcp__claude_ai_Vercel__*",
+      "mcp__claude_ai_Gmail__*",
+      "mcp__claude_ai_Google_Calendar__*",
+      "mcp__claude_ai_Supabase__*"
+    ],
+    "deny": [
+      "Bash(sudo rm -rf /)",
+      "Bash(sudo reboot *)",
+      "Bash(sudo shutdown *)"
+    ],
+    "additionalDirectories": [
+      "/home/almty1/.ssh",
+      "/tmp",
+      "/home/almty1/claude/goals/completed",
+      "/home/almty1/.claude/projects/-home-almty1/memory"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/almty1/claude/scripts/sync-memory.sh",
+            "timeout": 10,
+            "statusMessage": "Syncing memory from Supabase..."
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "discord@claude-plugins-official": true
+  },
+  "skipDangerousModePermissionPrompt": true
+}
