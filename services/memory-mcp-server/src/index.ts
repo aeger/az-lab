@@ -88,7 +88,7 @@ const r2 = r2Enabled
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "2.0.0",
+    version: "3.0.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -473,6 +473,122 @@ function createMcpServer(): McpServer {
     );
   }
 
+  // ── Tool: save_skill ────────────────────────────────────────────────────────
+  server.tool(
+    "save_skill",
+    "Save a skill — procedural knowledge about how to accomplish a specific type of task. Call this after completing a complex task (5+ steps) to capture the approach for future sessions.",
+    {
+      name: z.string().describe("Short slug, e.g. 'deploy-podman-compose-service'"),
+      title: z.string().describe("Human-readable title, e.g. 'Deploy a Podman Compose Service'"),
+      description: z.string().describe("One-line summary shown in skill index — when to use this skill"),
+      content: z.string().describe("Full skill content: steps, gotchas, examples, commands. Markdown."),
+      triggers: z.array(z.string()).optional().describe("Phrases that indicate this skill applies, e.g. ['deploy service', 'podman compose']"),
+      platforms: z.array(z.string()).optional().describe("Platforms this applies to, e.g. ['linux', 'podman', 'svc-podman-01']"),
+      source: z.string().optional().describe("Source interface (default: claude-code)"),
+    },
+    async ({ name, title, description, content, triggers, platforms, source }) => {
+      // Security gate
+      for (const [field, value] of [["name", name], ["title", title], ["description", description], ["content", content]] as Array<[string, string]>) {
+        const threat = scanContent(value);
+        if (threat) return { content: [{ type: "text" as const, text: `Blocked: ${field} matches threat pattern '${threat}'. Skill not saved.` }] };
+      }
+
+      const src = source || "claude-code";
+      const skillTriggers = triggers || [];
+      const skillPlatforms = platforms || [];
+      const embedding = await embed(embedInput(name, description, content));
+
+      const { data: existing } = await supabase.from("skills").select("id").eq("name", name).maybeSingle();
+
+      if (existing) {
+        const update: Record<string, unknown> = { title, description, content, triggers: skillTriggers, platforms: skillPlatforms, source: src };
+        if (embedding) update.embedding = JSON.stringify(embedding);
+        const { error } = await supabase.from("skills").update(update).eq("id", existing.id);
+        if (error) return { content: [{ type: "text" as const, text: `Error updating skill: ${error.message}` }] };
+        return { content: [{ type: "text" as const, text: `Updated skill "${name}"` }] };
+      }
+
+      const insert: Record<string, unknown> = { name, title, description, content, triggers: skillTriggers, platforms: skillPlatforms, source: src };
+      if (embedding) insert.embedding = JSON.stringify(embedding);
+      const { error } = await supabase.from("skills").insert(insert);
+      if (error) return { content: [{ type: "text" as const, text: `Error saving skill: ${error.message}` }] };
+      return { content: [{ type: "text" as const, text: `Saved new skill "${name}" — "${title}"` }] };
+    }
+  );
+
+  // ── Tool: recall_skill ───────────────────────────────────────────────────────
+  server.tool(
+    "recall_skill",
+    "Find a skill by semantic search or name. Returns full content of matching skills.",
+    {
+      query: z.string().optional().describe("What you're trying to do — semantic search"),
+      name: z.string().optional().describe("Exact skill name to retrieve"),
+      limit: z.number().optional().describe("Max results (default 3)"),
+    },
+    async ({ query, name, limit }) => {
+      const maxResults = limit || 3;
+
+      if (name) {
+        const { data, error } = await supabase.from("skills").select("*").eq("name", name).maybeSingle();
+        if (error || !data) return { content: [{ type: "text" as const, text: `Skill "${name}" not found.` }] };
+        await supabase.from("skills").update({ use_count: (data.use_count || 0) + 1 }).eq("id", data.id);
+        return { content: [{ type: "text" as const, text: `# ${data.title}\n_${data.description}_\n\n${data.content}` }] };
+      }
+
+      if (query) {
+        const queryEmbedding = await embed(query);
+        if (queryEmbedding) {
+          const { data, error } = await supabase.rpc("match_skills", { query_embedding: JSON.stringify(queryEmbedding), match_count: maxResults });
+          if (!error && data?.length > 0) {
+            for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1 }).eq("id", s.id);
+            const results = data.map((s: any) => `# ${s.title} (${(s.similarity * 100).toFixed(0)}% match)\n_${s.description}_\n\n${s.content}`);
+            return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
+          }
+        }
+        // keyword fallback
+        const { data, error } = await supabase.from("skills").select("*")
+          .or(`name.ilike.%${query}%,title.ilike.%${query}%,description.ilike.%${query}%`).limit(maxResults);
+        if (error || !data?.length) return { content: [{ type: "text" as const, text: "No matching skills found." }] };
+        const results = data.map((s) => `# ${s.title}\n_${s.description}_\n\n${s.content}`);
+        return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
+      }
+
+      return { content: [{ type: "text" as const, text: "Provide a query or name." }] };
+    }
+  );
+
+  // ── Tool: list_skills ────────────────────────────────────────────────────────
+  server.tool(
+    "list_skills",
+    "List all saved skills with their names and descriptions. Quick index of what procedural knowledge is available.",
+    {},
+    async () => {
+      const { data, error } = await supabase.from("skills")
+        .select("name, title, description, triggers, use_count, updated_at")
+        .order("use_count", { ascending: false });
+      if (error || !data?.length) return { content: [{ type: "text" as const, text: "No skills saved yet." }] };
+      const lines = data.map((s) => {
+        const t = s.triggers?.length ? ` [${s.triggers.slice(0, 3).join(", ")}]` : "";
+        return `- **${s.name}**${t} — ${s.description} (used ${s.use_count}x)`;
+      });
+      return { content: [{ type: "text" as const, text: `${data.length} skills:\n\n${lines.join("\n")}` }] };
+    }
+  );
+
+  // ── Tool: delete_skill ───────────────────────────────────────────────────────
+  server.tool(
+    "delete_skill",
+    "Delete a skill by name when it's outdated or replaced by a better approach.",
+    {
+      name: z.string().describe("Exact skill name to delete"),
+    },
+    async ({ name }) => {
+      const { error } = await supabase.from("skills").delete().eq("name", name);
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      return { content: [{ type: "text" as const, text: `Deleted skill "${name}".` }] };
+    }
+  );
+
   return server;
 }
 
@@ -480,8 +596,8 @@ function createMcpServer(): McpServer {
 const app = express();
 
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = r2 ? 8 : 5;
-  res.json({ status: "ok", service: "memory-mcp-server", version: "2.0.0", tools: toolCount, r2: r2Enabled });
+  const toolCount = r2 ? 12 : 9;
+  res.json({ status: "ok", service: "memory-mcp-server", version: "3.0.0", tools: toolCount, r2: r2Enabled });
 });
 
 // Map to store transports and their servers by session ID
@@ -538,6 +654,6 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   const toolCount = r2 ? 8 : 5;
-  console.log(`Memory MCP Server v2.0.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v3.0.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
 });
