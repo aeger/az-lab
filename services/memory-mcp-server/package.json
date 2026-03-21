@@ -1,0 +1,30 @@
+{
+  "name": "memory-mcp-server",
+  "version": "1.0.0",
+  "description": "Shared memory MCP server for az-lab — Supabase-backed with semantic search",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1014.0",
+    "@aws-sdk/s3-request-presigner": "^3.1014.0",
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "@supabase/supabase-js": "^2.49.1",
+    "express": "^4.21.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

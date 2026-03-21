@@ -1,0 +1,36 @@
+name: az-lab-memory-mcp
+
+services:
+  # ─── Memory MCP Server ──────────────────────────────────────────────────────
+  memory-mcp:
+    image: az-memory-mcp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: az-memory-mcp
+    restart: unless-stopped
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - R2_BUCKET=${R2_BUCKET}
+      - PORT=3100
+      - OLLAMA_URL=http://ollama:11434
+      - EMBED_MODEL=nomic-embed-text
+    ports:
+      - "127.0.0.1:3100:3100"
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.memory-mcp.rule=Host(`memory-mcp.az-lab.dev`)"
+      - "traefik.http.routers.memory-mcp.entrypoints=websecure"
+      - "traefik.http.routers.memory-mcp.tls=true"
+      - "traefik.http.routers.memory-mcp.middlewares=lan-allow@file"
+      - "traefik.http.services.memory-mcp.loadbalancer.server.port=3100"
+
+networks:
+  proxy:
+    external: true
