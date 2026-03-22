@@ -53,6 +53,71 @@ function scanContent(text: string): string | null {
   return null;
 }
 
+// ── Conflict Detection ────────────────────────────────────────────────────────
+// Simple heuristic: look for negation words near shared nouns between two memory contents
+const NEGATION_PATTERNS = [
+  /\b(not|no|never|don'?t|cannot|can'?t|won'?t|isn'?t|aren'?t|wasn'?t|weren'?t|disabled?|removed?|deprecated?|replaced?)\b/i,
+  /\b(changed?|updated?|no longer|instead of|replaced? with|switched? to)\b/i,
+];
+
+function mightContradict(contentA: string, contentB: string): boolean {
+  const hasNegationA = NEGATION_PATTERNS.some((p) => p.test(contentA));
+  const hasNegationB = NEGATION_PATTERNS.some((p) => p.test(contentB));
+  if (!hasNegationA && !hasNegationB) return false;
+
+  // Extract key nouns (words >4 chars, not stopwords) and check overlap
+  const stopwords = new Set(["this","that","with","from","have","will","been","they","their","there","about","which","these","those","would","could","should","after","before"]);
+  const words = (text: string) => text.toLowerCase().match(/\b[a-z]{4,}\b/g)?.filter((w) => !stopwords.has(w)) ?? [];
+  const wordsA = new Set(words(contentA));
+  const wordsB = words(contentB);
+  const overlap = wordsB.filter((w) => wordsA.has(w)).length;
+
+  return overlap >= 3; // Significant topic overlap + negation = possible contradiction
+}
+
+async function detectConflicts(
+  newMemoryId: string,
+  newContent: string,
+  type: string,
+  tags: string[],
+  embedding: number[] | null
+): Promise<string | null> {
+  // Find candidates: same type, overlapping tags, high similarity
+  let candidates: Array<{ id: string; name: string; content: string }> = [];
+
+  if (embedding) {
+    const { data } = await supabase.rpc("match_memories", {
+      query_embedding: JSON.stringify(embedding),
+      match_threshold: 0.72,
+      match_count: 8,
+    });
+    if (data) {
+      candidates = (data as any[])
+        .filter((m) => m.id !== newMemoryId && m.type === type)
+        .map((m) => ({ id: m.id, name: m.name, content: m.content }));
+    }
+  }
+
+  const conflictNames: string[] = [];
+  for (const candidate of candidates) {
+    if (mightContradict(newContent, candidate.content)) {
+      // Record conflict in DB
+      await supabase.from("memory_conflicts").upsert({
+        memory_a_id: newMemoryId,
+        memory_b_id: candidate.id,
+        conflict_type: "contradiction",
+        description: `New memory may contradict "${candidate.name}"`,
+        resolved: false,
+      }, { onConflict: "memory_a_id,memory_b_id" });
+      // Flag both memories
+      await supabase.from("memories").update({ conflict_flagged: true }).in("id", [newMemoryId, candidate.id]);
+      conflictNames.push(candidate.name);
+    }
+  }
+
+  return conflictNames.length > 0 ? conflictNames.join(", ") : null;
+}
+
 // ── Embeddings ───────────────────────────────────────────────────────────────
 async function embed(text: string): Promise<number[] | null> {
   try {
@@ -91,7 +156,7 @@ const r2 = r2Enabled
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.2.0",
+    version: "3.3.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -185,7 +250,11 @@ function createMcpServer(): McpServer {
         }
       }
 
-      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}` }] };
+      // Conflict detection
+      const conflicts = await detectConflicts(inserted.id, content, type, memTags, embedding);
+      const conflictNote = conflicts ? ` ⚠️ Possible contradiction with: ${conflicts}` : "";
+
+      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${conflictNote}` }] };
     }
   );
 
@@ -644,6 +713,36 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ── Tool: list_conflicts ────────────────────────────────────────────────────
+  server.tool(
+    "list_conflicts",
+    "List unresolved memory conflicts — memories that may contradict each other. Review and resolve manually.",
+    { resolved: z.boolean().optional().describe("If true, show resolved conflicts too (default: unresolved only)") },
+    async ({ resolved }) => {
+      const q = supabase
+        .from("memory_conflicts")
+        .select("id, conflict_type, description, created_at, memory_a_id, memory_b_id")
+        .order("created_at", { ascending: false })
+        .limit(20);
+      if (!resolved) q.eq("resolved", false);
+      const { data, error } = await q;
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      if (!data?.length) return { content: [{ type: "text" as const, text: "No unresolved conflicts." }] };
+
+      // Fetch memory names
+      const ids = [...new Set(data.flatMap((c) => [c.memory_a_id, c.memory_b_id]))];
+      const { data: mems } = await supabase.from("memories").select("id, name").in("id", ids);
+      const nameMap = Object.fromEntries((mems || []).map((m) => [m.id, m.name]));
+
+      const lines = data.map((c) => {
+        const a = nameMap[c.memory_a_id] || c.memory_a_id;
+        const b = nameMap[c.memory_b_id] || c.memory_b_id;
+        return `⚠️ **${a}** vs **${b}** (${c.conflict_type})\n  ${c.description}`;
+      });
+      return { content: [{ type: "text" as const, text: `${data.length} conflict${data.length === 1 ? "" : "s"}:\n\n${lines.join("\n\n")}` }] };
+    }
+  );
+
   // ── Home Assistant Tools ─────────────────────────────────────────────────────
   if (HA_URL && HA_TOKEN) {
     const haFetch = async (path: string, method = "GET", body?: object) => {
@@ -741,8 +840,8 @@ const app = express();
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = (r2 ? 12 : 9) + (haEnabled ? 3 : 0);
-  res.json({ status: "ok", service: "memory-mcp-server", version: "3.2.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  const toolCount = (r2 ? 13 : 10) + (haEnabled ? 3 : 0);
+  res.json({ status: "ok", service: "memory-mcp-server", version: "3.3.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
@@ -798,7 +897,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  const toolCount = (r2 ? 12 : 9) + (haEnabled ? 3 : 0);
-  console.log(`Memory MCP Server v3.2.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+  const toolCount = (r2 ? 13 : 10) + (haEnabled ? 3 : 0);
+  console.log(`Memory MCP Server v3.3.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
 });
