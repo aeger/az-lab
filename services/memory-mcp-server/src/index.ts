@@ -152,11 +152,18 @@ const r2 = r2Enabled
     })
   : null;
 
+// ── Source trust levels ───────────────────────────────────────────────────────
+const SOURCE_TRUST: Record<string, string> = {
+  "claude-code": "high",
+  "claude-ai": "medium",
+  "manual": "verified",
+};
+
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.3.0",
+    version: "3.4.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -222,7 +229,10 @@ function createMcpServer(): McpServer {
             }
           }
         }
-        return { content: [{ type: "text" as const, text: `Updated memory "${name}" (${type})${embedNote}.${linkNote}` }] };
+        // Re-run conflict detection on update
+        const updateConflicts = await detectConflicts(existing.id, content, type, memTags, embedding);
+        const updateConflictNote = updateConflicts ? ` ⚠️ Possible contradiction with: ${updateConflicts}` : "";
+        return { content: [{ type: "text" as const, text: `Updated memory "${name}" (${type})${embedNote}.${linkNote}${updateConflictNote}` }] };
       }
 
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
@@ -304,7 +314,9 @@ function createMcpServer(): McpServer {
               const results = filtered.map((m: any, i: number) => {
                 const tagStr = m.tags?.length ? ` [${m.tags.join(", ")}]` : "";
                 const rank = m.rank ? ` (rank ${(m.rank * 100).toFixed(0)}%)` : "";
-                return `## ${m.name} (${m.type})${tagStr}${rank}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
+                const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
+                const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
+                return `## ${m.name} (${m.type})${tagStr}${rank}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
               });
               return {
                 content: [{ type: "text" as const, text: `Found ${filtered.length} memor${filtered.length === 1 ? "y" : "ies"} (semantic+decay):\n\n${results.join("\n\n---\n\n")}` }],
@@ -743,6 +755,106 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ── Tool: find_duplicates ────────────────────────────────────────────────────
+  server.tool(
+    "find_duplicates",
+    "Find near-duplicate memories by cosine similarity. Use this to identify redundant memories that could be merged.",
+    {
+      threshold: z.number().optional().describe("Similarity threshold 0-1 (default 0.90 — very similar)"),
+      limit: z.number().optional().describe("Max pairs to return (default 20)"),
+    },
+    async ({ threshold = 0.90, limit = 20 }) => {
+      const { data, error } = await supabase.rpc("find_duplicate_memories", {
+        similarity_threshold: threshold,
+        max_pairs: limit,
+      });
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      if (!data?.length) return { content: [{ type: "text" as const, text: `No near-duplicate memories found at threshold ${threshold}.` }] };
+
+      const lines = (data as any[]).map((row) =>
+        `- **${row.memory_a_name}** ↔ **${row.memory_b_name}** (${(row.similarity * 100).toFixed(1)}% similar)`
+      );
+      return {
+        content: [{ type: "text" as const, text: `${data.length} near-duplicate pair${data.length === 1 ? "" : "s"} (threshold ${threshold}):\n\n${lines.join("\n")}\n\nUse merge_memories to combine a pair.` }],
+      };
+    }
+  );
+
+  // ── Tool: merge_memories ─────────────────────────────────────────────────────
+  server.tool(
+    "merge_memories",
+    "Merge two memories — keep the primary, absorb tags from secondary, redirect all links, delete secondary. Use after find_duplicates.",
+    {
+      primary_name: z.string().describe("Name of the memory to keep"),
+      secondary_name: z.string().describe("Name of the memory to absorb and delete"),
+      merged_content: z.string().optional().describe("Replacement content for the primary memory after merge. If omitted, primary content is unchanged."),
+    },
+    async ({ primary_name, secondary_name, merged_content }) => {
+      // Fetch both
+      const { data: primary } = await supabase.from("memories").select("id, type, description, content, tags, source").eq("name", primary_name).maybeSingle();
+      const { data: secondary } = await supabase.from("memories").select("id, tags, content").eq("name", secondary_name).maybeSingle();
+
+      if (!primary) return { content: [{ type: "text" as const, text: `Primary memory "${primary_name}" not found.` }] };
+      if (!secondary) return { content: [{ type: "text" as const, text: `Secondary memory "${secondary_name}" not found.` }] };
+
+      // Merge tags (union)
+      const mergedTags = [...new Set([...(primary.tags || []), ...(secondary.tags || [])])];
+
+      // Optionally update content
+      const update: Record<string, unknown> = { tags: mergedTags };
+      if (merged_content) {
+        update.content = merged_content;
+        const newEmbedding = await embed(embedInput(primary_name, primary.description, merged_content));
+        if (newEmbedding) update.embedding = JSON.stringify(newEmbedding);
+      }
+
+      const { error: updateError } = await supabase.from("memories").update(update).eq("id", primary.id);
+      if (updateError) return { content: [{ type: "text" as const, text: `Error updating primary: ${updateError.message}` }] };
+
+      // Merge via DB function (redirect links, delete secondary)
+      const { error: mergeError } = await supabase.rpc("merge_memory_into", {
+        primary_id: primary.id,
+        secondary_id: secondary.id,
+      });
+      if (mergeError) return { content: [{ type: "text" as const, text: `Error in merge RPC: ${mergeError.message}` }] };
+
+      const contentNote = merged_content ? " Content updated." : "";
+      const tagNote = mergedTags.length > (primary.tags?.length || 0) ? ` Tags merged: [${mergedTags.join(", ")}].` : "";
+      return {
+        content: [{ type: "text" as const, text: `Merged "${secondary_name}" into "${primary_name}".${contentNote}${tagNote} Secondary memory deleted, links redirected.` }],
+      };
+    }
+  );
+
+  // ── Tool: list_stale_memories ────────────────────────────────────────────────
+  server.tool(
+    "list_stale_memories",
+    "Find memories that haven't been accessed recently, have low use counts, and no outgoing links. Candidates for review or deletion.",
+    {
+      days_inactive: z.number().optional().describe("Inactivity threshold in days (default 60)"),
+      max_uses: z.number().optional().describe("Max access_count to consider stale (default 1)"),
+      limit: z.number().optional().describe("Max results (default 20)"),
+    },
+    async ({ days_inactive = 60, max_uses = 1, limit = 20 }) => {
+      const { data, error } = await supabase.rpc("find_stale_memories", {
+        days_inactive,
+        max_uses,
+        result_limit: limit,
+      });
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      if (!data?.length) return { content: [{ type: "text" as const, text: "No stale memories found." }] };
+
+      const lines = (data as any[]).map((m) => {
+        const age = m.updated_at ? `last updated ${new Date(m.updated_at).toLocaleDateString()}` : "never updated";
+        const accessed = m.accessed_at ? `accessed ${new Date(m.accessed_at).toLocaleDateString()}` : "never accessed";
+        return `- **${m.name}** (${m.type}) — ${m.description}\n  source:${m.source} | uses:${m.access_count} | ${age} | ${accessed}`;
+      });
+      return {
+        content: [{ type: "text" as const, text: `${data.length} stale memor${data.length === 1 ? "y" : "ies"} (inactive ${days_inactive}d, uses ≤${max_uses}, no links):\n\n${lines.join("\n\n")}\n\nReview and use forget() to prune any that are outdated.` }],
+      };
+    }
+  );
+
   // ── Home Assistant Tools ─────────────────────────────────────────────────────
   if (HA_URL && HA_TOKEN) {
     const haFetch = async (path: string, method = "GET", body?: object) => {
@@ -840,8 +952,8 @@ const app = express();
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = (r2 ? 13 : 10) + (haEnabled ? 3 : 0);
-  res.json({ status: "ok", service: "memory-mcp-server", version: "3.3.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  const toolCount = (r2 ? 13 : 10) + (haEnabled ? 3 : 0) + 3; // +3: find_duplicates, merge_memories, list_stale_memories
+  res.json({ status: "ok", service: "memory-mcp-server", version: "3.4.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
@@ -897,7 +1009,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  const toolCount = (r2 ? 13 : 10) + (haEnabled ? 3 : 0);
-  console.log(`Memory MCP Server v3.3.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+  const toolCount = (r2 ? 13 : 10) + (haEnabled ? 3 : 0) + 3;
+  console.log(`Memory MCP Server v3.4.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
 });
