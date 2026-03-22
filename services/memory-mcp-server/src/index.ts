@@ -91,7 +91,7 @@ const r2 = r2Enabled
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.1.0",
+    version: "3.2.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -137,15 +137,55 @@ function createMcpServer(): McpServer {
         if (embedding) update.embedding = JSON.stringify(embedding);
         const { error } = await supabase.from("memories").update(update).eq("id", existing.id);
         if (error) return { content: [{ type: "text" as const, text: `Error updating memory: ${error.message}` }] };
-        return { content: [{ type: "text" as const, text: `Updated memory "${name}" (${type})${embedNote}` }] };
+
+        // Re-link on update: remove old related_to links and rebuild
+        let linkNote = "";
+        if (embedding) {
+          await supabase.from("memory_links").delete().eq("source_id", existing.id).eq("relationship", "related_to");
+          const { data: similar } = await supabase.rpc("match_memories", {
+            query_embedding: JSON.stringify(embedding),
+            match_threshold: 0.75,
+            match_count: 5,
+          });
+          if (similar?.length) {
+            const links = similar
+              .filter((m: any) => m.id !== existing.id)
+              .map((m: any) => ({ source_id: existing.id, target_id: m.id, relationship: "related_to", strength: Math.min(m.similarity, 1.0) }));
+            if (links.length) {
+              await supabase.from("memory_links").upsert(links, { onConflict: "source_id,target_id,relationship" });
+              linkNote = ` Re-linked to ${links.length} related memor${links.length === 1 ? "y" : "ies"}.`;
+            }
+          }
+        }
+        return { content: [{ type: "text" as const, text: `Updated memory "${name}" (${type})${embedNote}.${linkNote}` }] };
       }
 
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
       if (embedding) insert.embedding = JSON.stringify(embedding);
-      const { error } = await supabase.from("memories").insert(insert);
+      const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
-      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}` }] };
+
+      // Auto-link: find related memories and create bidirectional links
+      let linkNote = "";
+      if (embedding && inserted?.id) {
+        const { data: similar } = await supabase.rpc("match_memories", {
+          query_embedding: JSON.stringify(embedding),
+          match_threshold: 0.75,
+          match_count: 5,
+        });
+        if (similar?.length) {
+          const links = similar
+            .filter((m: any) => m.id !== inserted.id)
+            .map((m: any) => ({ source_id: inserted.id, target_id: m.id, relationship: "related_to", strength: Math.min(m.similarity, 1.0) }));
+          if (links.length) {
+            await supabase.from("memory_links").upsert(links, { onConflict: "source_id,target_id,relationship" });
+            linkNote = ` Linked to ${links.length} related memor${links.length === 1 ? "y" : "ies"}.`;
+          }
+        }
+      }
+
+      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}` }] };
     }
   );
 
@@ -169,24 +209,36 @@ function createMcpServer(): McpServer {
         if (queryEmbedding) {
           const { data, error } = await supabase.rpc("match_memories", {
             query_embedding: JSON.stringify(queryEmbedding),
+            match_threshold: 0.4,
             match_count: maxResults,
-            filter_type: type || null,
           });
 
           if (!error && data && data.length > 0) {
-            // Apply tag filter client-side (rpc doesn't support it)
-            const filtered = tags?.length
-              ? data.filter((m: any) => tags.some((t) => m.tags?.includes(t)))
-              : data;
+            // Apply type + tag filters client-side
+            let filtered = data as any[];
+            if (type) filtered = filtered.filter((m) => m.type === type);
+            if (tags?.length) filtered = filtered.filter((m) => tags.some((t) => m.tags?.includes(t)));
 
             if (filtered.length > 0) {
-              const results = filtered.map((m: any) => {
+              // Touch all returned memories (update access_count + accessed_at)
+              await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
+
+              // Fetch links for the top result
+              let linkSection = "";
+              const top = filtered[0];
+              const { data: linked } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
+              if (linked?.length) {
+                const linkLines = linked.map((l: any) => `  - **${l.name}** (${l.relationship}, strength ${l.strength.toFixed(2)}): ${l.description}`);
+                linkSection = `\n\n**Linked memories (${linked.length}):**\n${linkLines.join("\n")}`;
+              }
+
+              const results = filtered.map((m: any, i: number) => {
                 const tagStr = m.tags?.length ? ` [${m.tags.join(", ")}]` : "";
-                const sim = m.similarity ? ` (${(m.similarity * 100).toFixed(0)}% match)` : "";
-                return `## ${m.name} (${m.type})${tagStr}${sim}\n_${m.description}_\n\n${m.content}`;
+                const rank = m.rank ? ` (rank ${(m.rank * 100).toFixed(0)}%)` : "";
+                return `## ${m.name} (${m.type})${tagStr}${rank}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
               });
               return {
-                content: [{ type: "text" as const, text: `Found ${filtered.length} memor${filtered.length === 1 ? "y" : "ies"} (semantic):\n\n${results.join("\n\n---\n\n")}` }],
+                content: [{ type: "text" as const, text: `Found ${filtered.length} memor${filtered.length === 1 ? "y" : "ies"} (semantic+decay):\n\n${results.join("\n\n---\n\n")}` }],
               };
             }
           }
@@ -690,7 +742,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 12 : 9) + (haEnabled ? 3 : 0);
-  res.json({ status: "ok", service: "memory-mcp-server", version: "3.1.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "3.2.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
@@ -747,6 +799,6 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   const toolCount = (r2 ? 12 : 9) + (haEnabled ? 3 : 0);
-  console.log(`Memory MCP Server v3.1.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v3.2.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
 });
