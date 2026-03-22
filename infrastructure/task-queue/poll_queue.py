@@ -18,20 +18,26 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
+def _read_file(path):
+    try:
+        with open(os.path.expanduser(path)) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
 SUPABASE_URL = "https://ogqjjlbupqnvlcyrfnxi.supabase.co"
 SUPABASE_KEY = os.environ.get(
     "SUPABASE_ANON_KEY",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ncWpqbGJ1cHFudmxjeXJmbnhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwNDU1NzYsImV4cCI6MjA4OTYyMTU3Nn0.VVvHOmcR04gnVHa6k8_lHhdCt6zNhpHYbj4c68LkScc",
 )
 CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
-NEMOCLAW_HOST = os.environ.get("NEMOCLAW_HOST", "192.168.1.183")
-NEMOCLAW_USER = os.environ.get("NEMOCLAW_USER", "ubuntu")
-NEMOCLAW_KEY = os.environ.get("NEMOCLAW_KEY", os.path.expanduser("~/.ssh/id_ed25519_claude_desktop"))
 HOSTNAME = socket.gethostname()
 
-# NVIDIA NIM model for nemotron routing
+# NVIDIA NIM for nemotron routing
 NEMOTRON_MODEL = "nvidia/nemotron-3-super-120b-a12b"
-NEMOTRON_SANDBOX = "az-labclaw"
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY") or _read_file("~/.nvidia_api_key")
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 
 def headers(extra=None):
@@ -149,44 +155,36 @@ def run_claude(prompt):
 
 
 def run_nemotron(prompt):
-    """Run task via NVIDIA NIM through the az-labclaw sandbox on nemoclaw-01.
-    Uses openclaw inside the sandbox which routes to Nemotron 120B (free inference).
+    """Call NVIDIA NIM (Nemotron 120B) directly via the OpenAI-compatible API.
+    Falls back to Claude if the API call fails.
     """
-    # Build a Python script to run inside the sandbox via SSH
-    # openclaw reads from stdin and writes to stdout
-    script = f"""
-import subprocess, sys
-result = subprocess.run(
-    ["sudo", "nemoclaw", "{NEMOTRON_SANDBOX}", "connect", "--", "openclaw", "run", "--stdin"],
-    input={json.dumps(prompt)},
-    capture_output=True, text=True, timeout=300
-)
-if result.returncode != 0:
-    print("ERROR: " + result.stderr, file=sys.stderr)
-    sys.exit(1)
-print(result.stdout)
-"""
+    if not NVIDIA_API_KEY:
+        print("No NVIDIA API key found, falling back to Claude.", file=sys.stderr)
+        return run_claude(prompt)
+
+    payload = json.dumps({
+        "model": NEMOTRON_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4096,
+        "temperature": 0.6,
+        "top_p": 0.9,
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{NVIDIA_BASE_URL}/chat/completions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
     try:
-        result = subprocess.run(
-            [
-                "ssh",
-                "-i", NEMOCLAW_KEY,
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "ConnectTimeout=10",
-                f"{NEMOCLAW_USER}@{NEMOCLAW_HOST}",
-                "python3", "-c", script,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=360,
-        )
-        if result.returncode != 0:
-            # Fall back to claude if nemotron fails
-            print(f"Nemotron failed, falling back to Claude: {result.stderr.strip()}", file=sys.stderr)
-            return run_claude(prompt)
-        return result.stdout.strip()
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+            return result["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        print(f"Nemotron SSH error, falling back to Claude: {e}", file=sys.stderr)
+        print(f"Nemotron API error, falling back to Claude: {e}", file=sys.stderr)
         return run_claude(prompt)
 
 
