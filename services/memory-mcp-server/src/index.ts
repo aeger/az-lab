@@ -608,6 +608,49 @@ function createMcpServer(): McpServer {
         return { content: [{ type: "text" as const, text: `Deleted file "${filename}" from storage and database.` }] };
       }
     );
+
+    // ── Tool: store_file ─────────────────────────────────────────────────────
+    // Large-object convention: use this instead of embedding content in Supabase
+    // when the payload exceeds ~8KB. Key format: agent/YYYY-MM-DD/name.md
+    server.tool(
+      "store_file",
+      "Write text content directly to R2 by key — no Supabase record. Use this for large payloads (>8KB) that would bloat memory storage. Key format: agent/YYYY-MM-DD/descriptive-name.md",
+      {
+        key: z.string().describe("R2 object key, e.g. 'wren/2026-03-26/research-notes.md'"),
+        content: z.string().describe("Text content to store"),
+        content_type: z.string().optional().describe("MIME type (default: text/plain for .txt, text/markdown for .md)"),
+      },
+      async ({ key, content, content_type }) => {
+        const ext = key.split(".").pop()?.toLowerCase() || "";
+        const mime = content_type || (ext === "md" ? "text/markdown" : ext === "json" ? "application/json" : "text/plain");
+        const body = Buffer.from(content, "utf-8");
+        try {
+          await r2!.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: body, ContentType: mime }));
+          return { content: [{ type: "text" as const, text: `Stored ${body.length.toLocaleString()} bytes → ${R2_BUCKET}/${key}` }] };
+        } catch (err: any) {
+          return { content: [{ type: "text" as const, text: `store_file failed: ${err.message}` }] };
+        }
+      }
+    );
+
+    // ── Tool: get_file ───────────────────────────────────────────────────────
+    server.tool(
+      "get_file",
+      "Read text content from R2 by key. Companion to store_file for large-object retrieval. Returns the raw text content.",
+      {
+        key: z.string().describe("R2 object key to retrieve, e.g. 'wren/2026-03-26/research-notes.md'"),
+      },
+      async ({ key }) => {
+        try {
+          const response = await r2!.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+          if (!response.Body) return { content: [{ type: "text" as const, text: `Empty response for key: ${key}` }] };
+          const text = await response.Body.transformToString("utf-8");
+          return { content: [{ type: "text" as const, text }] };
+        } catch (err: any) {
+          return { content: [{ type: "text" as const, text: `get_file failed for "${key}": ${err.message}` }] };
+        }
+      }
+    );
   }
 
   // ── Tool: save_skill ────────────────────────────────────────────────────────
@@ -953,7 +996,7 @@ const app = express();
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = (r2 ? 13 : 10) + (haEnabled ? 3 : 0) + 3; // +3: find_duplicates, merge_memories, list_stale_memories
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 3; // +5 r2: remember_file, recall_file, forget_file, store_file, get_file
   res.json({ status: "ok", service: "memory-mcp-server", version: "3.4.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
@@ -1010,7 +1053,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  const toolCount = (r2 ? 13 : 10) + (haEnabled ? 3 : 0) + 3;
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 3;
   console.log(`Memory MCP Server v3.4.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
 });

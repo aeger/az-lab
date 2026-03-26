@@ -68,7 +68,7 @@ azlab/
 | Webtop            | https://webtop.az-lab.dev         | Browser-based Linux desktop        |
 | RustDesk          | svc-podman-01:21115-21119         | Self-hosted remote desktop relay   |
 | Website           | https://www.az-lab.dev            | Astro static site + Caddy          |
-| memory-mcp-server | http://svc-podman-01:3100         | Agent memory MCP (v3.3.0)          |
+| memory-mcp-server | http://svc-podman-01:3100         | Agent memory MCP (v3.4.0)          |
 | Agent Bus         | http://svc-podman-01:8765         | Inter-agent HTTP + MCP server      |
 
 ---
@@ -112,7 +112,7 @@ The home lab runs a multi-agent Claude system. Each interface has a name and rol
 ### Shared Memory
 
 - **Supabase project:** `azlab-memory` (ogqjjlbupqnvlcyrfnxi.supabase.co)
-- **memory-mcp-server v3.3.0:** 16 tools — memory CRUD, hybrid recall (BM25+vector RRF fusion), Zettelkasten auto-links, conflict detection, skills, R2 file storage, HA control
+- **memory-mcp-server v3.4.0:** 18 tools — memory CRUD, hybrid recall (BM25+vector RRF fusion), Zettelkasten auto-links, conflict detection, skills, R2 file storage (incl. `store_file`/`get_file` for large objects >8KB), HA control
 - **Decay scoring:** 80% semantic + 20% recency/use frequency
 
 ### Task Queue
@@ -179,6 +179,45 @@ Python HTTP server at `~/claude/agent-bus/` on port 8765.
 
 > Use this when svc-podman-01 must be rebuilt from scratch.
 
+#### 0. Retrieve backups from R2 (do this before provisioning the new VM)
+
+Nightly backups are in the `az-lab-backups` R2 bucket. Pull them before rebuilding so you have configs and certs ready.
+
+```bash
+# Install AWS CLI (or use wrangler / boto3 script)
+pip3 install boto3
+
+# Set R2 credentials — get from Supabase credentials table or a known .env backup
+export R2_ACCOUNT_ID=157265a71e207b62e3e2d9f36dcd3f3d
+export AWS_ACCESS_KEY_ID=<CF_R2_ACCESS_KEY_ID>
+export AWS_SECRET_ACCESS_KEY=<CF_R2_SECRET_ACCESS_KEY>
+export R2_ENDPOINT=https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+
+# List what's available
+aws s3 ls s3://az-lab-backups/ --endpoint-url $R2_ENDPOINT --recursive | sort | tail -40
+
+# Pull latest Traefik configs + acme.json (saves re-issuing LE certs)
+LATEST_DATE=$(date -u +%Y-%m-%d)
+aws s3 cp s3://az-lab-backups/traefik/${LATEST_DATE}/traefik-configs.tar.gz . \
+  --endpoint-url $R2_ENDPOINT
+tar -xzf traefik-configs.tar.gz   # extracts acme.json + dynamic/*.yml
+
+# Pull latest Supabase snapshot
+aws s3 cp s3://az-lab-backups/supabase/${LATEST_DATE}.json supabase-backup.json \
+  --endpoint-url $R2_ENDPOINT
+
+# Pull latest LLDAP data
+aws s3 cp s3://az-lab-backups/lldap/${LATEST_DATE}/lldap-data.tar.gz . \
+  --endpoint-url $R2_ENDPOINT
+tar -xzf lldap-data.tar.gz   # extracts users.db + lldap_config.toml
+
+# Pull AdGuard DNS rewrites
+aws s3 cp s3://az-lab-backups/adguard/${LATEST_DATE}/adguard-config.json . \
+  --endpoint-url $R2_ENDPOINT
+```
+
+> **acme.json** is critical — restoring it prevents re-issuing Let's Encrypt certs (rate-limited to 5/week per domain).
+
 #### 1. Provision the VM
 - Create VM in Proxmox with Ubuntu 24.04, min 4 vCPU / 8 GB RAM, VLAN 10
 - Set static IP 192.168.1.181 in MikroTik DHCP static lease
@@ -201,7 +240,9 @@ mkdir -p ~/.config/systemd/user
 #### 4. Restore secrets
 - Retrieve credentials from `azlab-memory` Supabase (credentials table, agent-read role)
 - Recreate `.env` files in each service directory
-- Restore Traefik `acme.json` from backup (contains LE certs)
+- Restore Traefik `acme.json` from Phase 0 R2 backup → `~/azlab/infrastructure/traefik/data/acme.json`
+- Restore Traefik dynamic configs from Phase 0 R2 backup → `~/azlab/infrastructure/traefik/dynamic/`
+- Restore LLDAP `users.db` from Phase 0 R2 backup → `~/azlab/services/lldap/data/`
 
 #### 5. Start infrastructure first
 ```bash
