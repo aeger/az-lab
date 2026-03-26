@@ -258,7 +258,7 @@ def claim_next_task():
 
 
 def mark_in_progress(task_id):
-    api_request("PATCH", f"task_queue?id=eq.{task_id}", data={"status": "in_progress"})
+    pass  # 'claimed' already signals in-progress; schema has no in_progress status
 
 
 def mark_completed(task_id, result):
