@@ -282,27 +282,28 @@ function createMcpServer(): McpServer {
     async ({ query, type, tags, limit, semantic }) => {
       const maxResults = limit || 10;
 
-      // Try semantic search when query is provided and semantic not explicitly disabled
+      // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled
       if (query && semantic !== false) {
         const queryEmbedding = await embed(query);
         if (queryEmbedding) {
-          const { data, error } = await supabase.rpc("match_memories", {
-            query_embedding: JSON.stringify(queryEmbedding),
-            match_threshold: 0.4,
-            match_count: maxResults,
+          // Use hybrid_recall (RRF fusion) when embedding available
+          const { data, error } = await supabase.rpc("hybrid_recall", {
+            p_query_text: query,
+            p_query_embedding: JSON.stringify(queryEmbedding),
+            p_match_threshold: 0.3,
+            p_match_count: maxResults * 2, // wider pool, filter below
+            p_filter_type: type || null,
           });
 
           if (!error && data && data.length > 0) {
-            // Apply type + tag filters client-side
+            // Apply tag filters client-side
             let filtered = data as any[];
-            if (type) filtered = filtered.filter((m) => m.type === type);
             if (tags?.length) filtered = filtered.filter((m) => tags.some((t) => m.tags?.includes(t)));
+            filtered = filtered.slice(0, maxResults);
 
             if (filtered.length > 0) {
-              // Touch all returned memories (update access_count + accessed_at)
               await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
 
-              // Fetch links for the top result
               let linkSection = "";
               const top = filtered[0];
               const { data: linked } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
@@ -313,17 +314,17 @@ function createMcpServer(): McpServer {
 
               const results = filtered.map((m: any, i: number) => {
                 const tagStr = m.tags?.length ? ` [${m.tags.join(", ")}]` : "";
-                const rank = m.rank ? ` (rank ${(m.rank * 100).toFixed(0)}%)` : "";
+                const scoreStr = m.hybrid_score ? ` (score ${(m.hybrid_score * 100).toFixed(0)}%)` : "";
                 const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
                 const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
-                return `## ${m.name} (${m.type})${tagStr}${rank}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
+                return `## ${m.name} (${m.type})${tagStr}${scoreStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
               });
               return {
-                content: [{ type: "text" as const, text: `Found ${filtered.length} memor${filtered.length === 1 ? "y" : "ies"} (semantic+decay):\n\n${results.join("\n\n---\n\n")}` }],
+                content: [{ type: "text" as const, text: `Found ${filtered.length} memor${filtered.length === 1 ? "y" : "ies"} (hybrid BM25+vector):\n\n${results.join("\n\n---\n\n")}` }],
               };
             }
           }
-          // Fall through to keyword search if semantic returns nothing
+          // Fall through to keyword search if hybrid returns nothing
         }
       }
 

@@ -3,10 +3,6 @@
 Claude Code Task Queue Poller
 Polls azlab-memory Supabase for pending tasks, claims and executes them,
 then writes results back. Runs every 5 min via systemd timer.
-
-Model routing:
-  - Default / tags=["claude"]: run local claude CLI
-  - tags=["nemotron"]: call NVIDIA NIM API via nemoclaw-01 (free inference)
 """
 
 import json
@@ -18,26 +14,183 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-def _read_file(path):
+SUPABASE_URL = "https://ogqjjlbupqnvlcyrfnxi.supabase.co"
+
+def _load_supabase_key():
+    # Prefer service key (bypasses RLS) from memory-mcp-server env file
+    env_path = os.path.expanduser("~/azlab/services/memory-mcp-server/.env")
     try:
-        with open(os.path.expanduser(path)) as f:
+        with open(env_path) as f:
+            for line in f:
+                if line.startswith("SUPABASE_SERVICE_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    # Fall back to env var or hardcoded anon key
+    return os.environ.get(
+        "SUPABASE_KEY",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ncWpqbGJ1cHFudmxjeXJmbnhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwNDU1NzYsImV4cCI6MjA4OTYyMTU3Nn0.VVvHOmcR04gnVHa6k8_lHhdCt6zNhpHYbj4c68LkScc",
+    )
+
+SUPABASE_KEY = _load_supabase_key()
+CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
+HOSTNAME = socket.gethostname()
+
+# Nemotron routing — NVIDIA NIM API for cheap task classification
+NVIDIA_NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_API_KEY_FILE = os.path.expanduser("~/.nvidia_api_key")
+NEMOTRON_MODEL = "nvidia/nemotron-super-49b-instruct"
+
+ROUTING_TARGETS = ["claude-code", "cowork", "desktop"]
+
+ROUTING_PROMPT = """You are a task router for a homelab AI system. Classify the task below to exactly one target agent.
+
+Targets:
+- claude-code: Linux server ops, git, docker/podman, deployments, file edits, code, networking, infrastructure, APIs, scripting, anything on the homelab server
+- desktop: Windows-only tasks, OneDrive, local Office files, anything requiring a Windows app or GUI
+- cowork: Planning, research, writing docs, memory management, multi-turn conversational tasks, anything that needs discussion not execution
+
+Respond with ONLY the target name, nothing else. No punctuation, no explanation.
+
+Task title: {title}
+Task description: {description}"""
+
+# Discord notifications
+DISCORD_API = "https://discord.com/api/v10"
+DISCORD_JEFF_ID = "73899363499253760"
+_discord_token = None
+_discord_dm_channel = None
+
+def _get_discord_token():
+    global _discord_token
+    if _discord_token:
+        return _discord_token
+    _discord_token = os.environ.get("DISCORD_BOT_TOKEN")
+    if not _discord_token:
+        env_path = os.path.expanduser("~/.claude/channels/discord/.env")
+        try:
+            with open(env_path) as f:
+                for line in f:
+                    if line.startswith("DISCORD_BOT_TOKEN="):
+                        _discord_token = line.split("=", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+    return _discord_token
+
+def _discord_request(method, path, data=None):
+    token = _get_discord_token()
+    if not token:
+        return None
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(
+        f"{DISCORD_API}{path}",
+        data=body,
+        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
+        method=method,
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+def discord_notify(message):
+    """Send a short notification to Jeff's Discord DM. Best-effort — never raises."""
+    global _discord_dm_channel
+    try:
+        if not _discord_dm_channel:
+            ch = _discord_request("POST", "/users/@me/channels", {"recipient_id": DISCORD_JEFF_ID})
+            _discord_dm_channel = ch["id"]
+        _discord_request("POST", f"/channels/{_discord_dm_channel}/messages", {"content": message})
+    except Exception as e:
+        print(f"discord_notify failed (non-fatal): {e}", file=sys.stderr)
+
+
+def _get_nvidia_key():
+    key = os.environ.get("NVIDIA_API_KEY")
+    if key:
+        return key
+    try:
+        with open(NVIDIA_API_KEY_FILE) as f:
             return f.read().strip()
     except Exception:
         return None
 
 
-SUPABASE_URL = "https://ogqjjlbupqnvlcyrfnxi.supabase.co"
-SUPABASE_KEY = os.environ.get(
-    "SUPABASE_ANON_KEY",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ncWpqbGJ1cHFudmxjeXJmbnhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwNDU1NzYsImV4cCI6MjA4OTYyMTU3Nn0.VVvHOmcR04gnVHa6k8_lHhdCt6zNhpHYbj4c68LkScc",
-)
-CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
-HOSTNAME = socket.gethostname()
+def _route_via_nemotron(title, description):
+    """Ask Nemotron to classify the task. Returns target string or None on failure."""
+    key = _get_nvidia_key()
+    if not key:
+        return None
+    prompt = ROUTING_PROMPT.format(title=title, description=description[:500])
+    body = json.dumps({
+        "model": NEMOTRON_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 10,
+        "temperature": 0,
+    }).encode()
+    req = urllib.request.Request(
+        NVIDIA_NIM_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+            answer = data["choices"][0]["message"]["content"].strip().lower()
+            # Validate the response is a known target
+            for t in ROUTING_TARGETS:
+                if t in answer:
+                    return t
+            return None
+    except Exception as e:
+        print(f"Nemotron routing failed (non-fatal): {e}", file=sys.stderr)
+        return None
 
-# NVIDIA NIM for nemotron routing
-NEMOTRON_MODEL = "nvidia/nemotron-3-super-120b-a12b"
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY") or _read_file("~/.nvidia_api_key")
-NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+def _route_by_keywords(title, description):
+    """Fallback keyword-based routing when Nemotron is unavailable."""
+    text = (title + " " + description).lower()
+    desktop_signals = ["windows", "onedrive", "obsidian", "office", "excel", "word", "outlook", "c:\\", "appdata"]
+    cowork_signals = ["plan", "research", "write up", "document", "memory", "draft", "review", "summarize", "brainstorm"]
+    if any(s in text for s in desktop_signals):
+        return "desktop"
+    if any(s in text for s in cowork_signals):
+        return "cowork"
+    return "claude-code"  # default: if in doubt, we can handle it
+
+
+def route_auto_tasks():
+    """Find tasks with target=auto, classify them with Nemotron, update target."""
+    tasks = api_request(
+        "GET",
+        "task_queue",
+        params={
+            "status": "eq.pending",
+            "target": "eq.auto",
+            "order": "created_at.asc",
+            "limit": "5",
+            "select": "id,title,description",
+        },
+    )
+    if not tasks:
+        return
+
+    for task in tasks:
+        task_id = task["id"]
+        title = task["title"]
+        description = task.get("description", "")
+
+        target = _route_via_nemotron(title, description) or _route_by_keywords(title, description)
+        print(f"Auto-routing task {task_id[:8]} '{title}' → {target}")
+
+        api_request(
+            "PATCH",
+            f"task_queue?id=eq.{task_id}",
+            data={"target": target},
+        )
 
 
 def headers(extra=None):
@@ -67,16 +220,17 @@ def api_request(method, path, data=None, params=None):
 
 
 def claim_next_task():
-    """Fetch the highest-priority pending task and claim it atomically."""
+    """Fetch the highest-priority pending or delegated task and claim it atomically."""
+    # Pick up both 'pending' and 'delegated' tasks targeting claude-code
     tasks = api_request(
         "GET",
         "task_queue",
         params={
-            "status": "eq.pending",
+            "status": "in.(pending,delegated)",
             "target": "eq.claude-code",
             "order": "priority.asc,created_at.asc",
             "limit": "1",
-            "select": "id,title,description,context,priority,tags",
+            "select": "id,title,description,context,priority,tags,status",
         },
     )
     if not tasks:
@@ -84,10 +238,12 @@ def claim_next_task():
 
     task = tasks[0]
     task_id = task["id"]
+    current_status = task.get("status", "pending")
 
+    # Claim atomically — only succeeds if still in expected status
     claimed = api_request(
         "PATCH",
-        f"task_queue?id=eq.{task_id}&status=eq.pending",
+        f"task_queue?id=eq.{task_id}&status=eq.{current_status}",
         data={
             "status": "claimed",
             "claimed_by": HOSTNAME,
@@ -105,15 +261,20 @@ def mark_in_progress(task_id):
     api_request("PATCH", f"task_queue?id=eq.{task_id}", data={"status": "in_progress"})
 
 
-def mark_completed(task_id, result, model_used=None):
-    data = {"status": "completed", "result": result}
-    if model_used:
-        data["result"] = f"[model: {model_used}]\n\n{result}"
-    api_request("PATCH", f"task_queue?id=eq.{task_id}", data=data)
+def mark_completed(task_id, result):
+    api_request(
+        "PATCH",
+        f"task_queue?id=eq.{task_id}",
+        data={"status": "completed", "result": result},
+    )
 
 
 def mark_failed(task_id, error):
-    api_request("PATCH", f"task_queue?id=eq.{task_id}", data={"status": "failed", "error": error})
+    api_request(
+        "PATCH",
+        f"task_queue?id=eq.{task_id}",
+        data={"status": "failed", "error": error},
+    )
 
 
 def build_prompt(task):
@@ -130,66 +291,26 @@ def build_prompt(task):
     )
 
 
-def select_model(task):
-    """Choose execution model based on task tags and context."""
-    tags = task.get("tags") or []
-    context = task.get("context") or {}
-
-    if "nemotron" in tags or context.get("model") == "nemotron":
-        return "nemotron"
-    return "claude"
-
-
 def run_claude(prompt):
-    """Run task with local Claude Code."""
     result = subprocess.run(
         [CLAUDE_CMD, "--print", "--dangerously-skip-permissions"],
         input=prompt,
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=600,  # 10 min max per task
     )
     if result.returncode != 0:
-        raise RuntimeError(f"claude exited {result.returncode}: {result.stderr.strip()}")
+        raise RuntimeError(
+            f"claude exited {result.returncode}: {result.stderr.strip()}"
+        )
     return result.stdout.strip()
-
-
-def run_nemotron(prompt):
-    """Call NVIDIA NIM (Nemotron 120B) directly via the OpenAI-compatible API.
-    Falls back to Claude if the API call fails.
-    """
-    if not NVIDIA_API_KEY:
-        print("No NVIDIA API key found, falling back to Claude.", file=sys.stderr)
-        return run_claude(prompt)
-
-    payload = json.dumps({
-        "model": NEMOTRON_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 4096,
-        "temperature": 0.6,
-        "top_p": 0.9,
-    }).encode()
-
-    req = urllib.request.Request(
-        f"{NVIDIA_BASE_URL}/chat/completions",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {NVIDIA_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read())
-            return result["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"Nemotron API error, falling back to Claude: {e}", file=sys.stderr)
-        return run_claude(prompt)
 
 
 def main():
     print(f"[{datetime.now().isoformat()}] Polling task queue on {HOSTNAME}...")
+
+    # Route any unclassified tasks first
+    route_auto_tasks()
 
     task = claim_next_task()
     if not task:
@@ -197,26 +318,25 @@ def main():
         return
 
     task_id = task["id"]
-    model = select_model(task)
-    print(f"Claimed task {task_id}: {task['title']} [model: {model}]")
+    title = task["title"]
+    print(f"Claimed task {task_id}: {title}")
 
     mark_in_progress(task_id)
+    discord_notify(f"🟡 Claimed: {title} — starting now")
 
     try:
         prompt = build_prompt(task)
-        if model == "nemotron":
-            print(f"Running nemotron (az-labclaw) for task: {task['title']}")
-            result = run_nemotron(prompt)
-        else:
-            print(f"Running claude for task: {task['title']}")
-            result = run_claude(prompt)
-
-        mark_completed(task_id, result, model_used=model)
-        print(f"Task {task_id} completed [{model}].")
+        print(f"Running claude for task: {title}")
+        result = run_claude(prompt)
+        mark_completed(task_id, result)
+        summary = result.splitlines()[0][:120] if result else "done"
+        discord_notify(f"✅ Done: {title} — {summary}")
+        print(f"Task {task_id} completed.")
     except Exception as e:
         error_msg = str(e)
         print(f"Task {task_id} failed: {error_msg}", file=sys.stderr)
         mark_failed(task_id, error_msg)
+        discord_notify(f"❌ Failed: {title} — {error_msg[:120]}")
         sys.exit(1)
 
 
