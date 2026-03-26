@@ -299,6 +299,164 @@ def run_claude(prompt):
     return result.stdout.strip()
 
 
+# ── autonomous work loop ─────────────────────────────────────────────────────
+
+# Phoenix AZ is UTC-7 (no DST). Morning review window: 7:00–8:00 local = 14:00–15:00 UTC.
+MORNING_WINDOW_START_UTC = 14   # 7am Phoenix
+MORNING_WINDOW_END_UTC   = 15   # 8am Phoenix
+
+RESEARCH_COOLDOWN_HOURS = 20    # Only auto-queue research once per day
+
+def _in_morning_window() -> bool:
+    """Return True during Jeff's 7am review window (don't auto-generate work)."""
+    hour = datetime.now(timezone.utc).hour
+    return MORNING_WINDOW_START_UTC <= hour < MORNING_WINDOW_END_UTC
+
+
+def _has_recent_pending_task(goal_id: str) -> bool:
+    """Return True if goal already has a pending/claimed/failed task queued recently."""
+    try:
+        tasks = api_request(
+            "GET",
+            "task_queue",
+            params={
+                "goal_id": f"eq.{goal_id}",
+                "status": "in.(pending,claimed,failed)",
+                "select": "id",
+                "limit": "1",
+            },
+        )
+        return bool(tasks)
+    except Exception:
+        return True  # On error, assume task exists to avoid duplicates
+
+
+def auto_queue_from_goals():
+    """Find the highest-priority active milestone with an implementation_prompt and queue it."""
+    if _in_morning_window():
+        print("In morning review window — skipping auto-queue.")
+        return None
+
+    try:
+        milestones = api_request(
+            "GET",
+            "goals",
+            params={
+                "level": "eq.milestone",
+                "status": "eq.active",
+                "auto_queue": "eq.true",
+                "implementation_prompt": "not.is.null",
+                "order": "priority.asc,sort_order.asc",
+                "limit": "5",
+                "select": "id,title,implementation_prompt,last_queued_at,priority",
+            },
+        )
+    except Exception as e:
+        print(f"auto_queue_from_goals: failed to fetch goals: {e}", file=sys.stderr)
+        return None
+
+    for m in milestones:
+        goal_id = m["id"]
+        title = m["title"]
+
+        # Skip if queued recently (within last 6 hours)
+        if m.get("last_queued_at"):
+            last = datetime.fromisoformat(m["last_queued_at"].replace("Z", "+00:00"))
+            hours_ago = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+            if hours_ago < 6:
+                continue
+
+        # Skip if already has a pending/claimed task
+        if _has_recent_pending_task(goal_id):
+            continue
+
+        # Queue it
+        task_data = {
+            "title": f"[Auto] {title}",
+            "description": m["implementation_prompt"],
+            "status": "pending",
+            "target": "claude-code",
+            "source": "wren-scheduler",
+            "priority": m["priority"],
+            "goal_id": goal_id,
+            "tags": ["auto-queued", "goal-milestone"],
+        }
+        try:
+            result = api_request("POST", "task_queue", data=task_data)
+            task_id = result[0]["id"] if isinstance(result, list) else result.get("id")
+            # Update last_queued_at on goal
+            api_request("PATCH", f"goals?id=eq.{goal_id}",
+                        data={"last_queued_at": datetime.now(timezone.utc).isoformat()})
+            print(f"Auto-queued goal milestone: {title} (task {task_id})")
+            log_activity("status", f"Auto-queued: {title}", task_id=task_id)
+            discord_notify(f"📋 Auto-queued: {title} — picked from goals backlog")
+            return task_id
+        except Exception as e:
+            print(f"auto_queue_from_goals: failed to queue {goal_id}: {e}", file=sys.stderr)
+
+    return None
+
+
+def _research_recently_queued() -> bool:
+    """Return True if a self-improvement research task was queued recently."""
+    try:
+        tasks = api_request(
+            "GET",
+            "task_queue",
+            params={
+                "tags": "cs.{self-improvement-research}",
+                "order": "created_at.desc",
+                "select": "created_at",
+                "limit": "1",
+            },
+        )
+        if not tasks:
+            return False
+        last = datetime.fromisoformat(tasks[0]["created_at"].replace("Z", "+00:00"))
+        hours_ago = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+        return hours_ago < RESEARCH_COOLDOWN_HOURS
+    except Exception:
+        return False
+
+
+def auto_queue_research():
+    """When nothing else to do, queue a self-improvement research task for Iris."""
+    if _in_morning_window():
+        return
+    if _research_recently_queued():
+        print("Research task already queued recently — skipping.")
+        return
+
+    task_data = {
+        "title": "Daily self-improvement research — agentic workflows and AI",
+        "description": (
+            "Research today's developments in agentic AI systems, workflows, memory architectures, "
+            "and homelab automation. Focus on:\n"
+            "1. Any new papers, releases, or tools in agent memory and context management\n"
+            "2. New agent orchestration frameworks or significant updates to existing ones\n"
+            "3. Hardware/compute breakthroughs relevant to running AI locally\n"
+            "4. Practical improvements to multi-agent coordination patterns\n\n"
+            "Synthesize findings into 3-5 actionable recommendations for az-lab. "
+            "Post a summary to Discord (chat_id 1012721652049657896). "
+            "Save notable findings as memories in Supabase (type=project, tags=['memory','research','ai']). "
+            "If you find anything that represents a SEISMIC SHIFT — major model release, breakthrough hardware, "
+            "paradigm change in agent architecture — flag it explicitly in Discord with 🚨 and high urgency."
+        ),
+        "status": "pending",
+        "target": "cowork",
+        "source": "wren-scheduler",
+        "priority": 3,
+        "tags": ["self-improvement-research", "daily", "auto-queued"],
+    }
+    try:
+        result = api_request("POST", "task_queue", data=task_data)
+        task_id = result[0]["id"] if isinstance(result, list) else result.get("id")
+        print(f"Auto-queued daily research task {task_id}")
+        log_activity("status", "Queue idle — auto-queued daily research for Iris")
+    except Exception as e:
+        print(f"auto_queue_research failed: {e}", file=sys.stderr)
+
+
 def main():
     print(f"[{datetime.now().isoformat()}] Polling task queue on {HOSTNAME}...")
 
@@ -308,6 +466,11 @@ def main():
     task = claim_next_task()
     if not task:
         print("No pending tasks.")
+        # Try to auto-queue from goals backlog
+        queued = auto_queue_from_goals()
+        if not queued:
+            # Nothing in goals either — queue research fallback
+            auto_queue_research()
         return
 
     task_id = task["id"]
