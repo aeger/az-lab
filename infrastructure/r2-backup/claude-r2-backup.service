@@ -1,0 +1,14 @@
+[Unit]
+Description=az-lab R2 Backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/azlab/scripts/r2_backup.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=r2-backup
+
+[Install]
+WantedBy=default.target
