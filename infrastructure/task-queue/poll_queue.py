@@ -233,6 +233,23 @@ def claim_next_task():
     return task
 
 
+def log_activity(activity_type, content, task_id=None, metadata=None):
+    """Write a row to agent_activity. Best-effort — never raises."""
+    try:
+        data = {
+            "agent": "wren",
+            "activity_type": activity_type,
+            "content": content,
+        }
+        if task_id:
+            data["task_id"] = task_id
+        if metadata:
+            data["metadata"] = metadata
+        api_request("POST", "agent_activity", data=data)
+    except Exception as e:
+        print(f"log_activity failed (non-fatal): {e}", file=sys.stderr)
+
+
 def mark_in_progress(task_id):
     pass  # 'claimed' already signals in-progress; schema has no in_progress status
 
@@ -298,20 +315,24 @@ def main():
     print(f"Claimed task {task_id}: {title}")
 
     mark_in_progress(task_id)
+    log_activity("status", f"Claimed: {title}", task_id=task_id)
     discord_notify(f"🟡 Claimed: {title} — starting now")
 
     try:
         prompt = build_prompt(task)
         print(f"Running claude for task: {title}")
+        log_activity("thinking", f"Running Claude for: {title}", task_id=task_id)
         result = run_claude(prompt)
         mark_completed(task_id, result)
         summary = result.splitlines()[0][:120] if result else "done"
+        log_activity("result", summary, task_id=task_id)
         discord_notify(f"✅ Done: {title} — {summary}")
         print(f"Task {task_id} completed.")
     except Exception as e:
         error_msg = str(e)
         print(f"Task {task_id} failed: {error_msg}", file=sys.stderr)
         mark_failed(task_id, error_msg)
+        log_activity("error", error_msg[:200], task_id=task_id)
         discord_notify(f"❌ Failed: {title} — {error_msg[:120]}")
         sys.exit(1)
 
