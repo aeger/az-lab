@@ -55,51 +55,27 @@ Respond with ONLY the target name, nothing else. No punctuation, no explanation.
 Task title: {title}
 Task description: {description}"""
 
-# Discord notifications
-DISCORD_API = "https://discord.com/api/v10"
-DISCORD_JEFF_ID = "73899363499253760"
-_discord_token = None
-_discord_dm_channel = None
+# Discord notifications via webhook (more reliable than bot DMs)
+DISCORD_WEBHOOK_FILE = os.path.expanduser("~/claude/agent-bus/discord_webhooks.json")
 
-def _get_discord_token():
-    global _discord_token
-    if _discord_token:
-        return _discord_token
-    _discord_token = os.environ.get("DISCORD_BOT_TOKEN")
-    if not _discord_token:
-        env_path = os.path.expanduser("~/.claude/channels/discord/.env")
-        try:
-            with open(env_path) as f:
-                for line in f:
-                    if line.startswith("DISCORD_BOT_TOKEN="):
-                        _discord_token = line.split("=", 1)[1].strip()
-                        break
-        except Exception:
-            pass
-    return _discord_token
-
-def _discord_request(method, path, data=None):
-    token = _get_discord_token()
-    if not token:
+def _get_webhook_url():
+    try:
+        with open(DISCORD_WEBHOOK_FILE) as f:
+            hooks = json.load(f)
+            return hooks.get("claude-code")
+    except Exception:
         return None
-    body = json.dumps(data).encode() if data else None
-    req = urllib.request.Request(
-        f"{DISCORD_API}{path}",
-        data=body,
-        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
-        method=method,
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read())
 
 def discord_notify(message):
-    """Send a short notification to Jeff's Discord DM. Best-effort — never raises."""
-    global _discord_dm_channel
+    """Post a notification to the claude-code Discord channel. Best-effort — never raises."""
     try:
-        if not _discord_dm_channel:
-            ch = _discord_request("POST", "/users/@me/channels", {"recipient_id": DISCORD_JEFF_ID})
-            _discord_dm_channel = ch["id"]
-        _discord_request("POST", f"/channels/{_discord_dm_channel}/messages", {"content": message})
+        url = _get_webhook_url()
+        if not url:
+            return
+        body = json.dumps({"content": message}).encode()
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
     except Exception as e:
         print(f"discord_notify failed (non-fatal): {e}", file=sys.stderr)
 
