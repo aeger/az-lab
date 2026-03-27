@@ -159,11 +159,34 @@ const SOURCE_TRUST: Record<string, string> = {
   "manual": "verified",
 };
 
+// ── Startup Migration ────────────────────────────────────────────────────────
+// Attempts to add link_type column to memory_links via the pre-registered
+// add_link_type_if_missing() SECURITY DEFINER function.
+// If the function doesn't exist yet, this is a no-op — apply migrations/001_add_link_type.sql
+// via the Supabase SQL editor to bootstrap.
+async function applyStartupMigrations(): Promise<void> {
+  try {
+    const { data, error } = await supabase.rpc("add_link_type_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration RPC not yet registered — apply migrations/001_add_link_type.sql in Supabase SQL editor to enable typed links.");
+      } else {
+        console.warn("Migration warning:", error.message);
+      }
+    } else {
+      console.log("Startup migration result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Startup migration skipped:", err.message);
+  }
+}
+
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.4.0",
+    version: "3.6.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -222,7 +245,7 @@ function createMcpServer(): McpServer {
           if (similar?.length) {
             const links = similar
               .filter((m: any) => m.id !== existing.id)
-              .map((m: any) => ({ source_id: existing.id, target_id: m.id, relationship: "related_to", strength: Math.min(m.similarity, 1.0) }));
+              .map((m: any) => ({ source_id: existing.id, target_id: m.id, relationship: "related_to", link_type: "semantic", strength: Math.min(m.similarity, 1.0) }));
             if (links.length) {
               await supabase.from("memory_links").upsert(links, { onConflict: "source_id,target_id,relationship" });
               linkNote = ` Re-linked to ${links.length} related memor${links.length === 1 ? "y" : "ies"}.`;
@@ -252,7 +275,7 @@ function createMcpServer(): McpServer {
         if (similar?.length) {
           const links = similar
             .filter((m: any) => m.id !== inserted.id)
-            .map((m: any) => ({ source_id: inserted.id, target_id: m.id, relationship: "related_to", strength: Math.min(m.similarity, 1.0) }));
+            .map((m: any) => ({ source_id: inserted.id, target_id: m.id, relationship: "related_to", link_type: "semantic", strength: Math.min(m.similarity, 1.0) }));
           if (links.length) {
             await supabase.from("memory_links").upsert(links, { onConflict: "source_id,target_id,relationship" });
             linkNote = ` Linked to ${links.length} related memor${links.length === 1 ? "y" : "ies"}.`;
@@ -304,11 +327,73 @@ function createMcpServer(): McpServer {
             if (filtered.length > 0) {
               await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
 
+              // Fetch temporal/causal linked memories for all top results and apply score boost
+              const filteredIds = new Set(filtered.map((m: any) => m.id));
+              const boostedExtras: Map<string, { mem: any; boost: number }> = new Map();
+
+              // For each top result, fetch its links and check for temporal/causal types
+              const linkFetches = await Promise.all(
+                filtered.map(async (m: any) => {
+                  const { data: links } = await supabase
+                    .from("memory_links")
+                    .select("target_id, link_type, strength")
+                    .eq("source_id", m.id)
+                    .in("link_type", ["temporal", "causal"]);
+                  return { sourceId: m.id, links: links || [] };
+                })
+              );
+
+              // Collect unique target IDs for temporal/causal links not already in results
+              const tcTargetIds: string[] = [];
+              for (const { links } of linkFetches) {
+                for (const link of links) {
+                  if (!filteredIds.has(link.target_id) && !tcTargetIds.includes(link.target_id)) {
+                    tcTargetIds.push(link.target_id);
+                  }
+                }
+              }
+
+              // Fetch those extra memories and assign boosted scores
+              if (tcTargetIds.length > 0) {
+                const { data: extraMems } = await supabase
+                  .from("memories")
+                  .select("id, type, name, description, content, tags, source, conflict_flagged")
+                  .in("id", tcTargetIds);
+                if (extraMems) {
+                  for (const em of extraMems) {
+                    // Find max boost from any temporal/causal link pointing to this memory
+                    let maxBoost = 0;
+                    for (const { links } of linkFetches) {
+                      const link = links.find((l: any) => l.target_id === em.id);
+                      if (link) maxBoost = Math.max(maxBoost, 0.1 * (link.strength || 1.0));
+                    }
+                    boostedExtras.set(em.id, {
+                      mem: { ...em, hybrid_score: (filtered[filtered.length - 1]?.hybrid_score || 0.5) + maxBoost },
+                      boost: maxBoost,
+                    });
+                  }
+                }
+              }
+
+              // Fetch links for the top result to show in the link section
               let linkSection = "";
               const top = filtered[0];
               const { data: linked } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
               if (linked?.length) {
-                const linkLines = linked.map((l: any) => `  - **${l.name}** (${l.relationship}, strength ${l.strength.toFixed(2)}): ${l.description}`);
+                // Fetch link_type for each linked memory from memory_links
+                const { data: linkTypeRows } = await supabase
+                  .from("memory_links")
+                  .select("target_id, link_type")
+                  .eq("source_id", top.id)
+                  .in("target_id", linked.map((l: any) => l.id));
+                const linkTypeMap: Record<string, string> = {};
+                for (const lt of (linkTypeRows || [])) {
+                  linkTypeMap[lt.target_id] = lt.link_type || "semantic";
+                }
+                const linkLines = linked.map((l: any) => {
+                  const lt = linkTypeMap[l.id] || "semantic";
+                  return `  - **${l.name}** (${l.relationship}, type:${lt}, strength ${l.strength.toFixed(2)}): ${l.description}`;
+                });
                 linkSection = `\n\n**Linked memories (${linked.length}):**\n${linkLines.join("\n")}`;
               }
 
@@ -319,8 +404,20 @@ function createMcpServer(): McpServer {
                 const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
                 return `## ${m.name} (${m.type})${tagStr}${scoreStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
               });
+
+              // Append temporal/causal boosted extras not already in results
+              for (const { mem, boost } of boostedExtras.values()) {
+                const tagStr = mem.tags?.length ? ` [${mem.tags.join(", ")}]` : "";
+                const scoreStr = ` (score ${((mem.hybrid_score || 0) * 100).toFixed(0)}% +boost:${(boost * 100).toFixed(0)}%)`;
+                const trust = SOURCE_TRUST[mem.source] ? ` · trust:${SOURCE_TRUST[mem.source]}` : "";
+                const conflictFlag = mem.conflict_flagged ? " ⚠️" : "";
+                results.push(`## ${mem.name} (${mem.type})${tagStr}${scoreStr}${trust}${conflictFlag} [temporal/causal link]\n_${mem.description}_\n\n${mem.content}`);
+              }
+
+              const totalCount = filtered.length + boostedExtras.size;
+              const boostNote = boostedExtras.size > 0 ? ` (${boostedExtras.size} added via temporal/causal links)` : "";
               return {
-                content: [{ type: "text" as const, text: `Found ${filtered.length} memor${filtered.length === 1 ? "y" : "ies"} (hybrid BM25+vector):\n\n${results.join("\n\n---\n\n")}` }],
+                content: [{ type: "text" as const, text: `Found ${totalCount} memor${totalCount === 1 ? "y" : "ies"} (hybrid BM25+vector)${boostNote}:\n\n${results.join("\n\n---\n\n")}` }],
               };
             }
           }
@@ -375,6 +472,58 @@ function createMcpServer(): McpServer {
 
       if (error) return { content: [{ type: "text" as const, text: `Error deleting: ${error.message}` }] };
       return { content: [{ type: "text" as const, text: `Deleted memory "${name}". Audit log preserved.` }] };
+    }
+  );
+
+  // ── Tool: add_memory_link ────────────────────────────────────────────────────
+  server.tool(
+    "add_memory_link",
+    "Create a typed Zettelkasten link between two memories. Link types: semantic (topically related), temporal (time-ordered sequence), causal (A caused/led to B), entity (same entity referenced). Temporal and causal links receive a recall score boost.",
+    {
+      source_id: z.string().uuid().describe("UUID of the source memory"),
+      target_id: z.string().uuid().describe("UUID of the target memory"),
+      relationship: z.string().optional().describe("Relationship label, e.g. 'causes', 'precedes', 'related_to', 'references' (default: related_to)"),
+      link_type: z.enum(["semantic", "temporal", "causal", "entity"]).optional().describe("MAGMA link type — semantic: topically related, temporal: time-ordered, causal: A caused B, entity: same entity (default: semantic)"),
+      strength: z.number().min(0).max(1).optional().describe("Link strength 0-1 (default: 1.0)"),
+    },
+    async ({ source_id, target_id, relationship, link_type, strength }) => {
+      // Validate both memories exist
+      const { data: srcMem } = await supabase.from("memories").select("id, name").eq("id", source_id).maybeSingle();
+      if (!srcMem) return { content: [{ type: "text" as const, text: `Source memory not found: ${source_id}` }] };
+
+      const { data: tgtMem } = await supabase.from("memories").select("id, name").eq("id", target_id).maybeSingle();
+      if (!tgtMem) return { content: [{ type: "text" as const, text: `Target memory not found: ${target_id}` }] };
+
+      const rel = relationship || "related_to";
+      const ltype = link_type || "semantic";
+      const str = strength ?? 1.0;
+
+      const { error } = await supabase
+        .from("memory_links")
+        .upsert(
+          { source_id, target_id, relationship: rel, link_type: ltype, strength: str },
+          { onConflict: "source_id,target_id,relationship" }
+        );
+
+      if (error) {
+        // If link_type column doesn't exist yet, fall back to insert without it
+        if (error.message?.includes("link_type")) {
+          const { error: fallbackErr } = await supabase
+            .from("memory_links")
+            .upsert(
+              { source_id, target_id, relationship: rel, strength: str },
+              { onConflict: "source_id,target_id,relationship" }
+            );
+          if (fallbackErr) return { content: [{ type: "text" as const, text: `Error creating link: ${fallbackErr.message}. Note: run migrations/001_add_link_type.sql to enable typed links.` }] };
+          return { content: [{ type: "text" as const, text: `Linked "${srcMem.name}" → "${tgtMem.name}" (${rel}, strength ${str.toFixed(2)}) — warning: link_type not persisted, apply migrations/001_add_link_type.sql.` }] };
+        }
+        return { content: [{ type: "text" as const, text: `Error creating link: ${error.message}` }] };
+      }
+
+      const boostNote = ltype === "temporal" || ltype === "causal" ? " (recall-boosted)" : "";
+      return {
+        content: [{ type: "text" as const, text: `Linked "${srcMem.name}" → "${tgtMem.name}" (${rel}, type:${ltype}${boostNote}, strength ${str.toFixed(2)})` }],
+      };
     }
   );
 
@@ -899,6 +1048,73 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ── Tool: get_memory_block ───────────────────────────────────────────────────
+  server.tool(
+    "get_memory_block",
+    "Read a named memory block for a specific agent. Used for cross-agent whisper channel (e.g. guidance, pending_items, project_context).",
+    {
+      agent: z.string().describe("Agent name, e.g. 'wren', 'iris'"),
+      block_name: z.string().describe("Block name: guidance, user_prefs, project_context, session_patterns, pending_items, active_task"),
+    },
+    async ({ agent, block_name }) => {
+      const { data, error } = await supabase
+        .from("memory_blocks")
+        .select("content, updated_at, updated_by")
+        .eq("agent", agent)
+        .eq("block_name", block_name)
+        .maybeSingle();
+
+      if (error) return { content: [{ type: "text" as const, text: `Error reading memory block: ${error.message}` }] };
+      if (!data) return { content: [{ type: "text" as const, text: `No block '${block_name}' found for agent '${agent}'.` }] };
+
+      const ts = data.updated_at ? ` (updated ${new Date(data.updated_at).toISOString().slice(0, 16)} by ${data.updated_by || "unknown"})` : "";
+      return {
+        content: [{ type: "text" as const, text: `[${agent}/${block_name}]${ts}\n\n${data.content}` }],
+      };
+    }
+  );
+
+  // ── Tool: set_memory_block ───────────────────────────────────────────────────
+  server.tool(
+    "set_memory_block",
+    "Upsert a named memory block for a specific agent. Use this for the cross-agent whisper channel — write to another agent's guidance or pending_items block.",
+    {
+      agent: z.string().describe("Agent name, e.g. 'wren', 'iris'"),
+      block_name: z.string().describe("Block name: guidance, user_prefs, project_context, session_patterns, pending_items, active_task"),
+      content: z.string().describe("Full content to store in the block"),
+      updated_by: z.string().optional().describe("Who is writing (default: caller identity)"),
+    },
+    async ({ agent, block_name, content, updated_by }) => {
+      const threat = scanContent(content);
+      if (threat) {
+        return { content: [{ type: "text" as const, text: `Blocked: content matches threat pattern '${threat}'. Block not written.` }] };
+      }
+
+      const contentHash = Buffer.from(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(content))
+      ).toString("hex").slice(0, 16);
+
+      const { error } = await supabase
+        .from("memory_blocks")
+        .upsert(
+          {
+            agent,
+            block_name,
+            content,
+            content_hash: contentHash,
+            updated_by: updated_by || "claude-code",
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "agent,block_name" }
+        );
+
+      if (error) return { content: [{ type: "text" as const, text: `Error writing memory block: ${error.message}` }] };
+      return {
+        content: [{ type: "text" as const, text: `Wrote block '${block_name}' for agent '${agent}' (hash: ${contentHash}).` }],
+      };
+    }
+  );
+
   // ── Home Assistant Tools ─────────────────────────────────────────────────────
   if (HA_URL && HA_TOKEN) {
     const haFetch = async (path: string, method = "GET", body?: object) => {
@@ -996,8 +1212,8 @@ const app = express();
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 3; // +5 r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "3.4.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
+  res.json({ status: "ok", service: "memory-mcp-server", version: "3.6.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
@@ -1052,8 +1268,9 @@ app.delete("/mcp", async (req: Request, res: Response) => {
   res.status(400).json({ error: "No session found." });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 3;
-  console.log(`Memory MCP Server v3.4.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+app.listen(PORT, "0.0.0.0", async () => {
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
+  console.log(`Memory MCP Server v3.6.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
+  await applyStartupMigrations();
 });
