@@ -215,6 +215,23 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 004 skipped:", err.message);
   }
+
+  // Migration 005: Add 'duplicate' to memory_conflicts conflict_type check constraint
+  try {
+    const { data, error } = await supabase.rpc("apply_duplicate_conflict_type_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 005 RPC not yet registered — apply migrations/005_add_duplicate_conflict_type.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 005 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 005 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 005 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
