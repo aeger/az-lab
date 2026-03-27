@@ -165,20 +165,38 @@ const SOURCE_TRUST: Record<string, string> = {
 // If the function doesn't exist yet, this is a no-op — apply migrations/001_add_link_type.sql
 // via the Supabase SQL editor to bootstrap.
 async function applyStartupMigrations(): Promise<void> {
+  // Migration 001: link_type column on memory_links
   try {
     const { data, error } = await supabase.rpc("add_link_type_if_missing");
     if (error) {
       if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
           error.message?.includes("not found in the schema cache")) {
-        console.log("Migration RPC not yet registered — apply migrations/001_add_link_type.sql in Supabase SQL editor to enable typed links.");
+        console.log("Migration 001 RPC not yet registered — apply migrations/001_add_link_type.sql in Supabase SQL editor.");
       } else {
-        console.warn("Migration warning:", error.message);
+        console.warn("Migration 001 warning:", error.message);
       }
     } else {
-      console.log("Startup migration result:", data);
+      console.log("Migration 001 result:", data);
     }
   } catch (err: any) {
-    console.warn("Startup migration skipped:", err.message);
+    console.warn("Migration 001 skipped:", err.message);
+  }
+
+  // Migration 003: adaptive decay columns (last_accessed_at, importance_score)
+  try {
+    const { data, error } = await supabase.rpc("apply_adaptive_decay_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 003 RPC not yet registered — apply migrations/003_adaptive_decay.sql in Supabase SQL editor to enable adaptive decay.");
+      } else {
+        console.warn("Migration 003 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 003 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 003 skipped:", err.message);
   }
 }
 
@@ -186,7 +204,7 @@ async function applyStartupMigrations(): Promise<void> {
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.6.0",
+    version: "3.7.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -202,8 +220,9 @@ function createMcpServer(): McpServer {
       content: z.string().describe("Full memory content. For feedback/project types, include Why and How to apply."),
       tags: z.array(z.string()).optional().describe("Tags for categorization and search"),
       source: z.string().optional().describe("Who is writing: claude-code, claude-ai, manual"),
+      importance_score: z.number().min(0).max(1).optional().describe("Importance 0-1 (default 0.5). Higher = decays slower and ranks higher in recall. Use 0.8+ for critical long-term facts, 0.2 for ephemeral context."),
     },
-    async ({ type, name, description, content, tags, source }) => {
+    async ({ type, name, description, content, tags, source, importance_score }) => {
       // Security gate — scan all text fields before touching the DB
       const scanTargets: Array<[string, string]> = [
         ["name", name], ["description", description], ["content", content],
@@ -230,6 +249,7 @@ function createMcpServer(): McpServer {
       if (existing) {
         const update: Record<string, unknown> = { type, description, content, tags: memTags, source: src };
         if (embedding) update.embedding = JSON.stringify(embedding);
+        if (importance_score !== undefined) update.importance_score = importance_score;
         const { error } = await supabase.from("memories").update(update).eq("id", existing.id);
         if (error) return { content: [{ type: "text" as const, text: `Error updating memory: ${error.message}` }] };
 
@@ -260,6 +280,7 @@ function createMcpServer(): McpServer {
 
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
       if (embedding) insert.embedding = JSON.stringify(embedding);
+      if (importance_score !== undefined) insert.importance_score = importance_score;
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
@@ -400,9 +421,11 @@ function createMcpServer(): McpServer {
               const results = filtered.map((m: any, i: number) => {
                 const tagStr = m.tags?.length ? ` [${m.tags.join(", ")}]` : "";
                 const scoreStr = m.hybrid_score ? ` (score ${(m.hybrid_score * 100).toFixed(0)}%)` : "";
+                const importanceStr = m.importance_score !== undefined && m.importance_score !== 0.5 ? ` imp:${m.importance_score.toFixed(2)}` : "";
+                const accessStr = m.access_count > 0 ? ` accessed:${m.access_count}x` : "";
                 const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
                 const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
-                return `## ${m.name} (${m.type})${tagStr}${scoreStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
+                return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
               });
 
               // Append temporal/causal boosted extras not already in results
@@ -1213,7 +1236,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "3.6.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "3.7.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
@@ -1270,7 +1293,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v3.6.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v3.7.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
 });
