@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "1.0",
+  "name": "volt",
+  "displayName": "Volt",
+  "description": "Nemotron 120B inference agent on nemoclaw-01 (VM 108). Local LLM inference via NVIDIA NIM API. Used for privacy-sensitive tasks, high-volume generation, and NemoClaw sandbox experiments.",
+  "url": "http://192.168.1.183",
+  "version": "1.0.0",
+  "model": "nemotron-120b",
+  "runtime": "nvidia-nim",
+  "host": "nemoclaw-01",
+  "capabilities": [
+    "local_llm_inference",
+    "text_generation",
+    "code_generation",
+    "embeddings",
+    "nemoclaw_sandbox",
+    "openai_compatible_api"
+  ],
+  "accepted_tasks": [
+    "text_generation",
+    "code_generation",
+    "summarization",
+    "classification",
+    "privacy_sensitive_inference",
+    "high_volume_generation",
+    "nemoclaw_experiments"
+  ],
+  "contact": {
+    "discord_channel": "claude-code",
+    "queue": "task_queue",
+    "queue_target": "nemotron",
+    "routing_tag": "nemotron"
+  },
+  "authentication": {
+    "type": "header",
+    "header": "Authorization",
+    "scheme": "Bearer",
+    "note": "NVIDIA NIM API key required — see credentials table"
+  }
+}

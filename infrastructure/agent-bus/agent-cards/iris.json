@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "1.0",
+  "name": "iris",
+  "displayName": "Iris",
+  "description": "Claude Cowork agent (claude.ai). Research, planning, long-context analysis, and cross-agent coordination. Primary interface for Jeff's interactive sessions.",
+  "url": "https://claude.ai",
+  "version": "1.0.0",
+  "model": "claude-opus-4-6",
+  "runtime": "claude-cowork",
+  "host": "claude.ai",
+  "capabilities": [
+    "long_context_analysis",
+    "research",
+    "planning",
+    "document_writing",
+    "architecture_review",
+    "task_delegation",
+    "memory_management",
+    "supabase_sql",
+    "mcp_tools"
+  ],
+  "accepted_tasks": [
+    "research",
+    "planning",
+    "architecture_review",
+    "document_drafting",
+    "strategy",
+    "task_routing",
+    "memory_organization",
+    "cross_agent_coordination"
+  ],
+  "contact": {
+    "discord_channel": "general",
+    "queue": "task_queue",
+    "queue_target": "claude-ai"
+  },
+  "authentication": {
+    "type": "none",
+    "note": "Interactive sessions only — no direct programmatic endpoint"
+  }
+}

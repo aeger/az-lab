@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "1.0",
+  "name": "forge",
+  "displayName": "Forge",
+  "description": "Claude Code Desktop agent running on Windows workstation. Local code editing, git operations, and development environment management on the Windows dev machine.",
+  "url": "local://forge",
+  "version": "1.0.0",
+  "model": "claude-sonnet-4-6",
+  "runtime": "claude-code-desktop",
+  "host": "windows-workstation",
+  "capabilities": [
+    "code_editing",
+    "git_operations",
+    "local_file_system",
+    "bash_via_wsl",
+    "mcp_tools",
+    "ssh_to_svc_podman"
+  ],
+  "accepted_tasks": [
+    "code_editing",
+    "refactoring",
+    "local_dev_environment",
+    "git_workflow",
+    "windows_side_debugging",
+    "local_build_and_test"
+  ],
+  "contact": {
+    "discord_channel": "claude-code",
+    "queue": "task_queue",
+    "queue_target": "claude-code-desktop"
+  },
+  "authentication": {
+    "type": "none",
+    "note": "Local desktop process — not network-accessible"
+  }
+}

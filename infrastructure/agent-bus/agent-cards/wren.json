@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "1.0",
+  "name": "wren",
+  "displayName": "Wren",
+  "description": "Claude Code agent running on svc-podman-01. Primary operational agent for infrastructure management, deployment, code execution, and homelab automation.",
+  "url": "http://192.168.1.181:8765",
+  "version": "1.0.0",
+  "model": "claude-sonnet-4-6",
+  "runtime": "claude-code",
+  "host": "svc-podman-01",
+  "capabilities": [
+    "code_execution",
+    "file_system",
+    "bash_commands",
+    "git_operations",
+    "podman_management",
+    "systemd_management",
+    "infrastructure_deployment",
+    "supabase_sql",
+    "mcp_tools",
+    "task_queue_processing"
+  ],
+  "accepted_tasks": [
+    "deploy_service",
+    "infrastructure_change",
+    "code_review",
+    "debugging",
+    "file_operations",
+    "database_query",
+    "system_monitoring",
+    "security_audit",
+    "package_management",
+    "log_analysis"
+  ],
+  "contact": {
+    "discord_channel": "claude-code",
+    "queue": "task_queue",
+    "queue_target": "claude-code"
+  },
+  "authentication": {
+    "type": "header",
+    "header": "X-Agent-Secret"
+  }
+}

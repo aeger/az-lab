@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "1.0",
+  "name": "atlas",
+  "displayName": "Atlas",
+  "description": "Claude Desktop agent running on Windows workstation. Local desktop access, browser automation, Windows tool integration, and phone-to-desktop task dispatch via Dispatch.",
+  "url": "local://atlas",
+  "version": "1.0.0",
+  "model": "claude-sonnet-4-6",
+  "runtime": "claude-desktop",
+  "host": "windows-workstation",
+  "capabilities": [
+    "local_file_access",
+    "browser_automation",
+    "windows_tools",
+    "mcp_tools",
+    "dispatch_bridge",
+    "ssh_to_svc_podman",
+    "supabase_sql"
+  ],
+  "accepted_tasks": [
+    "local_file_management",
+    "browser_interaction",
+    "windows_automation",
+    "dispatch_phone_tasks",
+    "infrastructure_via_ssh",
+    "research_with_browser"
+  ],
+  "contact": {
+    "discord_channel": "general",
+    "queue": "task_queue",
+    "queue_target": "claude-desktop"
+  },
+  "authentication": {
+    "type": "none",
+    "note": "Local desktop process — not network-accessible"
+  }
+}
