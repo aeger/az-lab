@@ -198,13 +198,30 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 003 skipped:", err.message);
   }
+
+  // Migration 004: PageRank scoring over Zettelkasten memory link graph
+  try {
+    const { data, error } = await supabase.rpc("apply_pagerank_migration_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 004 RPC not yet registered — apply migrations/004_pagerank.sql in Supabase SQL editor to enable PageRank scoring.");
+      } else {
+        console.warn("Migration 004 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 004 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 004 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.7.0",
+    version: "3.8.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
