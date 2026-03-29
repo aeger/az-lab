@@ -24,6 +24,8 @@ LOG_FILE = Path.home() / ".wren-watchdog/reaction_guard.log"
 DISCORD_API = "https://discord.com/api/v10"
 EYES_EMOJI = "%F0%9F%91%80"
 CHECK_EMOJI = "%E2%9C%85"
+EYES_LABEL = "👀"
+CHECK_LABEL = "✅"
 
 logging.basicConfig(
     filename=str(LOG_FILE),
@@ -83,11 +85,12 @@ def put_reaction(bot_token: str, message_id: str, emoji: str) -> bool:
             headers={"Authorization": f"Bot {bot_token}", "Content-Length": "0"},
             timeout=5,
         )
+        label = EYES_LABEL if emoji == EYES_EMOJI else CHECK_LABEL
         if r.status_code in (200, 204):
-            log.info(f"reacted {emoji} to {message_id}")
+            log.info(f"reacted {label} to {message_id}")
             return True
         else:
-            log.warning(f"react failed {r.status_code} for {message_id}")
+            log.warning(f"react {label} failed {r.status_code} for {message_id}")
             return False
     except Exception as e:
         log.warning(f"put_reaction error: {e}")
@@ -149,6 +152,16 @@ def main():
     state.setdefault("seen_ids", [])
     state.setdefault("pending", {})
     state.setdefault("last_heartbeat_ts", None)
+
+    # Seed seen_ids on fresh start so we don't 👀 historical messages
+    if not state["seen_ids"]:
+        startup_msgs = get_messages(bot_token)
+        for msg in startup_msgs:
+            mid = msg.get("id", "")
+            if mid:
+                state["seen_ids"].append(mid)
+        log.info(f"seeded {len(state['seen_ids'])} existing messages on startup")
+        save_state(state)
 
     while True:
         try:
