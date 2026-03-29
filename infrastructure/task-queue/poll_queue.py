@@ -255,29 +255,64 @@ def mark_in_progress(task_id):
     pass  # 'claimed' already signals in-progress; schema has no in_progress status
 
 
-def mark_completed(task_id, result):
+def update_goal_notes(goal_id, note_line, progress=None, status=None):
+    """Append a timestamped note to goals.notes, optionally update progress/status. Best-effort."""
+    try:
+        rows = api_request("GET", "goals", params={"id": f"eq.{goal_id}", "select": "notes"})
+        existing = (rows[0].get("notes") or "") if rows else ""
+        updated = (existing.rstrip("\n") + "\n" + note_line).lstrip("\n")
+        patch = {"notes": updated}
+        if progress is not None:
+            patch["progress"] = progress
+        if status is not None:
+            patch["status"] = status
+        api_request("PATCH", f"goals?id=eq.{goal_id}", data=patch)
+    except Exception as e:
+        print(f"update_goal_notes failed (non-fatal): {e}", file=sys.stderr)
+
+
+def mark_completed(task_id, result, goal_id=None):
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
         data={"status": "completed", "result": result},
     )
+    summary = result.splitlines()[0][:200] if result else "done"
+    log_activity("result", f"Completed: {summary}", task_id=task_id)
+    if goal_id:
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        update_goal_notes(
+            goal_id,
+            f"Completed {date_str}: {summary}",
+            progress=100,
+            status="completed",
+        )
+        print(f"Marked goal {goal_id} as completed (progress=100).")
 
 
-def mark_pending_eval(task_id, result):
+def mark_pending_eval(task_id, result, goal_id=None):
     """Route CRIT/HIGH completed tasks to Iris for evaluation before marking done."""
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
         data={"status": "pending_eval", "result": result, "target": "cowork"},
     )
+    log_activity("status", "Pending Iris eval", task_id=task_id)
+    if goal_id:
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        summary = result.splitlines()[0][:200] if result else "pending"
+        update_goal_notes(goal_id, f"Pending eval {date_str}: {summary}")
 
 
-def mark_failed(task_id, error):
+def mark_failed(task_id, error, goal_id=None):
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
         data={"status": "failed", "error": error},
     )
+    if goal_id:
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        update_goal_notes(goal_id, f"Failed {date_str}: {error[:100]}")
 
 
 def build_prompt(task):
@@ -533,30 +568,22 @@ def main():
         log_activity("thinking", f"Starting: {title}", task_id=task_id)
         result = run_claude(prompt, task_id=task_id)
         summary = result.splitlines()[0][:120] if result else "done"
-        log_activity("result", summary, task_id=task_id)
+        goal_id = task.get("goal_id")
 
         # CRIT (0) and HIGH (1) tasks go to Iris for evaluation before completion
         task_priority = task.get("priority", 2)
         if task_priority <= 1:
-            mark_pending_eval(task_id, result)
+            mark_pending_eval(task_id, result, goal_id=goal_id)
             discord_notify(f"🔍 Pending eval: {title} — {summary}")
             print(f"Task {task_id} pending evaluation by Iris.")
         else:
-            mark_completed(task_id, result)
+            mark_completed(task_id, result, goal_id=goal_id)
             discord_notify(f"✅ Done: {title} — {summary}")
             print(f"Task {task_id} completed.")
-            # Mark linked goal milestone as completed so pipeline advances
-            goal_id = task.get("goal_id")
-            if goal_id:
-                try:
-                    api_request("PATCH", f"goals?id=eq.{goal_id}", data={"status": "completed"})
-                    print(f"Marked goal {goal_id} as completed.")
-                except Exception as ge:
-                    print(f"Failed to complete goal {goal_id}: {ge}", file=sys.stderr)
     except Exception as e:
         error_msg = str(e)
         print(f"Task {task_id} failed: {error_msg}", file=sys.stderr)
-        mark_failed(task_id, error_msg)
+        mark_failed(task_id, error_msg, goal_id=task.get("goal_id"))
         log_activity("error", error_msg[:200], task_id=task_id)
         discord_notify(f"❌ Failed: {title} — {error_msg[:120]}")
         sys.exit(1)
