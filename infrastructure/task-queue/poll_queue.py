@@ -10,6 +10,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -206,7 +207,7 @@ def claim_next_task():
             "target": "eq.claude-code",
             "order": "priority.asc,created_at.asc",
             "limit": "1",
-            "select": "id,title,description,context,priority,tags,status",
+            "select": "id,title,description,context,priority,tags,status,goal_id",
         },
     )
     if not tasks:
@@ -262,6 +263,15 @@ def mark_completed(task_id, result):
     )
 
 
+def mark_pending_eval(task_id, result):
+    """Route CRIT/HIGH completed tasks to Iris for evaluation before marking done."""
+    api_request(
+        "PATCH",
+        f"task_queue?id=eq.{task_id}",
+        data={"status": "pending_eval", "result": result, "target": "cowork"},
+    )
+
+
 def mark_failed(task_id, error):
     api_request(
         "PATCH",
@@ -284,19 +294,86 @@ def build_prompt(task):
     )
 
 
-def run_claude(prompt):
-    result = subprocess.run(
-        [CLAUDE_CMD, "--print", "--dangerously-skip-permissions"],
-        input=prompt,
-        capture_output=True,
+def run_claude(prompt, task_id=None):
+    """Run claude with streaming output, writing events to agent_activity in real-time."""
+    proc = subprocess.Popen(
+        [CLAUDE_CMD, "--print", "--dangerously-skip-permissions",
+         "--output-format", "stream-json", "--verbose", "--include-partial-messages"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=600,  # 10 min max per task
     )
-    if result.returncode != 0:
+
+    final_text = ""
+    stderr_lines = []
+    tool_name = None
+
+    # Feed prompt and close stdin
+    proc.stdin.write(prompt)
+    proc.stdin.close()
+
+    import threading, queue as _queue
+    stderr_q = _queue.Queue()
+    def _drain_stderr():
+        for line in proc.stderr:
+            stderr_q.put(line.rstrip())
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    deadline = time.time() + 1800
+    for raw_line in proc.stdout:
+        if time.time() > deadline:
+            proc.kill()
+            raise RuntimeError("claude timed out after 1800s")
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            event = json.loads(raw_line)
+        except Exception:
+            continue
+
+        etype = event.get("type", "")
+
+        # assistant streaming text
+        if etype == "assistant":
+            msg = event.get("message", {})
+            for block in msg.get("content", []):
+                btype = block.get("type", "")
+                if btype == "text":
+                    text = block.get("text", "").strip()
+                    if text and task_id:
+                        # Only log non-empty, non-duplicate snippets
+                        snippet = text[:200]
+                        log_activity("thinking", snippet, task_id=task_id)
+                elif btype == "tool_use":
+                    tool_name = block.get("name", "unknown")
+                    inp = block.get("input", {})
+                    # Summarise input to one line
+                    inp_str = json.dumps(inp, separators=(",", ":"))[:120]
+                    if task_id:
+                        log_activity("tool_call", f"{tool_name}: {inp_str}", task_id=task_id)
+                elif btype == "tool_result":
+                    content = block.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
+                    snippet = str(content)[:120].strip()
+                    if snippet and task_id:
+                        log_activity("result", f"← {snippet}", task_id=task_id)
+
+        # final result event
+        elif etype == "result":
+            final_text = event.get("result", "")
+
+    proc.wait()
+    while not stderr_q.empty():
+        stderr_lines.append(stderr_q.get())
+
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"claude exited {result.returncode}: {result.stderr.strip()}"
+            f"claude exited {proc.returncode}: " + "\n".join(stderr_lines)[-200:]
         )
-    return result.stdout.strip()
+    return final_text.strip()
 
 
 # ── autonomous work loop ─────────────────────────────────────────────────────
@@ -305,7 +382,6 @@ def run_claude(prompt):
 MORNING_WINDOW_START_UTC = 14   # 7am Phoenix
 MORNING_WINDOW_END_UTC   = 15   # 8am Phoenix
 
-RESEARCH_COOLDOWN_HOURS = 20    # Only auto-queue research once per day
 
 def _in_morning_window() -> bool:
     """Return True during Jeff's 7am review window (don't auto-generate work)."""
@@ -321,7 +397,7 @@ def _has_recent_pending_task(goal_id: str) -> bool:
             "task_queue",
             params={
                 "goal_id": f"eq.{goal_id}",
-                "status": "in.(pending,claimed,failed)",
+                "status": "in.(pending,claimed,failed,pending_eval)",
                 "select": "id",
                 "limit": "1",
             },
@@ -331,8 +407,40 @@ def _has_recent_pending_task(goal_id: str) -> bool:
         return True  # On error, assume task exists to avoid duplicates
 
 
+def _promote_planned_milestones():
+    """Activate the next planned milestone in each strategy when no active sibling is pending/queued."""
+    try:
+        # Find strategies that have at least one completed milestone but no active/pending ones
+        strategies = api_request("GET", "goals", params={
+            "level": "eq.strategy", "select": "id", "limit": "10"
+        })
+        for s in strategies:
+            sid = s["id"]
+            # Check if any milestone in this strategy is active or has a recent pending task
+            active = api_request("GET", "goals", params={
+                "parent_id": f"eq.{sid}", "level": "eq.milestone",
+                "status": "eq.active", "select": "id", "limit": "1"
+            })
+            if active:
+                continue  # already has active milestone, skip
+            # Promote the lowest-priority planned milestone
+            planned = api_request("GET", "goals", params={
+                "parent_id": f"eq.{sid}", "level": "eq.milestone",
+                "status": "eq.planned", "auto_queue": "eq.true",
+                "select": "id,title,priority", "order": "priority.asc,sort_order.asc", "limit": "1"
+            })
+            if planned:
+                nxt = planned[0]
+                api_request("PATCH", f"goals?id=eq.{nxt['id']}", data={"status": "active"})
+                print(f"Promoted milestone to active: {nxt['title']}")
+    except Exception as e:
+        print(f"_promote_planned_milestones failed (non-fatal): {e}", file=sys.stderr)
+
+
 def auto_queue_from_goals():
     """Find the highest-priority active milestone with an implementation_prompt and queue it."""
+    _promote_planned_milestones()
+
     if _in_morning_window():
         print("In morning review window — skipping auto-queue.")
         return None
@@ -397,65 +505,6 @@ def auto_queue_from_goals():
     return None
 
 
-def _research_recently_queued() -> bool:
-    """Return True if a self-improvement research task was queued recently."""
-    try:
-        tasks = api_request(
-            "GET",
-            "task_queue",
-            params={
-                "tags": "cs.{self-improvement-research}",
-                "order": "created_at.desc",
-                "select": "created_at",
-                "limit": "1",
-            },
-        )
-        if not tasks:
-            return False
-        last = datetime.fromisoformat(tasks[0]["created_at"].replace("Z", "+00:00"))
-        hours_ago = (datetime.now(timezone.utc) - last).total_seconds() / 3600
-        return hours_ago < RESEARCH_COOLDOWN_HOURS
-    except Exception:
-        return False
-
-
-def auto_queue_research():
-    """When nothing else to do, queue a self-improvement research task for Iris."""
-    if _in_morning_window():
-        return
-    if _research_recently_queued():
-        print("Research task already queued recently — skipping.")
-        return
-
-    task_data = {
-        "title": "Daily self-improvement research — agentic workflows and AI",
-        "description": (
-            "Research today's developments in agentic AI systems, workflows, memory architectures, "
-            "and homelab automation. Focus on:\n"
-            "1. Any new papers, releases, or tools in agent memory and context management\n"
-            "2. New agent orchestration frameworks or significant updates to existing ones\n"
-            "3. Hardware/compute breakthroughs relevant to running AI locally\n"
-            "4. Practical improvements to multi-agent coordination patterns\n\n"
-            "Synthesize findings into 3-5 actionable recommendations for az-lab. "
-            "Post a summary to Discord (chat_id 1012721652049657896). "
-            "Save notable findings as memories in Supabase (type=project, tags=['memory','research','ai']). "
-            "If you find anything that represents a SEISMIC SHIFT — major model release, breakthrough hardware, "
-            "paradigm change in agent architecture — flag it explicitly in Discord with 🚨 and high urgency."
-        ),
-        "status": "pending",
-        "target": "cowork",
-        "source": "wren-scheduler",
-        "priority": 3,
-        "tags": ["self-improvement-research", "daily", "auto-queued"],
-    }
-    try:
-        result = api_request("POST", "task_queue", data=task_data)
-        task_id = result[0]["id"] if isinstance(result, list) else result.get("id")
-        print(f"Auto-queued daily research task {task_id}")
-        log_activity("status", "Queue idle — auto-queued daily research for Iris")
-    except Exception as e:
-        print(f"auto_queue_research failed: {e}", file=sys.stderr)
-
 
 def main():
     print(f"[{datetime.now().isoformat()}] Polling task queue on {HOSTNAME}...")
@@ -467,10 +516,7 @@ def main():
     if not task:
         print("No pending tasks.")
         # Try to auto-queue from goals backlog
-        queued = auto_queue_from_goals()
-        if not queued:
-            # Nothing in goals either — queue research fallback
-            auto_queue_research()
+        auto_queue_from_goals()
         return
 
     task_id = task["id"]
@@ -484,13 +530,29 @@ def main():
     try:
         prompt = build_prompt(task)
         print(f"Running claude for task: {title}")
-        log_activity("thinking", f"Running Claude for: {title}", task_id=task_id)
-        result = run_claude(prompt)
-        mark_completed(task_id, result)
+        log_activity("thinking", f"Starting: {title}", task_id=task_id)
+        result = run_claude(prompt, task_id=task_id)
         summary = result.splitlines()[0][:120] if result else "done"
         log_activity("result", summary, task_id=task_id)
-        discord_notify(f"✅ Done: {title} — {summary}")
-        print(f"Task {task_id} completed.")
+
+        # CRIT (0) and HIGH (1) tasks go to Iris for evaluation before completion
+        task_priority = task.get("priority", 2)
+        if task_priority <= 1:
+            mark_pending_eval(task_id, result)
+            discord_notify(f"🔍 Pending eval: {title} — {summary}")
+            print(f"Task {task_id} pending evaluation by Iris.")
+        else:
+            mark_completed(task_id, result)
+            discord_notify(f"✅ Done: {title} — {summary}")
+            print(f"Task {task_id} completed.")
+            # Mark linked goal milestone as completed so pipeline advances
+            goal_id = task.get("goal_id")
+            if goal_id:
+                try:
+                    api_request("PATCH", f"goals?id=eq.{goal_id}", data={"status": "completed"})
+                    print(f"Marked goal {goal_id} as completed.")
+                except Exception as ge:
+                    print(f"Failed to complete goal {goal_id}: {ge}", file=sys.stderr)
     except Exception as e:
         error_msg = str(e)
         print(f"Task {task_id} failed: {error_msg}", file=sys.stderr)
