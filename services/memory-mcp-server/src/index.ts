@@ -377,126 +377,126 @@ function createMcpServer(): McpServer {
     async ({ query, type, tags, limit, semantic }) => {
       const maxResults = limit || 10;
 
-      // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled
+      // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled.
+      // hybrid_recall with null embedding degrades gracefully to BM25-only (tsvector ts_rank),
+      // ensuring BM25 is always used for text queries even when Ollama is unavailable.
       if (query && semantic !== false) {
         const queryEmbedding = await embed(query);
-        if (queryEmbedding) {
-          // Use hybrid_recall (RRF fusion) when embedding available
-          const { data, error } = await supabase.rpc("hybrid_recall", {
-            p_query_text: query,
-            p_query_embedding: JSON.stringify(queryEmbedding),
-            p_match_threshold: 0.3,
-            p_match_count: maxResults * 2, // wider pool, filter below
-            p_filter_type: type || null,
-          });
+        const hybridMode = queryEmbedding ? "hybrid BM25+vector" : "BM25-only";
+        const { data, error } = await supabase.rpc("hybrid_recall", {
+          p_query_text: query,
+          p_query_embedding: queryEmbedding ? JSON.stringify(queryEmbedding) : null,
+          p_match_threshold: queryEmbedding ? 0.3 : 0.0,
+          p_match_count: maxResults * 2, // wider pool, filter below
+          p_filter_type: type || null,
+        });
 
-          if (!error && data && data.length > 0) {
-            // Apply tag filters client-side
-            let filtered = data as any[];
-            if (tags?.length) filtered = filtered.filter((m) => tags.some((t) => m.tags?.includes(t)));
-            filtered = filtered.slice(0, maxResults);
+        if (!error && data && data.length > 0) {
+          // Apply tag filters client-side
+          let filtered = data as any[];
+          if (tags?.length) filtered = filtered.filter((m) => tags.some((t) => m.tags?.includes(t)));
+          filtered = filtered.slice(0, maxResults);
 
-            if (filtered.length > 0) {
-              await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
+          if (filtered.length > 0) {
+            await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
 
-              // Fetch temporal/causal linked memories for all top results and apply score boost
-              const filteredIds = new Set(filtered.map((m: any) => m.id));
-              const boostedExtras: Map<string, { mem: any; boost: number }> = new Map();
+            // Fetch temporal/causal linked memories for all top results and apply score boost
+            const filteredIds = new Set(filtered.map((m: any) => m.id));
+            const boostedExtras: Map<string, { mem: any; boost: number }> = new Map();
 
-              // For each top result, fetch its links and check for temporal/causal types
-              const linkFetches = await Promise.all(
-                filtered.map(async (m: any) => {
-                  const { data: links } = await supabase
-                    .from("memory_links")
-                    .select("target_id, link_type, strength")
-                    .eq("source_id", m.id)
-                    .in("link_type", ["temporal", "causal"]);
-                  return { sourceId: m.id, links: links || [] };
-                })
-              );
-
-              // Collect unique target IDs for temporal/causal links not already in results
-              const tcTargetIds: string[] = [];
-              for (const { links } of linkFetches) {
-                for (const link of links) {
-                  if (!filteredIds.has(link.target_id) && !tcTargetIds.includes(link.target_id)) {
-                    tcTargetIds.push(link.target_id);
-                  }
-                }
-              }
-
-              // Fetch those extra memories and assign boosted scores
-              if (tcTargetIds.length > 0) {
-                const { data: extraMems } = await supabase
-                  .from("memories")
-                  .select("id, type, name, description, content, tags, source, conflict_flagged")
-                  .in("id", tcTargetIds);
-                if (extraMems) {
-                  for (const em of extraMems) {
-                    // Find max boost from any temporal/causal link pointing to this memory
-                    let maxBoost = 0;
-                    for (const { links } of linkFetches) {
-                      const link = links.find((l: any) => l.target_id === em.id);
-                      if (link) maxBoost = Math.max(maxBoost, 0.1 * (link.strength || 1.0));
-                    }
-                    boostedExtras.set(em.id, {
-                      mem: { ...em, hybrid_score: (filtered[filtered.length - 1]?.hybrid_score || 0.5) + maxBoost },
-                      boost: maxBoost,
-                    });
-                  }
-                }
-              }
-
-              // Fetch links for the top result to show in the link section
-              let linkSection = "";
-              const top = filtered[0];
-              const { data: linked } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
-              if (linked?.length) {
-                // Fetch link_type for each linked memory from memory_links
-                const { data: linkTypeRows } = await supabase
+            // For each top result, fetch its links and check for temporal/causal types
+            const linkFetches = await Promise.all(
+              filtered.map(async (m: any) => {
+                const { data: links } = await supabase
                   .from("memory_links")
-                  .select("target_id, link_type")
-                  .eq("source_id", top.id)
-                  .in("target_id", linked.map((l: any) => l.id));
-                const linkTypeMap: Record<string, string> = {};
-                for (const lt of (linkTypeRows || [])) {
-                  linkTypeMap[lt.target_id] = lt.link_type || "semantic";
+                  .select("target_id, link_type, strength")
+                  .eq("source_id", m.id)
+                  .in("link_type", ["temporal", "causal"]);
+                return { sourceId: m.id, links: links || [] };
+              })
+            );
+
+            // Collect unique target IDs for temporal/causal links not already in results
+            const tcTargetIds: string[] = [];
+            for (const { links } of linkFetches) {
+              for (const link of links) {
+                if (!filteredIds.has(link.target_id) && !tcTargetIds.includes(link.target_id)) {
+                  tcTargetIds.push(link.target_id);
                 }
-                const linkLines = linked.map((l: any) => {
-                  const lt = linkTypeMap[l.id] || "semantic";
-                  return `  - **${l.name}** (${l.relationship}, type:${lt}, strength ${l.strength.toFixed(2)}): ${l.description}`;
-                });
-                linkSection = `\n\n**Linked memories (${linked.length}):**\n${linkLines.join("\n")}`;
               }
-
-              const results = filtered.map((m: any, i: number) => {
-                const tagStr = m.tags?.length ? ` [${m.tags.join(", ")}]` : "";
-                const scoreStr = m.hybrid_score ? ` (score ${(m.hybrid_score * 100).toFixed(0)}%)` : "";
-                const importanceStr = m.importance_score !== undefined && m.importance_score !== 0.5 ? ` imp:${m.importance_score.toFixed(2)}` : "";
-                const accessStr = m.access_count > 0 ? ` accessed:${m.access_count}x` : "";
-                const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
-                const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
-                return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
-              });
-
-              // Append temporal/causal boosted extras not already in results
-              for (const { mem, boost } of boostedExtras.values()) {
-                const tagStr = mem.tags?.length ? ` [${mem.tags.join(", ")}]` : "";
-                const scoreStr = ` (score ${((mem.hybrid_score || 0) * 100).toFixed(0)}% +boost:${(boost * 100).toFixed(0)}%)`;
-                const trust = SOURCE_TRUST[mem.source] ? ` · trust:${SOURCE_TRUST[mem.source]}` : "";
-                const conflictFlag = mem.conflict_flagged ? " ⚠️" : "";
-                results.push(`## ${mem.name} (${mem.type})${tagStr}${scoreStr}${trust}${conflictFlag} [temporal/causal link]\n_${mem.description}_\n\n${mem.content}`);
-              }
-
-              const totalCount = filtered.length + boostedExtras.size;
-              const boostNote = boostedExtras.size > 0 ? ` (${boostedExtras.size} added via temporal/causal links)` : "";
-              return {
-                content: [{ type: "text" as const, text: `Found ${totalCount} memor${totalCount === 1 ? "y" : "ies"} (hybrid BM25+vector)${boostNote}:\n\n${results.join("\n\n---\n\n")}` }],
-              };
             }
+
+            // Fetch those extra memories and assign boosted scores
+            if (tcTargetIds.length > 0) {
+              const { data: extraMems } = await supabase
+                .from("memories")
+                .select("id, type, name, description, content, tags, source, conflict_flagged")
+                .in("id", tcTargetIds);
+              if (extraMems) {
+                for (const em of extraMems) {
+                  // Find max boost from any temporal/causal link pointing to this memory
+                  let maxBoost = 0;
+                  for (const { links } of linkFetches) {
+                    const link = links.find((l: any) => l.target_id === em.id);
+                    if (link) maxBoost = Math.max(maxBoost, 0.1 * (link.strength || 1.0));
+                  }
+                  boostedExtras.set(em.id, {
+                    mem: { ...em, hybrid_score: (filtered[filtered.length - 1]?.hybrid_score || 0.5) + maxBoost },
+                    boost: maxBoost,
+                  });
+                }
+              }
+            }
+
+            // Fetch links for the top result to show in the link section
+            let linkSection = "";
+            const top = filtered[0];
+            const { data: linked } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
+            if (linked?.length) {
+              // Fetch link_type for each linked memory from memory_links
+              const { data: linkTypeRows } = await supabase
+                .from("memory_links")
+                .select("target_id, link_type")
+                .eq("source_id", top.id)
+                .in("target_id", linked.map((l: any) => l.id));
+              const linkTypeMap: Record<string, string> = {};
+              for (const lt of (linkTypeRows || [])) {
+                linkTypeMap[lt.target_id] = lt.link_type || "semantic";
+              }
+              const linkLines = linked.map((l: any) => {
+                const lt = linkTypeMap[l.id] || "semantic";
+                return `  - **${l.name}** (${l.relationship}, type:${lt}, strength ${l.strength.toFixed(2)}): ${l.description}`;
+              });
+              linkSection = `\n\n**Linked memories (${linked.length}):**\n${linkLines.join("\n")}`;
+            }
+
+            const results = filtered.map((m: any, i: number) => {
+              const tagStr = m.tags?.length ? ` [${m.tags.join(", ")}]` : "";
+              const scoreStr = m.hybrid_score ? ` (score ${(m.hybrid_score * 100).toFixed(0)}%)` : "";
+              const importanceStr = m.importance_score !== undefined && m.importance_score !== 0.5 ? ` imp:${m.importance_score.toFixed(2)}` : "";
+              const accessStr = m.access_count > 0 ? ` accessed:${m.access_count}x` : "";
+              const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
+              const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
+              return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
+            });
+
+            // Append temporal/causal boosted extras not already in results
+            for (const { mem, boost } of boostedExtras.values()) {
+              const tagStr = mem.tags?.length ? ` [${mem.tags.join(", ")}]` : "";
+              const scoreStr = ` (score ${((mem.hybrid_score || 0) * 100).toFixed(0)}% +boost:${(boost * 100).toFixed(0)}%)`;
+              const trust = SOURCE_TRUST[mem.source] ? ` · trust:${SOURCE_TRUST[mem.source]}` : "";
+              const conflictFlag = mem.conflict_flagged ? " ⚠️" : "";
+              results.push(`## ${mem.name} (${mem.type})${tagStr}${scoreStr}${trust}${conflictFlag} [temporal/causal link]\n_${mem.description}_\n\n${mem.content}`);
+            }
+
+            const totalCount = filtered.length + boostedExtras.size;
+            const boostNote = boostedExtras.size > 0 ? ` (${boostedExtras.size} added via temporal/causal links)` : "";
+            return {
+              content: [{ type: "text" as const, text: `Found ${totalCount} memor${totalCount === 1 ? "y" : "ies"} (${hybridMode})${boostNote}:\n\n${results.join("\n\n---\n\n")}` }],
+            };
           }
-          // Fall through to keyword search if hybrid returns nothing
         }
+        // Fall through to keyword search if hybrid/BM25 returns nothing
       }
 
       // Keyword / filter search fallback
