@@ -207,7 +207,7 @@ def claim_next_task():
             "target": "eq.claude-code",
             "order": "priority.asc,created_at.asc",
             "limit": "1",
-            "select": "id,title,description,context,priority,tags,status,goal_id",
+            "select": "id,title,description,context,priority,tags,status,goal_id,attempt_count,error",
         },
     )
     if not tasks:
@@ -272,10 +272,14 @@ def update_goal_notes(goal_id, note_line, progress=None, status=None):
 
 
 def mark_completed(task_id, result, goal_id=None):
+    # Truncate result — long results cause context bloat on next reads
+    stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
+    if result and len(result) > _RESULT_MAX_CHARS:
+        stored_result += f"\n... [truncated from {len(result)} chars]"
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
-        data={"status": "completed", "result": result},
+        data={"status": "completed", "result": stored_result},
     )
     summary = result.splitlines()[0][:200] if result else "done"
     log_activity("result", f"Completed: {summary}", task_id=task_id)
@@ -292,10 +296,13 @@ def mark_completed(task_id, result, goal_id=None):
 
 def mark_pending_eval(task_id, result, goal_id=None):
     """Route CRIT/HIGH completed tasks to Iris for evaluation before marking done."""
+    stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
+    if result and len(result) > _RESULT_MAX_CHARS:
+        stored_result += f"\n... [truncated from {len(result)} chars]"
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
-        data={"status": "pending_eval", "result": result, "target": "cowork"},
+        data={"status": "pending_eval", "result": stored_result, "target": "cowork"},
     )
     log_activity("status", "Pending Iris eval", task_id=task_id)
     if goal_id:
@@ -305,25 +312,94 @@ def mark_pending_eval(task_id, result, goal_id=None):
 
 
 def mark_failed(task_id, error, goal_id=None):
+    # Fetch current attempt_count so we can increment it
+    try:
+        rows = api_request("GET", "task_queue", params={"id": f"eq.{task_id}", "select": "attempt_count"})
+        current_attempts = (rows[0].get("attempt_count") or 0) if rows else 0
+    except Exception:
+        current_attempts = 0
+
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
-        data={"status": "failed", "error": error},
+        data={
+            "status": "failed",
+            "error": error[:500],
+            "attempt_count": current_attempts + 1,
+        },
     )
     if goal_id:
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         update_goal_notes(goal_id, f"Failed {date_str}: {error[:100]}")
 
 
+_CONTEXT_STRIP_KEYS = {"previous_output", "last_result", "full_transcript", "raw_output", "stdout"}
+_CONTEXT_MAX_CHARS = 3000
+_RESULT_MAX_CHARS = 2000
+_DESC_MAX_CHARS = 4000
+
+
+def _sanitize_context(ctx: dict, attempt_count: int, prior_error: str | None) -> dict:
+    """
+    Context contamination hygiene (per 2026 research on context rot):
+    - Strip known bulky/stale fields that cause context pollution
+    - Cap total serialized size
+    - Inject fresh-start hint when retrying a previously failed task
+    """
+    cleaned = {k: v for k, v in ctx.items() if k not in _CONTEXT_STRIP_KEYS}
+
+    if attempt_count and attempt_count > 0:
+        cleaned["_retry_hint"] = (
+            f"This task has been attempted {attempt_count} time(s) before and failed. "
+            "Start completely fresh — do NOT continue or build on the previous failed approach. "
+            "Re-read the task description and try a different strategy."
+        )
+        if prior_error:
+            cleaned["_prior_failure"] = prior_error[:300]
+
+    # Cap total size — drop values from least important keys if needed
+    serialized = json.dumps(cleaned, indent=2)
+    if len(serialized) > _CONTEXT_MAX_CHARS:
+        # Keep _retry hints, drop other keys until under limit
+        priority_keys = {"_retry_hint", "_prior_failure"}
+        overflow_keys = [k for k in cleaned if k not in priority_keys]
+        while len(serialized) > _CONTEXT_MAX_CHARS and overflow_keys:
+            cleaned.pop(overflow_keys.pop())
+            serialized = json.dumps(cleaned, indent=2)
+        if len(serialized) > _CONTEXT_MAX_CHARS:
+            cleaned["_truncated"] = True
+            serialized = json.dumps(cleaned, indent=2)[:_CONTEXT_MAX_CHARS] + "\n... [truncated]"
+
+    return cleaned
+
+
 def build_prompt(task):
-    context = task.get("context") or {}
+    attempt_count = task.get("attempt_count") or 0
+    prior_error = task.get("error")
+    raw_ctx = task.get("context") or {}
+    context = _sanitize_context(raw_ctx, attempt_count, prior_error)
+
+    # Truncate description if unusually long
+    description = (task.get("description") or "")
+    if len(description) > _DESC_MAX_CHARS:
+        description = description[:_DESC_MAX_CHARS] + "\n... [description truncated for context hygiene]"
+
     context_str = ""
     if context:
         context_str = "\n\nContext:\n" + json.dumps(context, indent=2)
 
+    # Fresh-start preamble on retry
+    retry_preamble = ""
+    if attempt_count > 0:
+        retry_preamble = (
+            f"⚠️  RETRY ATTEMPT {attempt_count + 1}: This task previously failed. "
+            "Approach it fresh — do not try to resume or patch the previous failed attempt.\n\n"
+        )
+
     return (
+        f"{retry_preamble}"
         f"Task: {task['title']}\n\n"
-        f"{task['description']}"
+        f"{description}"
         f"{context_str}\n\n"
         "Complete this task. Be concise in your response — summarize what you did."
     )
