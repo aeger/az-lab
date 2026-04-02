@@ -541,11 +541,57 @@ def auto_queue_from_goals():
 
 
 
+COWORK_NOTIFIED_FILE = os.path.expanduser("~/.claude-queue/cowork_notified.json")
+
+def notify_cowork_tasks():
+    """Ping Discord once per task when new cowork tasks appear. Never re-pings the same task."""
+    try:
+        tasks = api_request(
+            "GET",
+            "task_queue",
+            params={
+                "status": "eq.pending",
+                "target": "eq.cowork",
+                "order": "created_at.asc",
+                "limit": "10",
+                "select": "id,title,priority",
+            },
+        )
+        if not tasks:
+            return
+
+        # Load already-notified IDs
+        try:
+            with open(COWORK_NOTIFIED_FILE) as f:
+                notified = set(json.load(f))
+        except Exception:
+            notified = set()
+
+        new_tasks = [t for t in tasks if t["id"] not in notified]
+        if not new_tasks:
+            return
+
+        titles = ", ".join(t["title"] for t in new_tasks[:3])
+        extra = f" (+{len(new_tasks) - 3} more)" if len(new_tasks) > 3 else ""
+        discord_notify(f"📬 **{len(new_tasks)} new task(s) waiting for Cowork:** {titles}{extra}\nOpen a claude.ai session to pick them up.")
+
+        # Save newly notified IDs
+        notified.update(t["id"] for t in new_tasks)
+        os.makedirs(os.path.dirname(COWORK_NOTIFIED_FILE), exist_ok=True)
+        with open(COWORK_NOTIFIED_FILE, "w") as f:
+            json.dump(list(notified), f)
+    except Exception as e:
+        print(f"notify_cowork_tasks failed (non-fatal): {e}", file=sys.stderr)
+
+
 def main():
     print(f"[{datetime.now().isoformat()}] Polling task queue on {HOSTNAME}...")
 
     # Route any unclassified tasks first
     route_auto_tasks()
+
+    # Ping Discord if cowork tasks are pending
+    notify_cowork_tasks()
 
     task = claim_next_task()
     if not task:
