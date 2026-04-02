@@ -249,13 +249,47 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 007 skipped:", err.message);
   }
+
+  // Migration 008: Switch BM25 path from search_vector to search_vec (weighted: name=A, desc=B, content=C)
+  try {
+    const { data, error } = await supabase.rpc("apply_search_vec_migration_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 008 RPC not yet registered — apply migrations/008_switch_bm25_to_search_vec.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 008 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 008 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 008 skipped:", err.message);
+  }
+
+  // Migration 009: Trigram fallback for zero-BM25-hit queries (code identifiers with underscores)
+  try {
+    const { data, error } = await supabase.rpc("apply_trigram_fallback_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 009 RPC not yet registered — apply migrations/009_trigram_fallback.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 009 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 009 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 009 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.9.0",
+    version: "3.10.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -1287,7 +1321,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "3.7.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "3.10.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
@@ -1344,7 +1378,58 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v3.7.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v3.10.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
+  startMemorySyncListener();
 });
+
+// ── Cross-agent memory sync (Supabase Realtime) ──────────────────────────────
+// Subscribes to high-importance memory writes from other agents.
+// Logs when Iris/Atlas writes importance>=0.8 memories.
+function startMemorySyncListener() {
+  let retryTimer: NodeJS.Timeout | null = null;
+  let activeChannel: ReturnType<typeof supabase.channel> | null = null;
+
+  function subscribe() {
+    if (activeChannel) {
+      supabase.removeChannel(activeChannel).catch(() => {});
+    }
+
+    const channel = supabase
+      .channel(`memory-sync-${Date.now()}`)
+      .on(
+        "postgres_changes" as any,
+        { event: "*", schema: "public", table: "memories" },
+        (payload: any) => {
+          const rec = payload.new || payload.old;
+          if (!rec) return;
+          const importance = rec.importance_score ?? 0;
+          if (importance < 0.8) return;
+          const src = rec.source || "unknown";
+          if (src === "wren") return;
+          const event = (payload.eventType as string).toUpperCase();
+          console.log(
+            `[memory-sync] ${event} from ${src}: "${rec.name}" ` +
+            `(importance=${importance}, type=${rec.type})`
+          );
+        }
+      )
+      .subscribe((status: string) => {
+        if (status === "SUBSCRIBED") {
+          console.log("[memory-sync] Realtime subscription active — watching importance>=0.8 cross-agent writes");
+          if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn(`[memory-sync] ${status} — reconnecting in 30s`);
+          retryTimer = setTimeout(subscribe, 30_000);
+        }
+      });
+
+    activeChannel = channel;
+  }
+
+  subscribe();
+
+  process.on("SIGTERM", () => { if (activeChannel) supabase.removeChannel(activeChannel); });
+  process.on("SIGINT",  () => { if (activeChannel) supabase.removeChannel(activeChannel); });
+}
