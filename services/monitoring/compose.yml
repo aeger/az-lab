@@ -28,6 +28,7 @@ services:
       - GF_SERVER_ROOT_URL=https://grafana.az-lab.dev
     volumes:
       - ./grafana/data:/var/lib/grafana:Z
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro,Z
     networks:
       - proxy
     restart: unless-stopped
@@ -63,24 +64,9 @@ services:
     labels:
       - "traefik.enable=false"
 
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
-    container_name: cadvisor
-    privileged: true
-    devices:
-      - /dev/kmsg:/dev/kmsg
-    volumes:
-      - /:/rootfs:ro,Z
-      - /var/run:/var/run:rw,Z
-      - /sys:/sys:ro,Z
-      - /var/lib/containers:/var/lib/containers:ro,Z
-      - /var/lib/cni:/var/lib/cni:ro,Z
-      - /run:/run:rw,Z
-    networks:
-      - proxy
-    restart: unless-stopped
-    labels:
-      - "traefik.enable=false"
+  # cadvisor is managed by ~/.config/systemd/user/cadvisor.service
+  # (requires --cgroupns=host which podman-compose does not support)
+  # Runs as: podman run --cgroupns=host --network=proxy --network-alias=cadvisor ...
 
   blackbox:
     image: prom/blackbox-exporter:latest
@@ -108,8 +94,18 @@ services:
     labels:
       - "traefik.enable=false"
 
-  # podman_exporter runs standalone (requires --userns=keep-id, not supported by podman-compose)
-  # Managed by: ~/.config/systemd/user/podman-exporter.service
+  podman_exporter:
+    image: quay.io/navidys/prometheus-podman-exporter:latest
+    container_name: podman_exporter
+    userns_mode: keep-id
+    network_mode: host
+    security_opt:
+      - label=disable
+    environment:
+      - CONTAINER_HOST=unix:///run/podman/podman.sock
+    volumes:
+      - /run/user/1000/podman/podman.sock:/run/podman/podman.sock
+    restart: unless-stopped
 
 networks:
   proxy:
