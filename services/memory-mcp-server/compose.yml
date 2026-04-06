@@ -19,6 +19,10 @@ services:
       - PORT=3100
       - OLLAMA_URL=http://ollama:11434
       - EMBED_MODEL=nomic-embed-text
+      # Mem0 LLM classification (optional — heuristic mode if unset)
+      # Set to NemoClaw NIM API for LLM-based ADD/UPDATE/DELETE/NOOP decisions
+      - LLM_URL=${LLM_URL:-}
+      - LLM_MODEL=${LLM_MODEL:-llama3.2:3b}
       - HA_URL=${HA_URL}
       - HA_TOKEN=${HA_TOKEN}
     ports:

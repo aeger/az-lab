@@ -128,57 +128,165 @@ async function detectConflicts(
   return conflictNames.length > 0 ? conflictNames.join(", ") : null;
 }
 
-// ── Mem0-style Write Decision ─────────────────────────────────────────────────
-// Determines ADD / NOOP / MERGE_SUGGEST before every insert.
-// NOOP: new content is semantically identical to an existing memory (prevents bloat).
-// MERGE_SUGGEST: high similarity but different enough to warrant a write + warning.
+// ── Mem0 Conflict Resolution ──────────────────────────────────────────────────
+// Based on arXiv 2504.19413 — classify every write as ADD/UPDATE/DELETE/NOOP
+// to prevent stale/duplicate memory accumulation.
+// Heuristic mode (default): fast, no LLM required.
+// LLM mode: set LLM_URL to any OpenAI-compatible endpoint (e.g. NemoClaw NIM API).
 
-function contentOverlap(a: string, b: string): number {
-  const wordsA = new Set((a.toLowerCase().match(/\b\w{4,}\b/g) ?? []));
-  const wordsB = (b.toLowerCase().match(/\b\w{4,}\b/g) ?? []);
-  if (!wordsA.size || !wordsB.length) return 0;
-  const matches = wordsB.filter((w) => wordsA.has(w)).length;
-  return matches / Math.max(wordsA.size, wordsB.length);
+const LLM_URL = process.env.LLM_URL || "";
+const LLM_MODEL = process.env.LLM_MODEL || "llama3.2:3b";
+
+type Mem0Action = "ADD" | "UPDATE" | "DELETE" | "NOOP";
+
+interface Mem0Decision {
+  action: Mem0Action;
+  target_id?: string;
+  target_name?: string;
+  rationale: string;
 }
 
-type WriteDecision =
-  | { action: "add" }
-  | { action: "noop"; existingName: string; similarity: number }
-  | { action: "merge_suggest"; existingName: string; existingId: string; similarity: number };
+// Jaccard similarity on word tokens (fast, no embedding required)
+function textSimilarity(a: string, b: string): number {
+  const words = (t: string) => new Set(t.toLowerCase().match(/\b\w{3,}\b/g) || []);
+  const A = words(a);
+  const B = words(b);
+  const intersection = [...A].filter((w) => B.has(w)).length;
+  const union = new Set([...A, ...B]).size;
+  return union === 0 ? 1 : intersection / union;
+}
 
-async function resolveWriteAction(
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+// Heuristic Mem0 classification (no LLM needed)
+function heuristicMem0(
+  newName: string,
+  newContent: string,
+  candidates: Array<{ id: string; name: string; content: string; similarity: number }>
+): Mem0Decision[] {
+  const decisions: Mem0Decision[] = [];
+
+  for (const c of candidates) {
+    const sim = c.similarity;
+
+    // Near-identical content → NOOP (highest priority, return immediately)
+    if (sim >= 0.95 && textSimilarity(newContent, c.content) >= 0.80) {
+      return [{ action: "NOOP", target_id: c.id, target_name: c.name,
+        rationale: `Already captured in "${c.name}" (${(sim * 100).toFixed(0)}% similar)` }];
+    }
+
+    const nameSimilar = levenshtein(c.name.toLowerCase(), newName.toLowerCase()) <= 3;
+    const contradicts = mightContradict(newContent, c.content);
+
+    if (contradicts && sim >= 0.72) {
+      // Contradicted/stale → DELETE the old one; new content will be ADDed after
+      decisions.push({ action: "DELETE", target_id: c.id, target_name: c.name,
+        rationale: `Contradicts stale memory "${c.name}" (sim=${(sim * 100).toFixed(0)}%)` });
+    } else if (sim >= 0.88 && nameSimilar && !contradicts) {
+      // High similarity + similar name → UPDATE in place (prevents cross-name duplicates)
+      decisions.push({ action: "UPDATE", target_id: c.id, target_name: c.name,
+        rationale: `Updates existing memory "${c.name}" (sim=${(sim * 100).toFixed(0)}%)` });
+    }
+  }
+
+  if (decisions.length === 0) {
+    decisions.push({ action: "ADD", rationale: "No conflicts with existing memories" });
+  }
+  return decisions;
+}
+
+// LLM-based Mem0 classification (falls back to heuristic on any failure)
+async function llmMem0(
+  newName: string,
+  newContent: string,
+  candidates: Array<{ id: string; name: string; content: string; similarity: number }>
+): Promise<Mem0Decision[]> {
+  const prompt = `You are a memory deduplication system. Given a new fact and existing similar memories, classify the required operation.
+
+New memory:
+Name: ${newName}
+Content: ${newContent.slice(0, 800)}
+
+Existing similar memories:
+${candidates.slice(0, 5).map((c, i) =>
+  `[${i + 1}] id=${c.id}\nname=${c.name}\ncontent=${c.content.slice(0, 400)}`
+).join("\n\n---\n")}
+
+Classify the operation required:
+- NOOP: New memory is fully captured by an existing one. No write needed.
+- UPDATE: New memory updates/corrects an existing one. Merge content into it.
+- DELETE: An existing memory is contradicted/stale. Remove it (new fact added separately).
+- ADD: Genuinely new fact with no significant overlap.
+
+Rules: NOOP only if content is essentially identical. Multiple DELETE decisions allowed. Prefer UPDATE over ADD when clearly the same topic. Respond with a JSON array only, no explanation outside JSON.
+
+Example: [{"action":"DELETE","target_id":"abc-123","target_name":"old fact","rationale":"contradicted by new IP"}]`;
+
+  try {
+    const res = await fetch(`${LLM_URL}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: LLM_MODEL,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0,
+        max_tokens: 600,
+      }),
+      signal: AbortSignal.timeout(25000),
+    });
+    if (!res.ok) throw new Error(`LLM HTTP ${res.status}`);
+    const json = (await res.json()) as any;
+    let raw = json.choices?.[0]?.message?.content?.trim() || "[]";
+    raw = raw.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+    let parsed: Mem0Decision[] = JSON.parse(raw);
+    if (!Array.isArray(parsed)) parsed = [parsed];
+    const valid = parsed.filter((d) => ["ADD", "UPDATE", "DELETE", "NOOP"].includes(d.action));
+    return valid.length > 0 ? valid : [{ action: "ADD", rationale: "LLM returned no valid decisions" }];
+  } catch (err: any) {
+    console.warn("[mem0] LLM classify failed:", err.message, "— heuristic fallback");
+    return heuristicMem0(newName, newContent, candidates);
+  }
+}
+
+// Entry point: fetch candidates then classify
+async function mem0Resolve(
   name: string,
   content: string,
   type: string,
-  embedding: number[] | null
-): Promise<WriteDecision> {
-  if (!embedding) return { action: "add" };
-
-  const { data } = await supabase.rpc("match_memories", {
+  embedding: number[],
+  excludeId?: string
+): Promise<Mem0Decision[]> {
+  const { data: raw } = await supabase.rpc("match_memories", {
     query_embedding: JSON.stringify(embedding),
-    match_threshold: 0.92,
-    match_count: 5,
+    match_threshold: 0.72,
+    match_count: 10,
   });
-  if (!data?.length) return { action: "add" };
 
-  // Exclude exact name match (already handled as update-by-name)
-  const candidates = (data as any[]).filter((m) => m.type === type && m.name !== name);
-  if (!candidates.length) return { action: "add" };
+  if (!raw?.length) return [{ action: "ADD", rationale: "No similar memories found" }];
 
-  const top = candidates[0];
-  const overlap = contentOverlap(content, top.content ?? "");
+  const candidates = (raw as any[])
+    .filter((m) => m.id !== excludeId && m.type === type)
+    .map((m) => ({ id: m.id, name: m.name, content: m.content, similarity: m.similarity as number }))
+    .slice(0, 8);
 
-  // NOOP: essentially identical — don't write
-  if (top.similarity > 0.97 && overlap > 0.80) {
-    return { action: "noop", existingName: top.name, similarity: top.similarity };
-  }
+  if (!candidates.length) return [{ action: "ADD", rationale: "No same-type candidates" }];
 
-  // MERGE_SUGGEST: high similarity — write but warn
-  if (top.similarity > 0.92) {
-    return { action: "merge_suggest", existingName: top.name, existingId: top.id, similarity: top.similarity };
-  }
-
-  return { action: "add" };
+  return LLM_URL
+    ? llmMem0(name, content, candidates)
+    : heuristicMem0(name, content, candidates);
 }
 
 // ── Embeddings ───────────────────────────────────────────────────────────────
@@ -352,7 +460,7 @@ async function applyStartupMigrations(): Promise<void> {
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.11.0",
+    version: "4.0.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -385,23 +493,30 @@ function createMcpServer(): McpServer {
       const src = source || "claude-code";
       const memTags = tags || [];
 
+      // Fetch existing same-name memory (with content for NOOP check)
       const { data: existing } = await supabase
         .from("memories")
-        .select("id")
+        .select("id, content")
         .eq("name", name)
         .maybeSingle();
 
       const embedding = await embed(embedInput(name, description, content));
       const embedNote = embedding ? "" : " (no embedding — Ollama unavailable)";
 
+      // ── Same-name path ──────────────────────────────────────────────────────
       if (existing) {
+        // Mem0 NOOP: content is essentially unchanged — skip write
+        if (existing.content && textSimilarity(existing.content, content) >= 0.85) {
+          return { content: [{ type: "text" as const, text: `NOOP: Memory "${name}" content is unchanged (Jaccard ≥ 85%). No write needed.` }] };
+        }
+
         const update: Record<string, unknown> = { type, description, content, tags: memTags, source: src };
         if (embedding) update.embedding = JSON.stringify(embedding);
         if (importance_score !== undefined) update.importance_score = importance_score;
         const { error } = await supabase.from("memories").update(update).eq("id", existing.id);
         if (error) return { content: [{ type: "text" as const, text: `Error updating memory: ${error.message}` }] };
 
-        // Re-link on update: remove old related_to links and rebuild
+        // Re-link on update
         let linkNote = "";
         if (embedding) {
           await supabase.from("memory_links").delete().eq("source_id", existing.id).eq("relationship", "related_to");
@@ -420,23 +535,45 @@ function createMcpServer(): McpServer {
             }
           }
         }
-        // Re-run conflict detection on update
         const updateConflicts = await detectConflicts(existing.id, content, type, memTags, embedding);
         const updateConflictNote = updateConflicts ? ` ⚠️ Possible contradiction with: ${updateConflicts}` : "";
         return { content: [{ type: "text" as const, text: `Updated memory "${name}" (${type})${embedNote}.${linkNote}${updateConflictNote}` }] };
       }
 
-      // Mem0-style write decision: NOOP or MERGE_SUGGEST before inserting
-      const writeDecision = await resolveWriteAction(name, content, type, embedding);
+      // ── New-name path: full Mem0 conflict resolution ────────────────────────
+      let mem0Note = "";
+      if (embedding) {
+        const decisions = await mem0Resolve(name, content, type, embedding);
 
-      if (writeDecision.action === "noop") {
-        return { content: [{ type: "text" as const, text: `NOOP: "${name}" is semantically identical to existing memory "${writeDecision.existingName}" (similarity ${(writeDecision.similarity * 100).toFixed(1)}%). Memory not written — no new information.` }] };
+        for (const d of decisions) {
+          if (d.action === "NOOP") {
+            console.log(`[mem0] NOOP "${name}": ${d.rationale}`);
+            return { content: [{ type: "text" as const, text: `NOOP: Fact already captured in "${d.target_name}". No write needed. (${d.rationale})` }] };
+          }
+
+          if (d.action === "UPDATE" && d.target_id) {
+            // Update the existing differently-named memory in place
+            console.log(`[mem0] UPDATE "${d.target_name}": ${d.rationale}`);
+            const upd: Record<string, unknown> = { description, content, tags: memTags, source: src };
+            upd.embedding = JSON.stringify(embedding);
+            if (importance_score !== undefined) upd.importance_score = importance_score;
+            const { error: updErr } = await supabase.from("memories").update(upd).eq("id", d.target_id);
+            if (!updErr) {
+              return { content: [{ type: "text" as const, text: `mem0 UPDATE: merged "${name}" into existing memory "${d.target_name}". (${d.rationale})${embedNote}` }] };
+            }
+          }
+
+          if (d.action === "DELETE" && d.target_id) {
+            // Remove stale/contradicted memory before inserting the new one
+            console.log(`[mem0] DELETE "${d.target_name}": ${d.rationale}`);
+            await supabase.from("memory_links").delete().or(`source_id.eq.${d.target_id},target_id.eq.${d.target_id}`);
+            await supabase.from("memories").delete().eq("id", d.target_id);
+            mem0Note += ` Removed stale memory "${d.target_name}".`;
+          }
+        }
       }
 
-      const mergeNote = writeDecision.action === "merge_suggest"
-        ? ` ⚠️ High similarity (${(writeDecision.similarity * 100).toFixed(1)}%) to existing "${writeDecision.existingName}" — consider merging with merge_memories().`
-        : "";
-
+      // ── INSERT new memory ───────────────────────────────────────────────────
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
       if (embedding) insert.embedding = JSON.stringify(embedding);
       if (importance_score !== undefined) insert.importance_score = importance_score;
@@ -444,7 +581,7 @@ function createMcpServer(): McpServer {
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
 
-      // Auto-link: find related memories and create bidirectional links
+      // Auto-link
       let linkNote = "";
       if (embedding && inserted?.id) {
         const { data: similar } = await supabase.rpc("match_memories", {
@@ -463,11 +600,10 @@ function createMcpServer(): McpServer {
         }
       }
 
-      // Conflict detection (contradiction + stale flagging)
       const conflicts = await detectConflicts(inserted.id, content, type, memTags, embedding);
       const conflictNote = conflicts ? ` ⚠️ Possible contradiction with: ${conflicts}` : "";
 
-      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${conflictNote}${mergeNote}` }] };
+      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${mem0Note}${conflictNote}` }] };
     }
   );
 
@@ -1395,7 +1531,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "3.11.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "4.0.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
