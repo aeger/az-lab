@@ -3,6 +3,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import WebSocket from "ws";
 import express, { Request, Response } from "express";
 import { z } from "zod";
 
@@ -10,6 +11,7 @@ import { z } from "zod";
 const PORT = parseInt(process.env.PORT || "3100", 10);
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || SUPABASE_KEY;
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://ollama:11434";
 const EMBED_MODEL = process.env.EMBED_MODEL || "nomic-embed-text";
 
@@ -101,12 +103,20 @@ async function detectConflicts(
   const conflictNames: string[] = [];
   for (const candidate of candidates) {
     if (mightContradict(newContent, candidate.content)) {
-      // Record conflict in DB
+      // Record contradiction conflict
       await supabase.from("memory_conflicts").upsert({
         memory_a_id: newMemoryId,
         memory_b_id: candidate.id,
         conflict_type: "contradiction",
         description: `New memory may contradict "${candidate.name}"`,
+        resolved: false,
+      }, { onConflict: "memory_a_id,memory_b_id" });
+      // Also record stale conflict against the older memory (new supersedes old)
+      await supabase.from("memory_conflicts").upsert({
+        memory_a_id: candidate.id,
+        memory_b_id: newMemoryId,
+        conflict_type: "stale",
+        description: `May be superseded by newer memory "${newContent.slice(0, 80)}..."`,
         resolved: false,
       }, { onConflict: "memory_a_id,memory_b_id" });
       // Flag both memories
@@ -116,6 +126,59 @@ async function detectConflicts(
   }
 
   return conflictNames.length > 0 ? conflictNames.join(", ") : null;
+}
+
+// ── Mem0-style Write Decision ─────────────────────────────────────────────────
+// Determines ADD / NOOP / MERGE_SUGGEST before every insert.
+// NOOP: new content is semantically identical to an existing memory (prevents bloat).
+// MERGE_SUGGEST: high similarity but different enough to warrant a write + warning.
+
+function contentOverlap(a: string, b: string): number {
+  const wordsA = new Set((a.toLowerCase().match(/\b\w{4,}\b/g) ?? []));
+  const wordsB = (b.toLowerCase().match(/\b\w{4,}\b/g) ?? []);
+  if (!wordsA.size || !wordsB.length) return 0;
+  const matches = wordsB.filter((w) => wordsA.has(w)).length;
+  return matches / Math.max(wordsA.size, wordsB.length);
+}
+
+type WriteDecision =
+  | { action: "add" }
+  | { action: "noop"; existingName: string; similarity: number }
+  | { action: "merge_suggest"; existingName: string; existingId: string; similarity: number };
+
+async function resolveWriteAction(
+  name: string,
+  content: string,
+  type: string,
+  embedding: number[] | null
+): Promise<WriteDecision> {
+  if (!embedding) return { action: "add" };
+
+  const { data } = await supabase.rpc("match_memories", {
+    query_embedding: JSON.stringify(embedding),
+    match_threshold: 0.92,
+    match_count: 5,
+  });
+  if (!data?.length) return { action: "add" };
+
+  // Exclude exact name match (already handled as update-by-name)
+  const candidates = (data as any[]).filter((m) => m.type === type && m.name !== name);
+  if (!candidates.length) return { action: "add" };
+
+  const top = candidates[0];
+  const overlap = contentOverlap(content, top.content ?? "");
+
+  // NOOP: essentially identical — don't write
+  if (top.similarity > 0.97 && overlap > 0.80) {
+    return { action: "noop", existingName: top.name, similarity: top.similarity };
+  }
+
+  // MERGE_SUGGEST: high similarity — write but warn
+  if (top.similarity > 0.92) {
+    return { action: "merge_suggest", existingName: top.name, existingId: top.id, similarity: top.similarity };
+  }
+
+  return { action: "add" };
 }
 
 // ── Embeddings ───────────────────────────────────────────────────────────────
@@ -289,7 +352,7 @@ async function applyStartupMigrations(): Promise<void> {
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.10.0",
+    version: "3.11.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -363,6 +426,17 @@ function createMcpServer(): McpServer {
         return { content: [{ type: "text" as const, text: `Updated memory "${name}" (${type})${embedNote}.${linkNote}${updateConflictNote}` }] };
       }
 
+      // Mem0-style write decision: NOOP or MERGE_SUGGEST before inserting
+      const writeDecision = await resolveWriteAction(name, content, type, embedding);
+
+      if (writeDecision.action === "noop") {
+        return { content: [{ type: "text" as const, text: `NOOP: "${name}" is semantically identical to existing memory "${writeDecision.existingName}" (similarity ${(writeDecision.similarity * 100).toFixed(1)}%). Memory not written — no new information.` }] };
+      }
+
+      const mergeNote = writeDecision.action === "merge_suggest"
+        ? ` ⚠️ High similarity (${(writeDecision.similarity * 100).toFixed(1)}%) to existing "${writeDecision.existingName}" — consider merging with merge_memories().`
+        : "";
+
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
       if (embedding) insert.embedding = JSON.stringify(embedding);
       if (importance_score !== undefined) insert.importance_score = importance_score;
@@ -389,11 +463,11 @@ function createMcpServer(): McpServer {
         }
       }
 
-      // Conflict detection
+      // Conflict detection (contradiction + stale flagging)
       const conflicts = await detectConflicts(inserted.id, content, type, memTags, embedding);
       const conflictNote = conflicts ? ` ⚠️ Possible contradiction with: ${conflicts}` : "";
 
-      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${conflictNote}` }] };
+      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${conflictNote}${mergeNote}` }] };
     }
   );
 
@@ -1321,7 +1395,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "3.10.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "3.11.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
@@ -1378,58 +1452,84 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v3.10.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v3.11.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
 });
 
 // ── Cross-agent memory sync (Supabase Realtime) ──────────────────────────────
-// Subscribes to high-importance memory writes from other agents.
-// Logs when Iris/Atlas writes importance>=0.8 memories.
+// Subscribes to high-importance memory writes from other agents using raw
+// Phoenix v1.0.0 WebSocket — supabase-js hardcodes vsn=2.0.0 which this
+// project's Realtime server doesn't support.
 function startMemorySyncListener() {
+  const RT_URL = `${SUPABASE_URL.replace("https://", "wss://")}/realtime/v1/websocket?apikey=${SUPABASE_ANON_KEY}&vsn=1.0.0`;
+
+  let ws: any = null;
+  let heartbeat: NodeJS.Timeout | null = null;
   let retryTimer: NodeJS.Timeout | null = null;
-  let activeChannel: ReturnType<typeof supabase.channel> | null = null;
+  let ref = 0;
 
-  function subscribe() {
-    if (activeChannel) {
-      supabase.removeChannel(activeChannel).catch(() => {});
-    }
-
-    const channel = supabase
-      .channel(`memory-sync-${Date.now()}`)
-      .on(
-        "postgres_changes" as any,
-        { event: "*", schema: "public", table: "memories" },
-        (payload: any) => {
-          const rec = payload.new || payload.old;
-          if (!rec) return;
-          const importance = rec.importance_score ?? 0;
-          if (importance < 0.8) return;
-          const src = rec.source || "unknown";
-          if (src === "wren") return;
-          const event = (payload.eventType as string).toUpperCase();
-          console.log(
-            `[memory-sync] ${event} from ${src}: "${rec.name}" ` +
-            `(importance=${importance}, type=${rec.type})`
-          );
-        }
-      )
-      .subscribe((status: string) => {
-        if (status === "SUBSCRIBED") {
-          console.log("[memory-sync] Realtime subscription active — watching importance>=0.8 cross-agent writes");
-          if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
-        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          console.warn(`[memory-sync] ${status} — reconnecting in 30s`);
-          retryTimer = setTimeout(subscribe, 30_000);
-        }
-      });
-
-    activeChannel = channel;
+  function cleanup() {
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    if (ws) { try { ws.close(); } catch {} ws = null; }
   }
 
-  subscribe();
+  function connect() {
+    cleanup();
+    ws = new WebSocket(RT_URL);
 
-  process.on("SIGTERM", () => { if (activeChannel) supabase.removeChannel(activeChannel); });
-  process.on("SIGINT",  () => { if (activeChannel) supabase.removeChannel(activeChannel); });
+    ws.on("open", () => {
+      ref = 0;
+      // Join the channel
+      ws!.send(JSON.stringify({
+        topic: "realtime:memory-sync",
+        event: "phx_join",
+        payload: { config: { broadcast: { self: false }, presence: { key: "" }, postgres_changes: [{ event: "*", schema: "public", table: "memories" }] } },
+        ref: String(++ref),
+        join_ref: "1",
+      }));
+      // Heartbeat every 25s
+      heartbeat = setInterval(() => {
+        ws!.send(JSON.stringify({ topic: "phoenix", event: "heartbeat", payload: {}, ref: String(++ref) }));
+      }, 25_000);
+    });
+
+    ws.on("message", (raw: any) => {
+      let msg: any;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+      if (msg.event === "phx_reply" && msg.payload?.status === "ok" && msg.topic === "realtime:memory-sync") {
+        console.log("[memory-sync] Realtime subscription active — watching importance>=0.8 cross-agent writes");
+        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        return;
+      }
+
+      if (msg.event === "postgres_changes") {
+        const rec = msg.payload?.data?.record || msg.payload?.record;
+        if (!rec) return;
+        const importance = rec.importance_score ?? 0;
+        if (importance < 0.8) return;
+        const src = rec.source || "unknown";
+        if (src === "wren") return;
+        const event = (msg.payload?.data?.type || "CHANGE").toUpperCase();
+        console.log(`[memory-sync] ${event} from ${src}: "${rec.name}" (importance=${importance}, type=${rec.type})`);
+      }
+    });
+
+    ws.on("error", (e: any) => {
+      console.warn(`[memory-sync] WS error: ${e.message} — reconnecting in 30s`);
+      cleanup();
+      retryTimer = setTimeout(connect, 30_000);
+    });
+
+    ws.on("close", () => {
+      cleanup();
+      retryTimer = setTimeout(connect, 30_000);
+    });
+  }
+
+  connect();
+  process.on("SIGTERM", cleanup);
+  process.on("SIGINT",  cleanup);
 }
