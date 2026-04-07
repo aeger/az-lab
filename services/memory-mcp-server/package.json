@@ -1,6 +1,6 @@
 {
   "name": "memory-mcp-server",
-  "version": "4.2.0",
+  "version": "4.3.0",
   "description": "Shared memory MCP server for az-lab — Supabase-backed with semantic search",
   "type": "module",
   "main": "dist/index.js",

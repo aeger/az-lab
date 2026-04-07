@@ -517,13 +517,30 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 009 skipped:", err.message);
   }
+
+  // Migration 010: agent_id + visibility columns for multi-agent memory isolation
+  try {
+    const { data, error } = await supabase.rpc("apply_agent_visibility_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 010 RPC not yet registered — apply migrations/010_agent_visibility.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 010 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 010 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 010 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "4.2.0",
+    version: "4.3.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -540,8 +557,10 @@ function createMcpServer(): McpServer {
       tags: z.array(z.string()).optional().describe("Tags for categorization and search"),
       source: z.string().optional().describe("Who is writing: claude-code, claude-ai, manual"),
       importance_score: z.number().min(0).max(1).optional().describe("Importance 0-1 (default 0.5). Higher = decays slower and ranks higher in recall. Use 0.8+ for critical long-term facts, 0.2 for ephemeral context."),
+      agent_id: z.string().optional().describe("Agent that owns this memory: wren, iris, atlas, forge, volt. Used with visibility=private for agent-scoped memories."),
+      visibility: z.enum(["shared", "private"]).optional().describe("shared (default): visible to all agents. private: visible only to agent_id owner."),
     },
-    async ({ type, name, description, content, tags, source, importance_score }) => {
+    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility }) => {
       // Security gate — scan all text fields before touching the DB
       const scanTargets: Array<[string, string]> = [
         ["name", name], ["description", description], ["content", content],
@@ -576,6 +595,8 @@ function createMcpServer(): McpServer {
         const update: Record<string, unknown> = { type, description, content, tags: memTags, source: src };
         if (embedding) update.embedding = JSON.stringify(embedding);
         if (importance_score !== undefined) update.importance_score = importance_score;
+        if (agent_id) update.agent_id = agent_id;
+        if (visibility) update.visibility = visibility;
         const { error } = await supabase.from("memories").update(update).eq("id", existing.id);
         if (error) return { content: [{ type: "text" as const, text: `Error updating memory: ${error.message}` }] };
 
@@ -640,6 +661,8 @@ function createMcpServer(): McpServer {
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
       if (embedding) insert.embedding = JSON.stringify(embedding);
       if (importance_score !== undefined) insert.importance_score = importance_score;
+      if (agent_id) insert.agent_id = agent_id;
+      if (visibility) insert.visibility = visibility;
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
@@ -680,8 +703,9 @@ function createMcpServer(): McpServer {
       tags: z.array(z.string()).optional().describe("Filter by tags (any match)"),
       limit: z.number().optional().describe("Max results (default 10)"),
       semantic: z.boolean().optional().describe("Force semantic search (default: true when Ollama available)"),
+      agent_id: z.string().optional().describe("Filter by agent ownership: returns shared memories + private memories owned by this agent_id. Omit to return all shared memories."),
     },
-    async ({ query, type, tags, limit, semantic }) => {
+    async ({ query, type, tags, limit, semantic, agent_id }) => {
       const maxResults = limit || 10;
 
       // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled.
@@ -696,6 +720,7 @@ function createMcpServer(): McpServer {
           p_match_threshold: queryEmbedding ? 0.3 : 0.0,
           p_match_count: maxResults * 2, // wider pool, filter below
           p_filter_type: type || null,
+          p_agent_id: agent_id || null,
         });
 
         if (!error && data && data.length > 0) {
@@ -825,6 +850,8 @@ function createMcpServer(): McpServer {
       if (type) q = q.eq("type", type);
       if (tags && tags.length > 0) q = q.overlaps("tags", tags);
       if (query) q = q.or(`name.ilike.%${query}%,description.ilike.%${query}%,content.ilike.%${query}%`);
+      // Agent visibility filter: when agent_id set, return shared + own private; else return shared only (or all if visibility column not yet added)
+      if (agent_id) q = q.or(`visibility.eq.shared,and(visibility.eq.private,agent_id.eq.${agent_id})`);
 
       const { data, error } = await q;
 
@@ -1619,7 +1646,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "4.2.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "4.3.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
@@ -1676,7 +1703,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v4.1.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v4.3.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
