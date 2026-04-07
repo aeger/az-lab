@@ -1,0 +1,22 @@
+{
+  "name": "lumen-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lumen — az-lab browser agent. Eyes on the internet.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite build --watch --mode development",
+    "build": "tsc --noEmit && vite build",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "preact": "^10.25.0"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.9.0",
+    "@types/chrome": "^0.0.287",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  }
+}

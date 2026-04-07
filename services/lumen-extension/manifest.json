@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Lumen — az-lab Agent",
+  "version": "0.1.0",
+  "description": "Browser-native agent for the az-lab agentic system. Eyes on the internet.",
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "activeTab",
+    "tabs",
+    "contextMenus",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://memory-mcp.az-lab.dev/*",
+    "https://ogqjjlbupqnvlcyrfnxi.supabase.co/*",
+    "http://192.168.1.181:8765/*",
+    "https://api.anthropic.com/*"
+  ],
+  "background": {
+    "service_worker": "background/index.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/index.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "side_panel": {
+    "default_path": "sidepanel/index.html"
+  },
+  "action": {
+    "default_popup": "popup/index.html",
+    "default_icon": {
+      "16": "icons/lumen-16.png",
+      "48": "icons/lumen-48.png",
+      "128": "icons/lumen-128.png"
+    }
+  },
+  "options_page": "options/index.html",
+  "icons": {
+    "16": "icons/lumen-16.png",
+    "48": "icons/lumen-48.png",
+    "128": "icons/lumen-128.png"
+  }
+}
