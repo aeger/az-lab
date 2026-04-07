@@ -1599,6 +1599,22 @@ function createMcpServer(): McpServer {
 // ── Express + Transport ─────────────────────────────────────────────────────
 const app = express();
 
+// CORS: allow browser extension (chrome-extension://) and localhost origins
+app.use((req: Request, res: Response, next: () => void) => {
+  const origin = req.headers.origin || "";
+  if (origin.startsWith("chrome-extension://") || origin.startsWith("moz-extension://") || origin.startsWith("http://localhost") || origin.startsWith("http://127.0.0.1")) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, mcp-session-id, Authorization");
+    res.setHeader("Access-Control-Expose-Headers", "mcp-session-id");
+  }
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
+
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
