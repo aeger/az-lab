@@ -2,8 +2,21 @@
 # Stop hook — queues session transcript to task_queue (target=cowork) for Iris to process.
 # Reads transcript_path from Stop hook JSON input (stdin).
 
-SUPABASE_URL="https://ogqjjlbupqnvlcyrfnxi.supabase.co"
-SERVICE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ncWpqbGJ1cHFudmxjeXJmbnhpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDA0NTU3NiwiZXhwIjoyMDg5NjIxNTc2fQ.nxAesbiMgcogKp4rOS0VodJLI127mmMbSFMHcvRKNa0"
+# Load credentials from env file (never hardcode secrets in tracked files)
+ENV_FILE="/home/almty1/azlab/services/memory-mcp-server/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  set -o allexport
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +o allexport
+fi
+
+SUPABASE_URL="${SUPABASE_URL:-}"
+SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
+
+if [[ -z "$SUPABASE_URL" || -z "$SERVICE_KEY" ]]; then
+  exit 0
+fi
 
 # Read Stop hook JSON from stdin
 HOOK_JSON=$(cat)
