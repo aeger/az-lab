@@ -23,6 +23,11 @@ services:
       # Set to NemoClaw NIM API for LLM-based ADD/UPDATE/DELETE/NOOP decisions
       - LLM_URL=${LLM_URL:-}
       - LLM_MODEL=${LLM_MODEL:-llama3.2:3b}
+      # Nemotron reranking (optional — skipped if NVIDIA_API_KEY unset)
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - RERANK_URL=${RERANK_URL:-http://192.168.1.183:8000}
+      - RERANK_MODEL=${RERANK_MODEL:-nvidia/nemotron-3-super-120b-a12b}
+      - RERANK_TOP_K=${RERANK_TOP_K:-5}
       - HA_URL=${HA_URL}
       - HA_TOKEN=${HA_TOKEN}
     ports:

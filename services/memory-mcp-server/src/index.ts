@@ -137,6 +137,12 @@ async function detectConflicts(
 const LLM_URL = process.env.LLM_URL || "";
 const LLM_MODEL = process.env.LLM_MODEL || "llama3.2:3b";
 
+// Nemotron reranking — set NVIDIA_API_KEY to enable
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "";
+const RERANK_URL = process.env.RERANK_URL || "http://192.168.1.183:8000";
+const RERANK_MODEL = process.env.RERANK_MODEL || "nvidia/nemotron-3-super-120b-a12b";
+const RERANK_TOP_K = parseInt(process.env.RERANK_TOP_K || "5", 10);
+
 type Mem0Action = "ADD" | "UPDATE" | "DELETE" | "NOOP";
 
 interface Mem0Decision {
@@ -310,6 +316,63 @@ function embedInput(name: string, description: string, content: string): string 
   return `${name}: ${description}\n\n${content}`.slice(0, 4000);
 }
 
+// ── Nemotron Reranking ────────────────────────────────────────────────────────
+// Retrieves top-20 from hybrid recall, then asks Nemotron 120B to reorder by
+// relevance, returning top RERANK_TOP_K. Falls back to original order on failure.
+async function rerankMemories(query: string, memories: any[]): Promise<any[]> {
+  if (!NVIDIA_API_KEY || memories.length <= 1) return memories;
+
+  const snippets = memories.map((m, i) =>
+    `[${i}] ${m.name} (${m.type}): ${m.description}\n${(m.content || "").slice(0, 250)}`
+  ).join("\n\n");
+
+  const prompt = `You are a memory relevance ranker. Given the search query and candidate memories, return a JSON array of candidate indices ordered from most to least relevant to the query. Include all indices.
+
+Query: "${query}"
+
+Candidates:
+${snippets}
+
+Respond with only a JSON array of indices, e.g.: [2, 0, 4, 1, 3]`;
+
+  try {
+    const res = await fetch(`${RERANK_URL}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${NVIDIA_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: RERANK_MODEL,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0,
+        max_tokens: 120,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) throw new Error(`Rerank HTTP ${res.status}`);
+    const json = await res.json() as any;
+    let raw = (json.choices?.[0]?.message?.content || "").trim();
+    raw = raw.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+    const indices: number[] = JSON.parse(raw);
+    if (!Array.isArray(indices)) throw new Error("Non-array response");
+    const seen = new Set<number>();
+    const reranked: any[] = [];
+    for (const i of indices) {
+      if (typeof i === "number" && i >= 0 && i < memories.length && !seen.has(i)) {
+        reranked.push(memories[i]);
+        seen.add(i);
+      }
+    }
+    // Append any memories not mentioned by Nemotron
+    for (let i = 0; i < memories.length; i++) {
+      if (!seen.has(i)) reranked.push(memories[i]);
+    }
+    console.log(`[rerank] Nemotron reranked ${memories.length} memories`);
+    return reranked;
+  } catch (err: any) {
+    console.warn("[rerank] Nemotron rerank failed:", err.message, "— original order preserved");
+    return memories;
+  }
+}
+
 // R2 client (optional — file tools disabled if not configured)
 const r2Enabled = !!(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY);
 const r2 = r2Enabled
@@ -460,7 +523,7 @@ async function applyStartupMigrations(): Promise<void> {
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "4.1.0",
+    version: "4.2.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -639,7 +702,16 @@ function createMcpServer(): McpServer {
           // Apply tag filters client-side
           let filtered = data as any[];
           if (tags?.length) filtered = filtered.filter((m) => tags.some((t) => m.tags?.includes(t)));
-          filtered = filtered.slice(0, maxResults);
+          // Nemotron reranking: reorder the wider pool before slicing to final count
+          const rerankPool = filtered.slice(0, 20);
+          const rerankEnabled = !!NVIDIA_API_KEY;
+          if (rerankEnabled && rerankPool.length > 1) {
+            const reranked = await rerankMemories(query, rerankPool);
+            filtered = [...reranked, ...filtered.slice(20)];
+          }
+          const finalLimit = rerankEnabled ? Math.min(RERANK_TOP_K, maxResults) : maxResults;
+          const hybridModeLabel = rerankEnabled ? `${hybridMode}+rerank` : hybridMode;
+          filtered = filtered.slice(0, finalLimit);
 
           if (filtered.length > 0) {
             await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
@@ -736,7 +808,7 @@ function createMcpServer(): McpServer {
             const totalCount = filtered.length + boostedExtras.size;
             const boostNote = boostedExtras.size > 0 ? ` (${boostedExtras.size} added via temporal/causal links)` : "";
             return {
-              content: [{ type: "text" as const, text: `Found ${totalCount} memor${totalCount === 1 ? "y" : "ies"} (${hybridMode})${boostNote}:\n\n${results.join("\n\n---\n\n")}` }],
+              content: [{ type: "text" as const, text: `Found ${totalCount} memor${totalCount === 1 ? "y" : "ies"} (${hybridModeLabel})${boostNote}:\n\n${results.join("\n\n---\n\n")}` }],
             };
           }
         }
@@ -1531,7 +1603,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "4.1.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "4.2.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID

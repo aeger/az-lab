@@ -2,10 +2,14 @@
 """
 Episodic → Semantic → Procedural auto-distillation pipeline.
 
-Queries episodic memories with access_count >= 3 (not yet consolidated),
+Phase 1: Queries episodic memories with access_count >= 3 (not yet consolidated),
 clusters by semantic similarity, distills each cluster into a stable
 semantic fact, and inserts as type=semantic with Zettelkasten links
 back to the source episodes.
+
+Phase 2: Queries project memories 7-14 days old with access_count >= 2 (not yet
+consolidated), distills each cluster into a reference memory (permanent
+operational knowledge).
 
 Based on ElephantBroker 3-session promotion threshold and CraniMem
 scheduled consolidation replay pattern.
@@ -19,7 +23,7 @@ import json
 import logging
 import httpx
 import numpy as np
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SUPABASE_URL  = os.environ.get("SUPABASE_URL", "https://ogqjjlbupqnvlcyrfnxi.supabase.co")
@@ -30,9 +34,12 @@ NEMOCLAW_KEY  = os.environ.get("NVIDIA_API_KEY", "")
 NEMOCLAW_MODEL = os.environ.get("NEMOCLAW_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 
 MIN_ACCESS_COUNT = int(os.environ.get("MIN_ACCESS_COUNT", "3"))
+PROJECT_MIN_ACCESS_COUNT = int(os.environ.get("PROJECT_MIN_ACCESS_COUNT", "2"))
 CLUSTER_THRESHOLD = float(os.environ.get("CLUSTER_THRESHOLD", "0.82"))
 MAX_CLUSTERS = int(os.environ.get("MAX_CLUSTERS", "20"))
 CONSOLIDATED_TAG = "consolidated"
+PROJECT_AGE_MIN_DAYS = int(os.environ.get("PROJECT_AGE_MIN_DAYS", "7"))
+PROJECT_AGE_MAX_DAYS = int(os.environ.get("PROJECT_AGE_MAX_DAYS", "14"))
 DISCORD_CHANNEL = "1012721652049657896"
 AGENT_BUS_URL = "http://localhost:8765"
 
@@ -235,6 +242,171 @@ def send_discord(msg: str):
     except Exception:
         pass
 
+
+# ── Project memory consolidation ──────────────────────────────────────────────
+def fetch_stale_project_memories() -> list:
+    """Fetch project memories 7-14 days old with high access_count, not yet consolidated."""
+    now = datetime.now(timezone.utc)
+    date_min = (now - timedelta(days=PROJECT_AGE_MAX_DAYS)).isoformat()
+    date_max = (now - timedelta(days=PROJECT_AGE_MIN_DAYS)).isoformat()
+    try:
+        mems = supa_get("memories", {
+            "type": "eq.project",
+            "access_count": f"gte.{PROJECT_MIN_ACCESS_COUNT}",
+            "tags": f"not.cs.{{{CONSOLIDATED_TAG}}}",
+            "updated_at": f"gte.{date_min}",
+            "select": "id,name,description,content,tags,access_count,embedding,updated_at",
+            "order": "access_count.desc",
+            "limit": "100",
+        })
+        # Filter to upper age bound client-side
+        mems = [m for m in mems if m.get("updated_at", "") <= date_max]
+        return mems
+    except Exception as e:
+        log.error(f"Failed to fetch stale project memories: {e}")
+        return []
+
+
+def summarize_project_cluster(memories: list) -> str | None:
+    """Distill a cluster of related project memories into a permanent reference fact."""
+    if not NEMOCLAW_KEY:
+        return None
+
+    snippets = "\n".join([
+        f"- [{m['name']}]: {m['content'][:300]}"
+        for m in memories[:6]
+    ])
+    prompt = (
+        "You are a knowledge consolidation system. The following project memories "
+        "are related operational facts that were repeatedly referenced. "
+        "Distill them into a single permanent reference entry (2-4 sentences) "
+        "capturing the durable operational knowledge. Omit ephemeral dates, "
+        "in-progress status, and transient context.\n\n"
+        f"Project memories:\n{snippets}\n\n"
+        "Consolidated reference fact:"
+    )
+
+    try:
+        r = httpx.post(
+            f"{NEMOCLAW_URL}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {NEMOCLAW_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": NEMOCLAW_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 300,
+                "temperature": 0.3,
+            },
+            timeout=45,
+        )
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.warning(f"LLM project summarization failed: {e}")
+    return None
+
+
+def write_reference_memory(name: str, description: str, content: str, tags: list) -> str | None:
+    """Write a reference memory via MCP (with Supabase fallback)."""
+    try:
+        r = httpx.post(
+            f"{MEMORY_MCP_URL}/tools/remember",
+            json={
+                "type": "reference",
+                "name": name,
+                "description": description,
+                "content": content,
+                "tags": tags,
+                "source": "claude-code",
+                "importance_score": 0.80,
+            },
+            timeout=30,
+        )
+        if r.status_code == 200:
+            return r.json().get("id") or "ok"
+    except Exception as e:
+        log.warning(f"MCP reference write failed, falling back to Supabase: {e}")
+
+    try:
+        result = supa_post("memories", {
+            "type": "reference",
+            "name": name,
+            "description": description,
+            "content": content,
+            "tags": tags,
+            "source": "claude-code",
+            "importance_score": 0.80,
+        })
+        if isinstance(result, list) and result:
+            return result[0].get("id")
+    except Exception as e:
+        log.error(f"Direct Supabase reference write failed: {e}")
+    return None
+
+
+def run_project_consolidation(use_llm: bool) -> tuple[int, int]:
+    """Phase 2: consolidate stale project memories into reference memories."""
+    memories = fetch_stale_project_memories()
+    log.info(f"[Phase 2] Found {len(memories)} stale project memories eligible for consolidation")
+    if not memories:
+        return 0, 0
+
+    for m in memories:
+        emb = m.get("embedding")
+        if isinstance(emb, str):
+            try:
+                m["embedding"] = json.loads(emb)
+            except Exception:
+                m["embedding"] = None
+
+    clusters = cluster_memories(memories)
+    log.info(f"[Phase 2] {len(clusters)} clusters found")
+
+    created = 0
+    processed = 0
+
+    for cluster_idxs in clusters[:MAX_CLUSTERS]:
+        cluster_mems = [memories[i] for i in cluster_idxs]
+        cluster_names = [m["name"] for m in cluster_mems]
+        log.info(f"[Phase 2] Consolidating {len(cluster_mems)}: {cluster_names[:3]}...")
+
+        content = summarize_project_cluster(cluster_mems) if use_llm else None
+        if not content:
+            content = summarize_cluster_heuristic(cluster_mems)
+
+        top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
+        ref_name = f"ref:{top_mem['name']}"
+        description = f"Consolidated from {len(cluster_mems)} project memories"
+        tags = ["auto-consolidated", "project-distilled"] + [
+            t for m in cluster_mems for t in (m.get("tags") or [])
+            if t not in (CONSOLIDATED_TAG, "auto-consolidated", "project-distilled")
+        ][:8]
+
+        ref_id = write_reference_memory(ref_name, description, content, tags)
+        if not ref_id:
+            log.error(f"[Phase 2] Failed to create reference for {cluster_names}")
+            continue
+
+        if ref_id == "ok":
+            result = supa_get("memories", {"name": f"eq.{ref_name}", "select": "id"})
+            ref_id = result[0]["id"] if result else None
+
+        if ref_id:
+            for ep_mem in cluster_mems:
+                create_link(ref_id, ep_mem["id"], "consolidated_from", "semantic")
+            for ep_mem in cluster_mems:
+                mark_consolidated(ep_mem["id"], ep_mem.get("tags") or [])
+            created += 1
+            log.info(f"[Phase 2]   ✓ Created reference memory '{ref_name}'")
+        else:
+            log.warning(f"[Phase 2]   ✗ Could not retrieve ID for '{ref_name}'")
+        processed += 1
+
+    return created, processed
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     load_env()
@@ -270,33 +442,29 @@ def main():
 
     log.info(f"Found {len(memories)} eligible episodic memories (access_count>={MIN_ACCESS_COUNT})")
 
-    if not memories:
-        log.info("Nothing to distill.")
-        return
+    use_llm = bool(NEMOCLAW_KEY)
+    llm_status = "NemoClaw" if use_llm else "heuristic"
+    log.info(f"Summarization mode: {llm_status}")
 
-    # Parse embeddings from string if needed
-    for m in memories:
-        emb = m.get("embedding")
-        if isinstance(emb, str):
-            try:
-                m["embedding"] = json.loads(emb)
-            except Exception:
-                m["embedding"] = None
+    if not memories:
+        log.info("[Phase 1] Nothing to distill.")
+    else:
+        # Parse embeddings from string if needed
+        for m in memories:
+            emb = m.get("embedding")
+            if isinstance(emb, str):
+                try:
+                    m["embedding"] = json.loads(emb)
+                except Exception:
+                    m["embedding"] = None
 
     # 2. Cluster by semantic similarity
-    clusters = cluster_memories(memories)
+    clusters = cluster_memories(memories) if memories else []
     log.info(f"Found {len(clusters)} clusters of related episodic memories")
-
-    if not clusters:
-        log.info("No clusters formed — all memories are semantically distinct.")
-        return
 
     # Process up to MAX_CLUSTERS clusters
     processed = 0
     created_semantic = 0
-    use_llm = bool(NEMOCLAW_KEY)
-    llm_status = "NemoClaw" if use_llm else "heuristic"
-    log.info(f"Summarization mode: {llm_status}")
 
     for cluster_idxs in clusters[:MAX_CLUSTERS]:
         cluster_mems = [memories[i] for i in cluster_idxs]
@@ -346,13 +514,25 @@ def main():
 
         processed += 1
 
-    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-    log.info(f"=== Distillation complete: {created_semantic}/{processed} clusters → semantic memories ({elapsed:.1f}s) ===")
+    elapsed1 = (datetime.now(timezone.utc) - start).total_seconds()
+    log.info(f"=== Phase 1 complete: {created_semantic}/{processed} clusters → semantic memories ({elapsed1:.1f}s) ===")
 
-    if created_semantic > 0:
+    # ── Phase 2: Project memory consolidation ────────────────────────────────
+    log.info("=== Phase 2: Project memory consolidation started ===")
+    p2_created, p2_processed = run_project_consolidation(use_llm)
+    elapsed2 = (datetime.now(timezone.utc) - start).total_seconds() - elapsed1
+
+    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+    log.info(f"=== Phase 2 complete: {p2_created}/{p2_processed} clusters → reference memories ({elapsed2:.1f}s) ===")
+    log.info(f"=== Total: {created_semantic + p2_created} new memories created in {elapsed:.1f}s ===")
+
+    total_created = created_semantic + p2_created
+    if total_created > 0:
+        ep_note = f"{created_semantic} semantic from episodic" if created_semantic > 0 else ""
+        pr_note = f"{p2_created} reference from project" if p2_created > 0 else ""
+        parts = [p for p in [ep_note, pr_note] if p]
         send_discord(
-            f"🧠 Episodic distillation: {created_semantic} new semantic memories created "
-            f"from {sum(len(clusters[i]) for i in range(min(processed, len(clusters))))} episodic sources "
+            f"🧠 Memory consolidation: {', '.join(parts)} "
             f"({llm_status}, {elapsed:.0f}s)"
         )
 
