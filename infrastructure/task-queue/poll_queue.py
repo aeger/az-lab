@@ -37,12 +37,24 @@ SUPABASE_KEY = _load_supabase_key()
 CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
 HOSTNAME = socket.gethostname()
 
+# Model tiering — route low-priority/short tasks to Haiku to save cost/latency
+MODEL_DEFAULT = "claude-sonnet-4-6"          # medium/high/crit
+MODEL_HAIKU   = "claude-haiku-4-5-20251001"  # low priority (3) or tagged "haiku"
+
+def select_model(task: dict) -> str | None:
+    """Return model ID to pass to --model, or None to use the default."""
+    priority = task.get("priority", 2)
+    tags = task.get("tags") or []
+    if priority >= 3 or "haiku" in tags or "quick" in tags:
+        return MODEL_HAIKU
+    return None  # let claude binary use its own default
+
 # Nemotron routing — NVIDIA NIM API for cheap task classification
 NVIDIA_NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_API_KEY_FILE = os.path.expanduser("~/.nvidia_api_key")
 NEMOTRON_MODEL = "nvidia/nemotron-super-49b-instruct"
 
-ROUTING_TARGETS = ["claude-code", "cowork", "desktop"]
+ROUTING_TARGETS = ["claude-code", "wren", "cowork", "desktop"]
 
 ROUTING_PROMPT = """You are a task router for a homelab AI system. Classify the task below to exactly one target agent.
 
@@ -198,13 +210,13 @@ def api_request(method, path, data=None, params=None):
 
 def claim_next_task():
     """Fetch the highest-priority pending or delegated task and claim it atomically."""
-    # Pick up both 'pending' and 'delegated' tasks targeting claude-code
+    # Pick up both 'pending' and 'delegated' tasks targeting claude-code or wren
     tasks = api_request(
         "GET",
         "task_queue",
         params={
             "status": "in.(pending,delegated)",
-            "target": "eq.claude-code",
+            "target": "in.(claude-code,wren)",
             "order": "priority.asc,created_at.asc",
             "limit": "1",
             "select": "id,title,description,context,priority,tags,status,goal_id,attempt_count,error",
@@ -405,11 +417,14 @@ def build_prompt(task):
     )
 
 
-def run_claude(prompt, task_id=None):
+def run_claude(prompt, task_id=None, model=None):
     """Run claude with streaming output, writing events to agent_activity in real-time."""
+    cmd = [CLAUDE_CMD, "--print", "--dangerously-skip-permissions",
+           "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+    if model:
+        cmd += ["--model", model]
     proc = subprocess.Popen(
-        [CLAUDE_CMD, "--print", "--dangerously-skip-permissions",
-         "--output-format", "stream-json", "--verbose", "--include-partial-messages"],
+        cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -660,6 +675,31 @@ def notify_cowork_tasks():
         print(f"notify_cowork_tasks failed (non-fatal): {e}", file=sys.stderr)
 
 
+def write_heartbeat(status="active", metadata=None):
+    """Write task_poller heartbeat to agent_heartbeat table."""
+    try:
+        payload = json.dumps({
+            "agent": "task_poller",
+            "status": status,
+            "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+            "metadata": metadata or {"host": HOSTNAME},
+        }).encode()
+        req = urllib.request.Request(
+            f"{SUPABASE_URL}/rest/v1/agent_heartbeat?on_conflict=agent",
+            data=payload,
+            method="POST",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates",
+            }
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+
 def main():
     print(f"[{datetime.now().isoformat()}] Polling task queue on {HOSTNAME}...")
 
@@ -668,6 +708,8 @@ def main():
 
     # Ping Discord if cowork tasks are pending
     notify_cowork_tasks()
+
+    write_heartbeat("active")
 
     task = claim_next_task()
     if not task:
@@ -685,10 +727,12 @@ def main():
     discord_notify(f"🟡 Claimed: {title} — starting now")
 
     try:
+        model = select_model(task)
         prompt = build_prompt(task)
-        print(f"Running claude for task: {title}")
-        log_activity("thinking", f"Starting: {title}", task_id=task_id)
-        result = run_claude(prompt, task_id=task_id)
+        model_label = model or "default"
+        print(f"Running claude ({model_label}) for task: {title}")
+        log_activity("thinking", f"Starting: {title} [model: {model_label}]", task_id=task_id)
+        result = run_claude(prompt, task_id=task_id, model=model)
         summary = result.splitlines()[0][:120] if result else "done"
         goal_id = task.get("goal_id")
 

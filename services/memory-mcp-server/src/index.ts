@@ -485,12 +485,14 @@ async function applyStartupMigrations(): Promise<void> {
   }
 
   // Migration 008: Switch BM25 path from search_vector to search_vec (weighted: name=A, desc=B, content=C)
+  // Note: migration 009 supersedes 008 (includes search_vec) so PGRST202 on this sentinel is expected
+  // and harmless — migration 009 sentinel confirms the work is done.
   try {
     const { data, error } = await supabase.rpc("apply_search_vec_migration_if_missing");
     if (error) {
       if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
           error.message?.includes("not found in the schema cache")) {
-        console.log("Migration 008 RPC not yet registered — apply migrations/008_switch_bm25_to_search_vec.sql in Supabase SQL editor.");
+        console.log("Migration 008 sentinel not registered (superseded by 009 — OK).");
       } else {
         console.warn("Migration 008 warning:", error.message);
       }
@@ -714,14 +716,18 @@ function createMcpServer(): McpServer {
       if (query && semantic !== false) {
         const queryEmbedding = await embed(query);
         const hybridMode = queryEmbedding ? "hybrid BM25+vector" : "BM25-only";
-        const { data, error } = await supabase.rpc("hybrid_recall", {
+        // Build RPC params — only include p_agent_id when agent isolation is needed.
+        // Omitting it lets the call succeed against the 5-param DB function (migration 009)
+        // while remaining forward-compatible with the 6-param version (migration 010).
+        const rpcParams: Record<string, unknown> = {
           p_query_text: query,
           p_query_embedding: queryEmbedding ? JSON.stringify(queryEmbedding) : null,
           p_match_threshold: queryEmbedding ? 0.3 : 0.0,
           p_match_count: maxResults * 2, // wider pool, filter below
           p_filter_type: type || null,
-          p_agent_id: agent_id || null,
-        });
+        };
+        if (agent_id) rpcParams.p_agent_id = agent_id;
+        const { data, error } = await supabase.rpc("hybrid_recall", rpcParams);
 
         if (!error && data && data.length > 0) {
           // Apply tag filters client-side
@@ -1703,7 +1709,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v4.3.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v4.3.1 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
