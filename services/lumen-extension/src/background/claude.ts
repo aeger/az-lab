@@ -1,7 +1,8 @@
-// Claude API integration — Lumen's reasoning engine
+// Lumen's reasoning engine — Ollama (local, free) + Wren delegation for complex tasks
 
-import { getConfig, AGENT_NAME, AGENT_DISPLAY_NAME, STORAGE_KEYS } from '../shared/config';
+import { getConfig, AGENT_DISPLAY_NAME, STORAGE_KEYS } from '../shared/config';
 import type { ChatMessage, PageContext } from '../shared/types';
+import { createTask } from './supabase';
 
 const SYSTEM_PROMPT = `You are ${AGENT_DISPLAY_NAME}, a browser-native agent in Jeff's az-lab agentic system.
 
@@ -39,35 +40,101 @@ export async function loadChatHistory(): Promise<ChatMessage[]> {
 }
 
 async function saveChatHistory(): Promise<void> {
-  // Keep last 50 messages
   if (chatHistory.length > 50) {
     chatHistory = chatHistory.slice(-50);
   }
   await chrome.storage.local.set({ lumen_chat_history: chatHistory });
 }
 
+// --- Chat via Ollama (default, free, local) ---
+
+async function chatOllama(
+  messages: { role: string; content: string }[],
+  systemPrompt: string
+): Promise<string> {
+  const config = await getConfig();
+  const url = `${config.ollamaUrl}/api/chat`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: config.ollamaModel,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...messages,
+      ],
+      stream: false,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Ollama ${response.status}: ${await response.text()}`);
+  }
+
+  const data = await response.json();
+  return data.message?.content ?? 'No response';
+}
+
+// --- Chat via Anthropic API (optional, if key provided) ---
+
+async function chatAnthropic(
+  messages: { role: string; content: string }[],
+  systemPrompt: string
+): Promise<string> {
+  const config = await getConfig();
+  if (!config.anthropicApiKey) throw new Error('No Anthropic API key configured');
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': config.anthropicApiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model: config.anthropicModel,
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages,
+    }),
+  });
+
+  if (!response.ok) throw new Error(`Anthropic ${response.status}: ${await response.text()}`);
+
+  const data = await response.json();
+  return data.content?.[0]?.text ?? 'No response';
+}
+
+// --- Delegate to Wren via task queue (for complex/long tasks) ---
+
+export async function delegateToWren(
+  description: string,
+  context: Record<string, unknown> = {}
+): Promise<string> {
+  const created = await createTask({
+    title: `Lumen delegation: ${description.slice(0, 60)}`,
+    description,
+    target: 'wren',
+    priority: 2,
+    tags: ['lumen', 'delegated'],
+    context: { ...context, delegated_by: 'lumen' },
+  });
+
+  const taskId = created[0]?.id;
+  return taskId
+    ? `Delegated to Wren (task ${taskId.slice(0, 8)}). He'll pick it up within 5 minutes — I'll check back.`
+    : 'Task queued to Wren.';
+}
+
+// --- Main chat function ---
+
 export async function chat(
   userMessage: string,
   pageContext?: PageContext
 ): Promise<ChatMessage> {
   const config = await getConfig();
-
-  if (!config.anthropicApiKey) {
-    return {
-      role: 'assistant',
-      content: 'I need an Anthropic API key to chat. Open my options page (right-click extension icon > Options) to configure it.',
-      timestamp: Date.now(),
-    };
-  }
-
-  // Build user message with page context
-  let fullMessage = userMessage;
-  if (pageContext) {
-    fullMessage += `\n\n[Current page: ${pageContext.title} — ${pageContext.url}]`;
-    if (pageContext.selection) {
-      fullMessage += `\n[Selected text: ${pageContext.selection}]`;
-    }
-  }
 
   // Add to history
   const userMsg: ChatMessage = {
@@ -83,7 +150,7 @@ export async function chat(
   const feedbackRules = (stored[STORAGE_KEYS.feedbackMemories] ?? []).join('\n\n');
   const systemPrompt = SYSTEM_PROMPT.replace('{FEEDBACK_RULES}', feedbackRules || '(none loaded yet — run startup)');
 
-  // Build messages for API
+  // Build messages
   const messages = chatHistory.map((msg) => ({
     role: msg.role as 'user' | 'assistant',
     content: msg.role === 'user' && msg.pageContext
@@ -92,45 +159,29 @@ export async function chat(
   }));
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': config.anthropicApiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true',
-      },
-      body: JSON.stringify({
-        model: config.anthropicModel,
-        max_tokens: 4096,
-        system: systemPrompt,
-        messages,
-      }),
-    });
+    let content: string;
 
-    if (!response.ok) {
-      const err = await response.text();
-      throw new Error(`Anthropic API ${response.status}: ${err}`);
+    // Pick backend: Anthropic API if key provided, otherwise Ollama (free)
+    if (config.anthropicApiKey) {
+      content = await chatAnthropic(messages, systemPrompt);
+    } else {
+      content = await chatOllama(messages, systemPrompt);
     }
 
-    const data = await response.json();
-    const assistantContent = data.content?.[0]?.text ?? 'No response';
-
-    const assistantMsg: ChatMessage = {
-      role: 'assistant',
-      content: assistantContent,
-      timestamp: Date.now(),
-    };
+    const assistantMsg: ChatMessage = { role: 'assistant', content, timestamp: Date.now() };
     chatHistory.push(assistantMsg);
     await saveChatHistory();
-
     return assistantMsg;
   } catch (error) {
-    const errMsg: ChatMessage = {
-      role: 'assistant',
-      content: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      timestamp: Date.now(),
-    };
+    const errContent = error instanceof Error ? error.message : 'Unknown error';
+
+    // If Ollama fails, provide helpful guidance
+    let fallbackMsg = `Error: ${errContent}`;
+    if (errContent.includes('Ollama') || errContent.includes('Failed to fetch')) {
+      fallbackMsg = `Can't reach Ollama at ${config.ollamaUrl}. Make sure Ollama is running on svc-podman-01 with a chat model pulled (e.g. \`ollama pull llama3.1:8b\`). Or set an Anthropic API key in Settings as a fallback.`;
+    }
+
+    const errMsg: ChatMessage = { role: 'assistant', content: fallbackMsg, timestamp: Date.now() };
     chatHistory.push(errMsg);
     await saveChatHistory();
     return errMsg;

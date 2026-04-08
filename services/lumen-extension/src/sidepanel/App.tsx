@@ -12,7 +12,7 @@ export function App() {
     memoryMcp: 'disconnected',
     supabase: 'disconnected',
     agentBus: 'disconnected',
-    anthropic: 'missing_key',
+    chatBackend: 'disconnected',
   });
 
   useEffect(() => {
@@ -38,7 +38,7 @@ export function App() {
           <div class={`status-dot ${status.supabase}`} title={`Supabase: ${status.supabase}`} />
           <div class={`status-dot ${status.memoryMcp}`} title={`Memory MCP: ${status.memoryMcp}`} />
           <div class={`status-dot ${status.agentBus}`} title={`Agent Bus: ${status.agentBus}`} />
-          <div class={`status-dot ${status.anthropic}`} title={`Claude API: ${status.anthropic}`} />
+          <div class={`status-dot ${status.chatBackend}`} title={`Chat: ${status.chatBackend}`} />
         </div>
       </div>
 

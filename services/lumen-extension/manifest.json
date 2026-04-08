@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Lumen — az-lab Agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browser-native agent for the az-lab agentic system. Eyes on the internet.",
   "permissions": [
     "storage",
@@ -15,6 +15,7 @@
     "https://memory-mcp.az-lab.dev/*",
     "https://ogqjjlbupqnvlcyrfnxi.supabase.co/*",
     "http://192.168.1.181:8765/*",
+    "http://192.168.1.181:11434/*",
     "https://api.anthropic.com/*"
   ],
   "background": {

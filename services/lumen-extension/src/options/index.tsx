@@ -58,13 +58,25 @@ function Options() {
       </p>
 
       <h2 style={{ fontSize: '14px', color: '#a1a1aa', marginBottom: '12px', borderBottom: '1px solid #3f3f46', paddingBottom: '4px' }}>
-        Claude API
+        Chat Backend (Ollama — free, local)
       </h2>
-      {field('anthropicApiKey', 'Anthropic API Key', 'sk-ant-...', true)}
-      {field('anthropicModel', 'Model', DEFAULT_CONFIG.anthropicModel)}
+      {field('ollamaUrl', 'Ollama URL')}
+      {field('ollamaModel', 'Ollama Model')}
+      <p style={{ color: '#71717a', fontSize: '11px', marginBottom: '16px', marginTop: '-8px' }}>
+        Uses Ollama on svc-podman-01 by default. Complex tasks are delegated to Wren via the task queue (uses your Claude subscription).
+      </p>
 
       <h2 style={{ fontSize: '14px', color: '#a1a1aa', marginBottom: '12px', borderBottom: '1px solid #3f3f46', paddingBottom: '4px', marginTop: '24px' }}>
-        Endpoints
+        Claude API (optional fallback)
+      </h2>
+      {field('anthropicApiKey', 'Anthropic API Key', 'Leave blank to use Ollama', true)}
+      {field('anthropicModel', 'Model', DEFAULT_CONFIG.anthropicModel)}
+      <p style={{ color: '#71717a', fontSize: '11px', marginBottom: '16px', marginTop: '-8px' }}>
+        Only used if an API key is provided. Otherwise all chat goes through Ollama.
+      </p>
+
+      <h2 style={{ fontSize: '14px', color: '#a1a1aa', marginBottom: '12px', borderBottom: '1px solid #3f3f46', paddingBottom: '4px', marginTop: '24px' }}>
+        az-lab Services
       </h2>
       {field('memoryMcpUrl', 'Memory MCP Server')}
       {field('memoryHealthUrl', 'Memory MCP Health')}

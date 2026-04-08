@@ -1,6 +1,6 @@
 {
   "name": "lumen-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Lumen — az-lab browser agent. Eyes on the internet.",
   "type": "module",
@@ -10,7 +10,6 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
     "preact": "^10.25.0"
   },
   "devDependencies": {

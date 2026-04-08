@@ -13,7 +13,7 @@ let agentStatus: AgentStatus = {
   memoryMcp: 'disconnected',
   supabase: 'disconnected',
   agentBus: 'disconnected',
-  anthropic: 'missing_key',
+  chatBackend: 'disconnected',
 };
 
 // --- Install & Startup ---

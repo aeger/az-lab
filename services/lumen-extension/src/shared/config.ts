@@ -6,12 +6,17 @@ export const AGENT_ROLE = 'Browser agent — eyes on the internet';
 
 // Endpoints (defaults — overridable via options page)
 export const DEFAULT_CONFIG = {
+  // Chat backend — Ollama is default (free, local on svc-podman-01)
+  ollamaUrl: 'http://192.168.1.181:11434',
+  ollamaModel: 'llama3.1:8b',
+  // Anthropic API is optional fallback (only used if API key is set)
+  anthropicModel: 'claude-sonnet-4-6',
+  // az-lab services
   memoryMcpUrl: 'https://memory-mcp.az-lab.dev/mcp',
   memoryHealthUrl: 'https://memory-mcp.az-lab.dev/health',
   supabaseUrl: 'https://ogqjjlbupqnvlcyrfnxi.supabase.co',
   supabaseAnonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ncWpqbGJ1cHFudmxjeXJmbnhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwNDU1NzYsImV4cCI6MjA4OTYyMTU3Nn0.VVvHOmcR04gnVHa6k8_lHhdCt6zNhpHYbj4c68LkScc',
   agentBusUrl: 'http://192.168.1.181:8765',
-  anthropicModel: 'claude-sonnet-4-6',
 } as const;
 
 // Storage keys
@@ -32,13 +37,15 @@ export const ALARMS = {
 } as const;
 
 export type LumenConfig = {
+  ollamaUrl: string;
+  ollamaModel: string;
+  anthropicModel: string;
+  anthropicApiKey?: string;
   memoryMcpUrl: string;
   memoryHealthUrl: string;
   supabaseUrl: string;
   supabaseAnonKey: string;
   agentBusUrl: string;
-  anthropicModel: string;
-  anthropicApiKey?: string;
 };
 
 export async function getConfig(): Promise<LumenConfig> {

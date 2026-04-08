@@ -1,6 +1,6 @@
 // Lumen startup protocol — mirrors other agents' startup sequence
 
-import { STORAGE_KEYS, AGENT_NAME } from '../shared/config';
+import { STORAGE_KEYS, AGENT_NAME, getConfig } from '../shared/config';
 import { mcpHealthCheck, mcpInitialize } from './mcp-client';
 import { fetchMemories, fetchPendingTasks, fetchSharedContext } from './supabase';
 import { busHealthCheck } from './agent-bus';
@@ -59,20 +59,29 @@ export async function runStartup(): Promise<StartupResult> {
     memoryMcp: mcpConnected ? 'connected' : 'disconnected',
     supabase: supabaseOk ? 'connected' : 'disconnected',
     agentBus: busConnected ? 'connected' : 'disconnected',
-    anthropic: 'missing_key', // updated by checkAnthropicKey
+    chatBackend: 'configured', // Ollama is default, no key needed
   };
 
-  // Check Anthropic key
+  // Check chat backend availability
   const stored = await chrome.storage.local.get(STORAGE_KEYS.anthropicApiKey);
   if (stored[STORAGE_KEYS.anthropicApiKey]) {
-    status.anthropic = 'configured';
+    status.chatBackend = 'configured'; // Using Anthropic API
+  } else {
+    // Check if Ollama is reachable
+    try {
+      const config = await getConfig();
+      const ollamaRes = await fetch(`${config.ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(3000) });
+      status.chatBackend = ollamaRes.ok ? 'connected' : 'error';
+    } catch {
+      status.chatBackend = 'disconnected'; // Ollama unreachable
+    }
   }
 
   console.log(`[${AGENT_NAME}] Startup complete:`, {
     mcp: status.memoryMcp,
     supabase: status.supabase,
     bus: status.agentBus,
-    anthropic: status.anthropic,
+    chat: status.chatBackend,
     feedbackRules: feedbackRules.length,
     pendingTasks: pendingCount,
   });

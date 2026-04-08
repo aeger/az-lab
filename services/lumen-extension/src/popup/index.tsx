@@ -48,7 +48,7 @@ function Popup() {
             ['Supabase', status.supabase],
             ['Memory MCP', status.memoryMcp],
             ['Agent Bus', status.agentBus],
-            ['Claude API', status.anthropic],
+            ['Chat', status.chatBackend],
           ] as [string, string][]).map(([label, s]) => (
             <div key={label} style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '2px 0' }}>
               <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: dot(s), display: 'inline-block' }} />

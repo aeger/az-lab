@@ -58,5 +58,5 @@ export interface AgentStatus {
   memoryMcp: 'connected' | 'disconnected' | 'error';
   supabase: 'connected' | 'disconnected' | 'error';
   agentBus: 'connected' | 'disconnected' | 'error';
-  anthropic: 'configured' | 'missing_key' | 'error';
+  chatBackend: 'connected' | 'configured' | 'disconnected' | 'error';
 }
