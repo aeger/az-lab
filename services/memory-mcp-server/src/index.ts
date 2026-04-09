@@ -137,7 +137,9 @@ async function detectConflicts(
 const LLM_URL = process.env.LLM_URL || "";
 const LLM_MODEL = process.env.LLM_MODEL || "llama3.2:3b";
 
-// Nemotron reranking — set NVIDIA_API_KEY to enable
+// TEI cross-encoder reranking (primary) — set RERANKER_URL to enable (e.g. http://tei-reranker:8080)
+const RERANKER_URL = process.env.RERANKER_URL || "";
+// Nemotron reranking (fallback) — set NVIDIA_API_KEY to enable
 const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "";
 const RERANK_URL = process.env.RERANK_URL || "http://192.168.1.183:8000";
 const RERANK_MODEL = process.env.RERANK_MODEL || "nvidia/nemotron-3-super-120b-a12b";
@@ -316,7 +318,35 @@ function embedInput(name: string, description: string, content: string): string 
   return `${name}: ${description}\n\n${content}`.slice(0, 4000);
 }
 
-// ── Nemotron Reranking ────────────────────────────────────────────────────────
+// ── TEI Cross-Encoder Reranking (primary) ─────────────────────────────────────
+// Calls bge-reranker-v2-m3 via HuggingFace TEI /rerank endpoint.
+// Returns reranked array on success, null on failure (triggers Nemotron fallback).
+// ~80ms latency, CPU-only, local — no external API required.
+async function rerankWithTEI(query: string, memories: any[]): Promise<any[] | null> {
+  if (!RERANKER_URL || memories.length <= 1) return null;
+  const texts = memories.map((m) =>
+    `${m.name} (${m.type}): ${m.description}\n${(m.content || "").slice(0, 400)}`
+  );
+  try {
+    const res = await fetch(`${RERANKER_URL}/rerank`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, texts, truncate: true }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const results = (await res.json()) as Array<{ index: number; score: number }>;
+    const sorted = results.sort((a, b) => b.score - a.score);
+    const reranked = sorted.map((r) => memories[r.index]);
+    console.log(`[rerank] TEI bge-reranker-v2-m3 reranked ${memories.length} memories`);
+    return reranked;
+  } catch (err: any) {
+    console.warn("[rerank] TEI unavailable:", err.message, "— falling back to Nemotron");
+    return null;
+  }
+}
+
+// ── Nemotron Reranking (fallback) ─────────────────────────────────────────────
 // Retrieves top-20 from hybrid recall, then asks Nemotron 120B to reorder by
 // relevance, returning top RERANK_TOP_K. Falls back to original order on failure.
 async function rerankMemories(query: string, memories: any[]): Promise<any[]> {
@@ -542,7 +572,7 @@ async function applyStartupMigrations(): Promise<void> {
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "4.3.0",
+    version: "4.4.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -733,15 +763,23 @@ function createMcpServer(): McpServer {
           // Apply tag filters client-side
           let filtered = data as any[];
           if (tags?.length) filtered = filtered.filter((m) => tags.some((t) => m.tags?.includes(t)));
-          // Nemotron reranking: reorder the wider pool before slicing to final count
+          // Reranking: TEI cross-encoder (primary, local) → Nemotron LLM (fallback)
           const rerankPool = filtered.slice(0, 20);
-          const rerankEnabled = !!NVIDIA_API_KEY;
-          if (rerankEnabled && rerankPool.length > 1) {
-            const reranked = await rerankMemories(query, rerankPool);
-            filtered = [...reranked, ...filtered.slice(20)];
+          let rerankLabel = "";
+          if (rerankPool.length > 1) {
+            const teiResult = await rerankWithTEI(query, rerankPool);
+            if (teiResult) {
+              filtered = [...teiResult, ...filtered.slice(20)];
+              rerankLabel = "+tei-rerank";
+            } else if (NVIDIA_API_KEY) {
+              const reranked = await rerankMemories(query, rerankPool);
+              filtered = [...reranked, ...filtered.slice(20)];
+              rerankLabel = "+rerank";
+            }
           }
+          const rerankEnabled = rerankLabel !== "";
           const finalLimit = rerankEnabled ? Math.min(RERANK_TOP_K, maxResults) : maxResults;
-          const hybridModeLabel = rerankEnabled ? `${hybridMode}+rerank` : hybridMode;
+          const hybridModeLabel = `${hybridMode}${rerankLabel}`;
           filtered = filtered.slice(0, finalLimit);
 
           if (filtered.length > 0) {
@@ -1652,7 +1690,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "4.3.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "4.4.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
 });
 
 // Map to store transports and their servers by session ID
