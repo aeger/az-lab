@@ -1747,7 +1747,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v4.3.1 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v4.4.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();

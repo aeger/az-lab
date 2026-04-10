@@ -14,6 +14,11 @@ operational knowledge).
 Based on ElephantBroker 3-session promotion threshold and CraniMem
 scheduled consolidation replay pattern.
 
+LLM priority: NemoClaw (Nemotron 120B, on-prem) > claude-haiku-4-5 (Anthropic API) > heuristic
+- NemoClaw: preferred when NVIDIA_API_KEY set (on-prem, no token cost)
+- Haiku: fallback when ANTHROPIC_API_KEY set (low-cost cloud, ~$0.25/MTok input)
+- Heuristic: always available, no LLM needed
+
 Systemd timer: episodic-distill.timer (nightly at 03:00 UTC)
 """
 
@@ -32,6 +37,8 @@ MEMORY_MCP_URL = os.environ.get("MEMORY_MCP_URL", "http://localhost:3100")
 NEMOCLAW_URL  = os.environ.get("NEMOCLAW_URL", "http://192.168.1.183:8000")
 NEMOCLAW_KEY  = os.environ.get("NVIDIA_API_KEY", "")
 NEMOCLAW_MODEL = os.environ.get("NEMOCLAW_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+HAIKU_MODEL   = os.environ.get("HAIKU_MODEL", "claude-haiku-4-5")
 
 MIN_ACCESS_COUNT = int(os.environ.get("MIN_ACCESS_COUNT", "3"))
 PROJECT_MIN_ACCESS_COUNT = int(os.environ.get("PROJECT_MIN_ACCESS_COUNT", "2"))
@@ -171,6 +178,69 @@ def summarize_cluster_heuristic(memories: list) -> str:
     top = sorted_mems[:3]
     parts = [f"{m['name']}: {m['content'][:200]}" for m in top]
     return " | ".join(parts)
+
+def _call_claude_haiku(prompt: str, max_tokens: int = 256) -> str | None:
+    """Call claude-haiku-4-5 via Anthropic Messages API. Returns text or None on failure."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    try:
+        r = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": HAIKU_MODEL,
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        if r.status_code == 200:
+            return r.json()["content"][0]["text"].strip()
+        log.warning(f"Haiku API returned {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log.warning(f"Haiku API call failed: {e}")
+    return None
+
+def summarize_cluster_haiku(memories: list) -> str | None:
+    """Distill a cluster of episodic memories using claude-haiku-4-5 (cost-efficient fallback)."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    snippets = "\n".join([
+        f"- [{m['name']}]: {m['content'][:300]}"
+        for m in memories[:6]
+    ])
+    prompt = (
+        "You are a knowledge distillation system. The following episodic memories "
+        "were repeatedly accessed and are semantically related. Distill them into a "
+        "single, stable, declarative semantic fact (1-3 sentences). "
+        "Be concise, factual, and remove ephemeral details.\n\n"
+        f"Episodic memories:\n{snippets}\n\n"
+        "Distilled semantic fact:"
+    )
+    return _call_claude_haiku(prompt, max_tokens=256)
+
+def summarize_project_cluster_haiku(memories: list) -> str | None:
+    """Distill a cluster of project memories into a reference fact using claude-haiku-4-5."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    snippets = "\n".join([
+        f"- [{m['name']}]: {m['content'][:300]}"
+        for m in memories[:6]
+    ])
+    prompt = (
+        "You are a knowledge consolidation system. The following project memories "
+        "are related operational facts that were repeatedly referenced. "
+        "Distill them into a single permanent reference entry (2-4 sentences) "
+        "capturing the durable operational knowledge. Omit ephemeral dates, "
+        "in-progress status, and transient context.\n\n"
+        f"Project memories:\n{snippets}\n\n"
+        "Consolidated reference fact:"
+    )
+    return _call_claude_haiku(prompt, max_tokens=300)
 
 # ── Memory MCP write (via HTTP) ───────────────────────────────────────────────
 def write_semantic_memory(name: str, description: str, content: str, tags: list) -> str | None:
@@ -346,7 +416,7 @@ def write_reference_memory(name: str, description: str, content: str, tags: list
     return None
 
 
-def run_project_consolidation(use_llm: bool) -> tuple[int, int]:
+def run_project_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, int]:
     """Phase 2: consolidate stale project memories into reference memories."""
     memories = fetch_stale_project_memories()
     log.info(f"[Phase 2] Found {len(memories)} stale project memories eligible for consolidation")
@@ -372,7 +442,10 @@ def run_project_consolidation(use_llm: bool) -> tuple[int, int]:
         cluster_names = [m["name"] for m in cluster_mems]
         log.info(f"[Phase 2] Consolidating {len(cluster_mems)}: {cluster_names[:3]}...")
 
-        content = summarize_project_cluster(cluster_mems) if use_llm else None
+        # NemoClaw > Haiku > heuristic
+        content = summarize_project_cluster(cluster_mems) if use_nemoclaw else None
+        if not content and use_haiku:
+            content = summarize_project_cluster_haiku(cluster_mems)
         if not content:
             content = summarize_cluster_heuristic(cluster_mems)
 
@@ -412,7 +485,7 @@ def main():
     load_env()
 
     # Re-read env after loading .env
-    global SUPABASE_KEY, NEMOCLAW_KEY
+    global SUPABASE_KEY, NEMOCLAW_KEY, ANTHROPIC_API_KEY
     SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", SUPABASE_KEY)
     NEMOCLAW_KEY = os.environ.get("NVIDIA_API_KEY", "")
     if not NEMOCLAW_KEY:
@@ -422,6 +495,7 @@ def main():
                 NEMOCLAW_KEY = open(key_path).read().strip()
         except Exception:
             pass
+    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
 
     log.info("=== Episodic→Semantic distillation started ===")
     start = datetime.now(timezone.utc)
@@ -442,8 +516,15 @@ def main():
 
     log.info(f"Found {len(memories)} eligible episodic memories (access_count>={MIN_ACCESS_COUNT})")
 
-    use_llm = bool(NEMOCLAW_KEY)
-    llm_status = "NemoClaw" if use_llm else "heuristic"
+    use_nemoclaw = bool(NEMOCLAW_KEY)
+    use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
+    use_llm = use_nemoclaw or use_haiku
+    if use_nemoclaw:
+        llm_status = "NemoClaw"
+    elif use_haiku:
+        llm_status = f"claude-haiku-4-5"
+    else:
+        llm_status = "heuristic"
     log.info(f"Summarization mode: {llm_status}")
 
     if not memories:
@@ -471,10 +552,12 @@ def main():
         cluster_names = [m["name"] for m in cluster_mems]
         log.info(f"Distilling cluster of {len(cluster_mems)}: {cluster_names[:3]}...")
 
-        # 3. Summarize cluster
+        # 3. Summarize cluster — NemoClaw > Haiku > heuristic
         content = None
-        if use_llm:
+        if use_nemoclaw:
             content = summarize_cluster_llm(cluster_mems)
+        if not content and use_haiku:
+            content = summarize_cluster_haiku(cluster_mems)
         if not content:
             content = summarize_cluster_heuristic(cluster_mems)
 
@@ -519,7 +602,7 @@ def main():
 
     # ── Phase 2: Project memory consolidation ────────────────────────────────
     log.info("=== Phase 2: Project memory consolidation started ===")
-    p2_created, p2_processed = run_project_consolidation(use_llm)
+    p2_created, p2_processed = run_project_consolidation(use_nemoclaw, use_haiku)
     elapsed2 = (datetime.now(timezone.utc) - start).total_seconds() - elapsed1
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
