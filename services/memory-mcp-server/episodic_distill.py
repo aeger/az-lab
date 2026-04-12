@@ -500,10 +500,11 @@ def main():
     log.info("=== Episodic→Semantic distillation started ===")
     start = datetime.now(timezone.utc)
 
-    # 1. Fetch episodic memories eligible for consolidation
+    # 1. Fetch high-access memories eligible for consolidation
+    # Target project/feedback/reference — az-lab does not use 'episodic' type
     try:
         memories = supa_get("memories", {
-            "type": "eq.episodic",
+            "type": "in.(project,feedback,reference)",
             "access_count": f"gte.{MIN_ACCESS_COUNT}",
             "tags": f"not.cs.{{{CONSOLIDATED_TAG}}}",
             "select": "id,name,description,content,tags,access_count,embedding",
@@ -511,10 +512,10 @@ def main():
             "limit": "200",
         })
     except Exception as e:
-        log.error(f"Failed to fetch episodic memories: {e}")
+        log.error(f"Failed to fetch memories for consolidation: {e}")
         sys.exit(1)
 
-    log.info(f"Found {len(memories)} eligible episodic memories (access_count>={MIN_ACCESS_COUNT})")
+    log.info(f"Found {len(memories)} eligible memories for consolidation (access_count>={MIN_ACCESS_COUNT})")
 
     use_nemoclaw = bool(NEMOCLAW_KEY)
     use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
