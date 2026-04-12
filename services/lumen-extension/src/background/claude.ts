@@ -1,6 +1,6 @@
-// Claude API integration — Lumen's reasoning engine
+// Claude integration — routes through Agent Bus (no API key in browser)
 
-import { getConfig, AGENT_NAME, AGENT_DISPLAY_NAME, STORAGE_KEYS } from '../shared/config';
+import { getConfig, AGENT_DISPLAY_NAME, STORAGE_KEYS } from '../shared/config';
 import type { ChatMessage, PageContext } from '../shared/types';
 
 const SYSTEM_PROMPT = `You are ${AGENT_DISPLAY_NAME}, a browser-native agent in Jeff's az-lab agentic system.
@@ -39,7 +39,6 @@ export async function loadChatHistory(): Promise<ChatMessage[]> {
 }
 
 async function saveChatHistory(): Promise<void> {
-  // Keep last 50 messages
   if (chatHistory.length > 50) {
     chatHistory = chatHistory.slice(-50);
   }
@@ -51,14 +50,6 @@ export async function chat(
   pageContext?: PageContext
 ): Promise<ChatMessage> {
   const config = await getConfig();
-
-  if (!config.anthropicApiKey) {
-    return {
-      role: 'assistant',
-      content: 'I need an Anthropic API key to chat. Open my options page (right-click extension icon > Options) to configure it.',
-      timestamp: Date.now(),
-    };
-  }
 
   // Build user message with page context
   let fullMessage = userMessage;
@@ -92,33 +83,31 @@ export async function chat(
   }));
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    // Route through Agent Bus — no API key needed in the browser
+    const response = await fetch(`${config.agentBusUrl}/chat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': config.anthropicApiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true',
+        'X-Agent-Secret': 'azlab-agent-bus',
       },
       body: JSON.stringify({
-        model: config.anthropicModel,
-        max_tokens: 4096,
         system: systemPrompt,
         messages,
+        max_tokens: 4096,
       }),
     });
 
     if (!response.ok) {
       const err = await response.text();
-      throw new Error(`Anthropic API ${response.status}: ${err}`);
+      throw new Error(`Agent Bus /chat ${response.status}: ${err}`);
     }
 
     const data = await response.json();
-    const assistantContent = data.content?.[0]?.text ?? 'No response';
+    if (data.error) throw new Error(data.error);
 
     const assistantMsg: ChatMessage = {
       role: 'assistant',
-      content: assistantContent,
+      content: data.content,
       timestamp: Date.now(),
     };
     chatHistory.push(assistantMsg);

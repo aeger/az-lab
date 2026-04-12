@@ -54,16 +54,10 @@ function Options() {
         Lumen Settings
       </h1>
       <p style={{ color: '#71717a', marginBottom: '24px', fontSize: '13px' }}>
-        Configure endpoints and API keys for the az-lab agentic system.
+        Configure endpoints for the az-lab agentic system. LLM calls route through Agent Bus — no API key needed.
       </p>
 
       <h2 style={{ fontSize: '14px', color: '#a1a1aa', marginBottom: '12px', borderBottom: '1px solid #3f3f46', paddingBottom: '4px' }}>
-        Claude API
-      </h2>
-      {field('anthropicApiKey', 'Anthropic API Key', 'sk-ant-...', true)}
-      {field('anthropicModel', 'Model', DEFAULT_CONFIG.anthropicModel)}
-
-      <h2 style={{ fontSize: '14px', color: '#a1a1aa', marginBottom: '12px', borderBottom: '1px solid #3f3f46', paddingBottom: '4px', marginTop: '24px' }}>
         Endpoints
       </h2>
       {field('memoryMcpUrl', 'Memory MCP Server')}
