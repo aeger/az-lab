@@ -1,0 +1,14 @@
+[Unit]
+Description=Wren Watchdog (TypeScript)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/azlab/services/watchdog
+ExecStart=/usr/bin/node --import tsx/esm src/index.ts
+Restart=always
+RestartSec=30
+EnvironmentFile=-%h/.wren-watchdog/watchdog.env
+
+[Install]
+WantedBy=default.target
