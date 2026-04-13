@@ -33,6 +33,10 @@ services:
       - RERANK_TOP_K=${RERANK_TOP_K:-5}
       - HA_URL=${HA_URL}
       - HA_TOKEN=${HA_TOKEN}
+      # AIP: Agent Identity Protocol — shared HS256 secret for caller-identity JWTs
+      # Agents sign: {"sub":"wren","iss":"az-lab","iat":<unix>,"exp":<unix+3600>}
+      # If unset, AIP verification is disabled (backward-compatible)
+      - AIP_SECRET=${AIP_SECRET:-}
     depends_on:
       tei-reranker:
         condition: service_healthy

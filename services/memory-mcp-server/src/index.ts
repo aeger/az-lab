@@ -3,6 +3,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { createHmac } from "crypto";
 import WebSocket from "ws";
 import express, { Request, Response } from "express";
 import { z } from "zod";
@@ -22,6 +23,31 @@ const R2_BUCKET = process.env.R2_BUCKET || "az-lab-memory";
 
 const HA_URL = process.env.HA_URL || "";
 const HA_TOKEN = process.env.HA_TOKEN || "";
+
+// ── AIP: Agent Identity Protocol ────────────────────────────────────────────
+// Agents sign requests with HS256 JWTs. If AIP_SECRET is set, write ops will
+// stamp the verified caller identity as `source`/`updated_by` instead of
+// trusting the client-supplied value.
+const AIP_SECRET = process.env.AIP_SECRET || "";
+
+function verifyAipJwt(token: string): { sub: string } | null {
+  if (!AIP_SECRET) return null;
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const [headerB64, payloadB64, sigB64] = parts;
+    const expected = createHmac("sha256", AIP_SECRET)
+      .update(`${headerB64}.${payloadB64}`)
+      .digest("base64url");
+    if (expected !== sigB64) return null;
+    const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf-8"));
+    if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) return null;
+    if (!payload.sub || typeof payload.sub !== "string") return null;
+    return { sub: payload.sub };
+  } catch {
+    return null;
+  }
+}
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY");
@@ -569,10 +595,10 @@ async function applyStartupMigrations(): Promise<void> {
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
-function createMcpServer(): McpServer {
+function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "4.4.0",
+    version: "4.5.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -604,7 +630,8 @@ function createMcpServer(): McpServer {
         }
       }
 
-      const src = source || "claude-code";
+      // AIP: verified caller identity overrides client-supplied source
+      const src = callerIdentity || source || "claude-code";
       const memTags = tags || [];
 
       // Fetch existing same-name memory (with content for NOOP check)
@@ -932,6 +959,7 @@ function createMcpServer(): McpServer {
       const { error } = await supabase.from("memories").delete().eq("id", existing.id);
 
       if (error) return { content: [{ type: "text" as const, text: `Error deleting: ${error.message}` }] };
+      console.log(`[aip] forget "${name}" by ${callerIdentity || "unverified"}`);
       return { content: [{ type: "text" as const, text: `Deleted memory "${name}". Audit log preserved.` }] };
     }
   );
@@ -982,6 +1010,7 @@ function createMcpServer(): McpServer {
       }
 
       const boostNote = ltype === "temporal" || ltype === "causal" ? " (recall-boosted)" : "";
+      console.log(`[aip] add_memory_link "${srcMem.name}"→"${tgtMem.name}" by ${callerIdentity || "unverified"}`);
       return {
         content: [{ type: "text" as const, text: `Linked "${srcMem.name}" → "${tgtMem.name}" (${rel}, type:${ltype}${boostNote}, strength ${str.toFixed(2)})` }],
       };
@@ -1127,6 +1156,7 @@ function createMcpServer(): McpServer {
           return { content: [{ type: "text" as const, text: `File uploaded to R2 but DB insert failed: ${error.message}. Key: ${key}` }] };
         }
 
+        console.log(`[aip] remember_file "${filename}" (${body.length}B) by ${callerIdentity || "unverified"}`);
         return {
           content: [{ type: "text" as const, text: `Stored file "${filename}" (${(body.length / 1024).toFixed(1)} KB, ${mime})\nR2 key: ${key}${memory_name ? `\nLinked to memory: ${memory_name}` : ""}` }],
         };
@@ -1215,6 +1245,7 @@ function createMcpServer(): McpServer {
         const { error } = await supabase.from("memory_files").delete().eq("id", file.id);
         if (error) return { content: [{ type: "text" as const, text: `R2 file deleted but DB cleanup failed: ${error.message}` }] };
 
+        console.log(`[aip] forget_file "${filename}" by ${callerIdentity || "unverified"}`);
         return { content: [{ type: "text" as const, text: `Deleted file "${filename}" from storage and database.` }] };
       }
     );
@@ -1283,7 +1314,8 @@ function createMcpServer(): McpServer {
         if (threat) return { content: [{ type: "text" as const, text: `Blocked: ${field} matches threat pattern '${threat}'. Skill not saved.` }] };
       }
 
-      const src = source || "claude-code";
+      // AIP: verified caller identity overrides client-supplied source
+      const src = callerIdentity || source || "claude-code";
       const skillTriggers = triggers || [];
       const skillPlatforms = platforms || [];
       const embedding = await embed(embedInput(name, description, content));
@@ -1375,6 +1407,7 @@ function createMcpServer(): McpServer {
     async ({ name }) => {
       const { error } = await supabase.from("skills").delete().eq("name", name);
       if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      console.log(`[aip] delete_skill "${name}" by ${callerIdentity || "unverified"}`);
       return { content: [{ type: "text" as const, text: `Deleted skill "${name}".` }] };
     }
   );
@@ -1474,6 +1507,7 @@ function createMcpServer(): McpServer {
 
       const contentNote = merged_content ? " Content updated." : "";
       const tagNote = mergedTags.length > (primary.tags?.length || 0) ? ` Tags merged: [${mergedTags.join(", ")}].` : "";
+      console.log(`[aip] merge_memories "${secondary_name}"→"${primary_name}" by ${callerIdentity || "unverified"}`);
       return {
         content: [{ type: "text" as const, text: `Merged "${secondary_name}" into "${primary_name}".${contentNote}${tagNote} Secondary memory deleted, links redirected.` }],
       };
@@ -1563,7 +1597,8 @@ function createMcpServer(): McpServer {
             block_name,
             content,
             content_hash: contentHash,
-            updated_by: updated_by || "claude-code",
+            // AIP: verified caller identity overrides client-supplied updated_by
+            updated_by: callerIdentity || updated_by || "claude-code",
             updated_at: new Date().toISOString(),
           },
           { onConflict: "agent,block_name" }
@@ -1690,13 +1725,27 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "4.4.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "4.5.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
 const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
 
 app.post("/mcp", async (req: Request, res: Response) => {
+  // AIP: extract and verify caller-identity JWT from Authorization header
+  let callerIdentity: string | null = null;
+  const authHeader = req.headers.authorization || "";
+  if (authHeader.startsWith("Bearer ") && AIP_SECRET) {
+    const token = authHeader.slice(7);
+    const payload = verifyAipJwt(token);
+    if (payload) {
+      callerIdentity = payload.sub;
+      console.log(`[aip] verified caller: ${callerIdentity}`);
+    } else {
+      console.warn("[aip] invalid/expired JWT presented — caller unverified");
+    }
+  }
+
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
   if (sessionId && sessions.has(sessionId)) {
@@ -1705,9 +1754,9 @@ app.post("/mcp", async (req: Request, res: Response) => {
     return;
   }
 
-  // New session — new server instance
+  // New session — new server instance with verified caller identity bound
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
-  const server = createMcpServer();
+  const server = createMcpServer(callerIdentity);
 
   transport.onclose = () => {
     const sid = (transport as any).sessionId;
@@ -1747,7 +1796,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v4.4.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v4.5.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
