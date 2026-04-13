@@ -52,6 +52,7 @@ echo "--- Current migration status (via REST sentinels) ---"
 check_migration "007 BM25" "apply_bm25_migration_if_missing"
 check_migration "009 Trigram" "apply_trigram_fallback_if_missing"
 check_migration "011 agent_id+skills" "apply_agent_visibility_if_missing"
+check_migration "012 agent_scope" "apply_agent_scope_if_missing"
 echo ""
 
 if ! command -v psql &>/dev/null; then
@@ -81,7 +82,20 @@ else
 fi
 
 echo ""
+AGENT_SCOPE_EXISTS=$(curl -s "${SUPABASE_URL}/rest/v1/memories?select=agent_scope&limit=0" \
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \
+  -H "apikey: ${SUPABASE_KEY}" 2>/dev/null | grep -c "42703" || true)
+
+if [ "${AGENT_SCOPE_EXISTS}" -gt 0 ]; then
+  echo "Migration 012 (agent_scope array): PENDING"
+  apply_migration "${MIGRATIONS_DIR}/012_agent_scope.sql"
+else
+  echo "Migration 012 (agent_scope array): already applied"
+fi
+
+echo ""
 echo "--- Post-migration status ---"
 check_migration "011 agent_id+skills" "apply_agent_visibility_if_missing"
+check_migration "012 agent_scope" "apply_agent_scope_if_missing"
 echo ""
 echo "Done."
