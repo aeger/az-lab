@@ -1,41 +1,74 @@
 {
-  "schemaVersion": "1.0",
   "name": "iris",
   "displayName": "Iris",
   "description": "Claude Cowork agent (claude.ai). Research, planning, long-context analysis, and cross-agent coordination. Primary interface for Jeff's interactive sessions.",
   "url": "https://claude.ai",
   "version": "1.0.0",
+  "protocolVersion": "0.3",
+  "defaultInputModes": ["application/json", "text/plain"],
+  "defaultOutputModes": ["application/json", "text/plain"],
+  "supportsAuthenticatedExtendedCard": false,
   "model": "claude-opus-4-6",
   "runtime": "claude-cowork",
   "host": "claude.ai",
-  "capabilities": [
-    "long_context_analysis",
-    "research",
-    "planning",
-    "document_writing",
-    "architecture_review",
-    "task_delegation",
-    "memory_management",
-    "supabase_sql",
-    "mcp_tools"
+  "skills": [
+    {
+      "id": "research",
+      "name": "Research",
+      "description": "Deep research on any topic with web access and long-context reasoning",
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/plain"]
+    },
+    {
+      "id": "planning",
+      "name": "Planning",
+      "description": "Architectural planning, project scoping, and roadmap creation",
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/plain"]
+    },
+    {
+      "id": "architecture_review",
+      "name": "Architecture Review",
+      "description": "Review and critique system designs and architectural decisions",
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["text/plain"]
+    },
+    {
+      "id": "document_drafting",
+      "name": "Document Drafting",
+      "description": "Write technical documents, READMEs, and structured reports",
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/plain"]
+    },
+    {
+      "id": "task_routing",
+      "name": "Task Routing",
+      "description": "Analyze tasks and route them to the appropriate agent",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "memory_organization",
+      "name": "Memory Organization",
+      "description": "Organize, consolidate, and manage the shared memory system",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    }
   ],
   "accepted_tasks": [
-    "research",
-    "planning",
-    "architecture_review",
-    "document_drafting",
-    "strategy",
-    "task_routing",
-    "memory_organization",
-    "cross_agent_coordination"
+    "research", "planning", "architecture_review", "document_drafting",
+    "strategy", "task_routing", "memory_organization", "cross_agent_coordination"
   ],
   "contact": {
     "discord_channel": "general",
     "queue": "task_queue",
     "queue_target": "claude-ai"
   },
-  "authentication": {
-    "type": "none",
-    "note": "Interactive sessions only — no direct programmatic endpoint"
-  }
+  "securitySchemes": {
+    "none": {
+      "type": "none",
+      "description": "Interactive sessions only — no direct programmatic endpoint"
+    }
+  },
+  "security": []
 }

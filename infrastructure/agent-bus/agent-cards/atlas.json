@@ -1,37 +1,67 @@
 {
-  "schemaVersion": "1.0",
   "name": "atlas",
   "displayName": "Atlas",
-  "description": "Claude Desktop agent running on Windows workstation. Local desktop access, browser automation, Windows tool integration, and phone-to-desktop task dispatch via Dispatch.",
+  "description": "Claude Desktop agent on Windows workstation. Local desktop access, browser automation, Windows tool integration, and phone-to-desktop task dispatch.",
   "url": "local://atlas",
   "version": "1.0.0",
+  "protocolVersion": "0.3",
+  "defaultInputModes": ["application/json", "text/plain"],
+  "defaultOutputModes": ["application/json", "text/plain"],
+  "supportsAuthenticatedExtendedCard": false,
   "model": "claude-sonnet-4-6",
   "runtime": "claude-desktop",
   "host": "windows-workstation",
-  "capabilities": [
-    "local_file_access",
-    "browser_automation",
-    "windows_tools",
-    "mcp_tools",
-    "dispatch_bridge",
-    "ssh_to_svc_podman",
-    "supabase_sql"
+  "skills": [
+    {
+      "id": "local_file_management",
+      "name": "Local File Management",
+      "description": "Manage files on the Windows workstation desktop environment",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "browser_interaction",
+      "name": "Browser Interaction",
+      "description": "Web browsing and research via desktop browser",
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/plain"]
+    },
+    {
+      "id": "windows_automation",
+      "name": "Windows Automation",
+      "description": "Automate Windows desktop tasks and tool integrations",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "dispatch_phone_tasks",
+      "name": "Dispatch Phone Tasks",
+      "description": "Receive and execute tasks dispatched from Jeff's phone",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "infrastructure_via_ssh",
+      "name": "Infrastructure via SSH",
+      "description": "Reach svc-podman-01 and other lab hosts via SSH from Windows",
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["text/plain"]
+    }
   ],
   "accepted_tasks": [
-    "local_file_management",
-    "browser_interaction",
-    "windows_automation",
-    "dispatch_phone_tasks",
-    "infrastructure_via_ssh",
-    "research_with_browser"
+    "local_file_management", "browser_interaction", "windows_automation",
+    "dispatch_phone_tasks", "infrastructure_via_ssh", "research_with_browser"
   ],
   "contact": {
     "discord_channel": "general",
     "queue": "task_queue",
     "queue_target": "claude-desktop"
   },
-  "authentication": {
-    "type": "none",
-    "note": "Local desktop process — not network-accessible"
-  }
+  "securitySchemes": {
+    "none": {
+      "type": "none",
+      "description": "Local desktop process — not network-accessible"
+    }
+  },
+  "security": []
 }
