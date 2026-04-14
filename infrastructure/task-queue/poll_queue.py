@@ -7,6 +7,7 @@ then writes results back. Runs every 5 min via systemd timer.
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -27,32 +28,77 @@ def _load_supabase_key():
                     return line.split("=", 1)[1].strip()
     except Exception:
         pass
-    # Fall back to env var or hardcoded anon key
-    return os.environ.get(
-        "SUPABASE_KEY",
-        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ncWpqbGJ1cHFudmxjeXJmbnhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwNDU1NzYsImV4cCI6MjA4OTYyMTU3Nn0.VVvHOmcR04gnVHa6k8_lHhdCt6zNhpHYbj4c68LkScc",
-    )
+    # Fall back to env var (no hardcoded key)
+    return os.environ.get("SUPABASE_KEY")
 
 SUPABASE_KEY = _load_supabase_key()
 CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
 HOSTNAME = socket.gethostname()
 
-# Model tiering — route low-priority/short tasks to Haiku to save cost/latency
-MODEL_DEFAULT = "claude-sonnet-4-6"          # medium/high/crit
-MODEL_HAIKU   = "claude-haiku-4-5-20251001"  # low priority (3) or tagged "haiku"
+# Model tiering — route tasks to the right model based on priority and tags
+MODEL_DEFAULT = "claude-sonnet-4-6"          # medium/high (priority 1-2)
+MODEL_HAIKU   = "claude-haiku-4-5-20251001"  # low priority (3+) or tagged "haiku"/"quick"
+MODEL_OPUS    = "claude-opus-4-6"            # CRIT (priority 0), default heavy-reasoning path
+MODEL_GEMINI3 = "gemini-3-deep-think"        # CRIT with "gemini"/"deepthink" tag
+
+# Google Generative AI API (Gemini 3 Deep Think)
+GOOGLE_API_KEY_FILE = os.path.expanduser("~/.google_api_key")
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+
+def _get_google_key():
+    key = os.environ.get("GOOGLE_API_KEY")
+    if key:
+        return key
+    try:
+        with open(GOOGLE_API_KEY_FILE) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def route_task(task: dict) -> dict:
+    """Return {"model": str|None, "runner": "claude"|"gemini"} routing decision.
+
+    Priority tiers:
+      0 CRIT  → Opus (default) or Gemini3 Deep Think (if tagged gemini/deepthink)
+      1 HIGH  → Sonnet
+      2 MED   → Sonnet (default)
+      3+ LOW  → Haiku
+    Tags override: "opus", "gemini", "gemini3", "deepthink", "haiku", "quick"
+    """
+    priority = task.get("priority", 2)
+    tags = [t.lower() for t in (task.get("tags") or [])]
+
+    # Explicit tag overrides first
+    if "gemini" in tags or "gemini3" in tags or "deepthink" in tags or "deep-think" in tags:
+        return {"model": MODEL_GEMINI3, "runner": "gemini"}
+    if "opus" in tags:
+        return {"model": MODEL_OPUS, "runner": "claude"}
+    if "haiku" in tags or "quick" in tags:
+        return {"model": MODEL_HAIKU, "runner": "claude"}
+
+    # Priority-based routing
+    if priority == 0:  # CRIT — default to Opus; Gemini3 available via tag
+        return {"model": MODEL_OPUS, "runner": "claude"}
+    if priority >= 3:  # LOW
+        return {"model": MODEL_HAIKU, "runner": "claude"}
+
+    # HIGH (1) and MED (2) — Sonnet
+    return {"model": None, "runner": "claude"}  # None = claude binary default
+
 
 def select_model(task: dict) -> str | None:
-    """Return model ID to pass to --model, or None to use the default."""
-    priority = task.get("priority", 2)
-    tags = task.get("tags") or []
-    if priority >= 3 or "haiku" in tags or "quick" in tags:
-        return MODEL_HAIKU
-    return None  # let claude binary use its own default
+    """Legacy shim — returns claude model ID or None. Use route_task() for full routing."""
+    r = route_task(task)
+    if r["runner"] == "gemini":
+        return None  # gemini tasks handled separately
+    return r["model"]
 
 # Nemotron routing — NVIDIA NIM API for cheap task classification
 NVIDIA_NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_API_KEY_FILE = os.path.expanduser("~/.nvidia_api_key")
-NEMOTRON_MODEL = "nvidia/nemotron-super-49b-instruct"
+NEMOTRON_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 ROUTING_TARGETS = ["claude-code", "wren", "cowork", "desktop"]
 
@@ -210,12 +256,12 @@ def api_request(method, path, data=None, params=None):
 
 def claim_next_task():
     """Fetch the highest-priority pending or delegated task and claim it atomically."""
-    # Pick up both 'pending' and 'delegated' tasks targeting claude-code or wren
+    # Pick up 'ready'/'pending' (new/legacy) and 'delegated' tasks targeting claude-code or wren
     tasks = api_request(
         "GET",
         "task_queue",
         params={
-            "status": "in.(pending,delegated)",
+            "status": "in.(ready,pending,delegated)",
             "target": "in.(claude-code,wren)",
             "order": "priority.asc,created_at.asc",
             "limit": "1",
@@ -347,15 +393,50 @@ def mark_failed(task_id, error, goal_id=None):
 
 _CONTEXT_STRIP_KEYS = {"previous_output", "last_result", "full_transcript", "raw_output", "stdout"}
 _CONTEXT_MAX_CHARS = 3000
+_CONTEXT_COMPRESS_THRESHOLD = 6000   # compress when serialized context exceeds this
 _RESULT_MAX_CHARS = 2000
 _DESC_MAX_CHARS = 4000
+_DESC_COMPRESS_THRESHOLD = 8000      # compress descriptions above this before hard-capping
+
+
+def _compress_via_haiku(text: str, target_chars: int, label: str = "content") -> str:
+    """
+    Use Haiku to intelligently compress overlong text to ~target_chars.
+    Falls back to truncation on failure.
+
+    Context compression research (2026): Morph Compact achieves 50-70% token reduction
+    at 98% accuracy. CompLLM shows 2x-compressed context outperforms uncompressed.
+    Pattern: compress at 60-70% utilization; retain only essential facts and results.
+    """
+    prompt = (
+        f"Compress the following {label} to under {target_chars} characters. "
+        "Preserve all actionable instructions, key facts, error details, file paths, "
+        "and technical specifics. Remove redundancy, verbose prose, and filler. "
+        "Output ONLY the compressed text, nothing else:\n\n" + text
+    )
+    try:
+        result = subprocess.run(
+            [CLAUDE_CMD, "--print", "--dangerously-skip-permissions",
+             "--model", MODEL_HAIKU, "--output-format", "text"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        compressed = result.stdout.strip()
+        if compressed and len(compressed) < len(text):
+            return compressed
+    except Exception as e:
+        print(f"_compress_via_haiku failed (non-fatal): {e}", file=sys.stderr)
+    # Fallback: dumb truncation
+    return text[:target_chars] + "\n... [truncated]"
 
 
 def _sanitize_context(ctx: dict, attempt_count: int, prior_error: str | None) -> dict:
     """
     Context contamination hygiene (per 2026 research on context rot):
     - Strip known bulky/stale fields that cause context pollution
-    - Cap total serialized size
+    - Compress (not just truncate) when serialized size exceeds threshold
     - Inject fresh-start hint when retrying a previously failed task
     """
     cleaned = {k: v for k, v in ctx.items() if k not in _CONTEXT_STRIP_KEYS}
@@ -369,10 +450,24 @@ def _sanitize_context(ctx: dict, attempt_count: int, prior_error: str | None) ->
         if prior_error:
             cleaned["_prior_failure"] = prior_error[:300]
 
-    # Cap total size — drop values from least important keys if needed
     serialized = json.dumps(cleaned, indent=2)
+
+    # If oversized, try intelligent compression first
+    if len(serialized) > _CONTEXT_COMPRESS_THRESHOLD:
+        priority_keys = {"_retry_hint", "_prior_failure"}
+        compressible = {k: v for k, v in cleaned.items() if k not in priority_keys}
+        if compressible:
+            compressed_str = _compress_via_haiku(
+                json.dumps(compressible, indent=2),
+                target_chars=_CONTEXT_MAX_CHARS - 200,  # leave room for retry hints
+                label="task context JSON",
+            )
+            cleaned = {**{k: cleaned[k] for k in priority_keys if k in cleaned}}
+            cleaned["_context_compressed"] = compressed_str
+            serialized = json.dumps(cleaned, indent=2)
+
+    # Hard cap as last resort
     if len(serialized) > _CONTEXT_MAX_CHARS:
-        # Keep _retry hints, drop other keys until under limit
         priority_keys = {"_retry_hint", "_prior_failure"}
         overflow_keys = [k for k in cleaned if k not in priority_keys]
         while len(serialized) > _CONTEXT_MAX_CHARS and overflow_keys:
@@ -391,8 +486,10 @@ def build_prompt(task):
     raw_ctx = task.get("context") or {}
     context = _sanitize_context(raw_ctx, attempt_count, prior_error)
 
-    # Truncate description if unusually long
+    # Compress description if very long; truncate as last resort
     description = (task.get("description") or "")
+    if len(description) > _DESC_COMPRESS_THRESHOLD:
+        description = _compress_via_haiku(description, target_chars=_DESC_MAX_CHARS, label="task description")
     if len(description) > _DESC_MAX_CHARS:
         description = description[:_DESC_MAX_CHARS] + "\n... [description truncated for context hygiene]"
 
@@ -502,6 +599,54 @@ def run_claude(prompt, task_id=None, model=None):
     return final_text.strip()
 
 
+def run_gemini(prompt: str, model: str = MODEL_GEMINI3, task_id=None) -> str:
+    """Call Gemini API directly (REST). Returns text response.
+
+    Used for CRIT tasks tagged gemini/deepthink where Gemini 3 Deep Think
+    outperforms Opus on multi-step reasoning and complex planning tasks.
+    Falls back to run_claude(MODEL_OPUS) if API key is unavailable.
+    """
+    key = _get_google_key()
+    if not key:
+        print("No Google API key found (~/.google_api_key / GOOGLE_API_KEY) — falling back to Opus", file=sys.stderr)
+        return run_claude(prompt, task_id=task_id, model=MODEL_OPUS)
+
+    url = f"{GEMINI_API_BASE}/{model}:generateContent?key={key}"
+    body = json.dumps({
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 8192,
+        },
+    }).encode()
+
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    if task_id:
+        log_activity("thinking", f"Starting {model} inference", task_id=task_id)
+
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            data = json.loads(resp.read())
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise RuntimeError(f"Gemini API returned no candidates: {json.dumps(data)[:200]}")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+        if not text:
+            raise RuntimeError(f"Gemini API returned empty text: {json.dumps(data)[:200]}")
+        if task_id:
+            log_activity("result", f"← Gemini3 [{len(text)} chars]", task_id=task_id)
+        return text
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()[:300]
+        raise RuntimeError(f"Gemini API HTTP {e.code}: {err_body}")
+
+
 # ── autonomous work loop ─────────────────────────────────────────────────────
 
 # Phoenix AZ is UTC-7 (no DST). Morning review window: 7:00–8:00 local = 14:00–15:00 UTC.
@@ -523,7 +668,7 @@ def _has_recent_pending_task(goal_id: str) -> bool:
             "task_queue",
             params={
                 "goal_id": f"eq.{goal_id}",
-                "status": "in.(pending,claimed,failed,pending_eval)",
+                "status": "in.(ready,pending,claimed,failed,pending_eval,in_progress_agent,pending_jeff_action)",
                 "select": "id",
                 "limit": "1",
             },
@@ -700,6 +845,67 @@ def write_heartbeat(status="active", metadata=None):
         pass
 
 
+# ── JeffLoop: auto-detect tasks needing Jeff input ────────────────────────────
+
+_JEFF_INPUT_KEYWORDS = [
+    "@jeff",
+    "need your input", "need your decision", "need your approval", "need your confirmation",
+    "need jeff", "needs jeff",
+    "your choice", "your call", "your decision", "your approval",
+    "please advise", "please confirm", "please approve", "please choose", "please decide",
+    "waiting for you", "waiting for jeff", "up to you", "your preference",
+    "decision point", "requires your", "require your",
+]
+
+_JEFF_QUESTION_RE = re.compile(
+    r"\b("
+    r"should (i|we|claude)\b|"
+    r"do you (want|prefer|need|approve)\b|"
+    r"would you (like|prefer|want)\b|"
+    r"which (one|option|approach|method|path|direction)\b|"
+    r"can you (confirm|approve|choose|decide)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _needs_jeff_input(text: str) -> tuple[bool, str]:
+    """Scan task result for signals that Jeff input is needed.
+    Returns (True, reason_snippet) or (False, '').
+    """
+    if not text:
+        return False, ""
+    lower = text.lower()
+    for kw in _JEFF_INPUT_KEYWORDS:
+        if kw in lower:
+            idx = lower.index(kw)
+            snippet = text[max(0, idx - 20): idx + len(kw) + 60].strip()
+            return True, snippet
+    m = _JEFF_QUESTION_RE.search(text)
+    if m:
+        snippet = text[max(0, m.start() - 20): m.end() + 60].strip()
+        return True, snippet
+    return False, ""
+
+
+def mark_pending_jeff_action(task_id: str, result: str, reason: str, title: str = "", goal_id: str | None = None) -> None:
+    """Transition task to pending_jeff_action and notify Jeff via Discord."""
+    stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
+    api_request(
+        "PATCH",
+        f"task_queue?id=eq.{task_id}",
+        data={"status": "pending_jeff_action", "result": stored_result},
+    )
+    log_activity("status", f"Pending Jeff action: {reason[:100]}", task_id=task_id)
+    display = title or task_id
+    discord_notify(
+        f"🙋 **Jeff input needed:** {display}\n"
+        f"**Signal:** `{reason[:120]}`\n"
+        f"Set task status back to `ready` once you've provided direction."
+    )
+    print(f"Task {task_id} transitioned to pending_jeff_action.")
+
+
 def main():
     print(f"[{datetime.now().isoformat()}] Polling task queue on {HOSTNAME}...")
 
@@ -727,14 +933,25 @@ def main():
     discord_notify(f"🟡 Claimed: {title} — starting now")
 
     try:
-        model = select_model(task)
+        routing = route_task(task)
+        runner = routing["runner"]
+        model = routing["model"]
         prompt = build_prompt(task)
-        model_label = model or "default"
-        print(f"Running claude ({model_label}) for task: {title}")
-        log_activity("thinking", f"Starting: {title} [model: {model_label}]", task_id=task_id)
-        result = run_claude(prompt, task_id=task_id, model=model)
+        model_label = model or "sonnet (default)"
+        print(f"Running {runner} ({model_label}) for task: {title}")
+        log_activity("thinking", f"Starting: {title} [runner: {runner}, model: {model_label}]", task_id=task_id)
+        if runner == "gemini":
+            result = run_gemini(prompt, model=model, task_id=task_id)
+        else:
+            result = run_claude(prompt, task_id=task_id, model=model)
         summary = result.splitlines()[0][:120] if result else "done"
         goal_id = task.get("goal_id")
+
+        # JeffLoop: auto-detect if result signals Jeff input is needed
+        jeff_needed, jeff_reason = _needs_jeff_input(result)
+        if jeff_needed:
+            mark_pending_jeff_action(task_id, result, jeff_reason, title=title, goal_id=goal_id)
+            return
 
         # CRIT (0) and HIGH (1) tasks go to Iris for evaluation before completion
         task_priority = task.get("priority", 2)
