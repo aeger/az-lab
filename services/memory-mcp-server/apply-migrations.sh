@@ -53,6 +53,7 @@ check_migration "007 BM25" "apply_bm25_migration_if_missing"
 check_migration "009 Trigram" "apply_trigram_fallback_if_missing"
 check_migration "011 agent_id+skills" "apply_agent_visibility_if_missing"
 check_migration "012 agent_scope" "apply_agent_scope_if_missing"
+check_migration "014 hybrid_search+consolidation" "apply_consolidation_migration_if_missing"
 echo ""
 
 if ! command -v psql &>/dev/null; then
@@ -94,8 +95,21 @@ else
 fi
 
 echo ""
+CONSOLIDATION_EXISTS=$(curl -s "${SUPABASE_URL}/rest/v1/rpc/apply_consolidation_migration_if_missing" \
+  -X POST -H "Authorization: Bearer ${SUPABASE_KEY}" -H "apikey: ${SUPABASE_KEY}" \
+  -H "Content-Type: application/json" -d '{}' 2>/dev/null | grep -c "PGRST202" || true)
+
+if [ "${CONSOLIDATION_EXISTS}" -gt 0 ]; then
+  echo "Migration 014 (hybrid_search_memories + consolidation): PENDING"
+  apply_migration "${MIGRATIONS_DIR}/014_hybrid_search_and_consolidation.sql"
+else
+  echo "Migration 014 (hybrid_search_memories + consolidation): already applied"
+fi
+
+echo ""
 echo "--- Post-migration status ---"
 check_migration "011 agent_id+skills" "apply_agent_visibility_if_missing"
 check_migration "012 agent_scope" "apply_agent_scope_if_missing"
+check_migration "014 hybrid_search+consolidation" "apply_consolidation_migration_if_missing"
 echo ""
 echo "Done."

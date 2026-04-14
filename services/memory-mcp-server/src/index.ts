@@ -609,13 +609,50 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 012 skipped:", err.message);
   }
+
+  // Migration 013: A-MAC 5-dimension memory decay scoring (ICLR 2026)
+  // Replaces single-scalar ACT-R decay with composite: α*recency + β*access_freq + γ*novelty + δ*importance + ε*utility
+  try {
+    const { data, error } = await supabase.rpc("apply_amac_scoring_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 013 RPC not yet registered — apply migrations/013_amac_scoring.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 013 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 013 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 013 skipped:", err.message);
+  }
+
+  // Migration 014: hybrid_search_memories() + consolidate_similar_memories() + pg_cron job
+  // hybrid_search_memories: pgvector cosine + tsvector BM25 (search_vec weighted + search_vector plain) via RRF
+  // consolidate_similar_memories: merges memory pairs with cosine similarity > 0.90, weekly pg_cron job
+  try {
+    const { data, error } = await supabase.rpc("apply_consolidation_migration_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 014 RPC not yet registered — apply migrations/014_hybrid_search_and_consolidation.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 014 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 014 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 014 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "4.6.0",
+    version: "4.7.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -1818,7 +1855,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v4.5.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v4.7.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
