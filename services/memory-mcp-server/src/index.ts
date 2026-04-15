@@ -646,13 +646,33 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 014 skipped:", err.message);
   }
+
+  // Migration 017: Dual-BM25 hybrid_recall — adds search_vector plain lane to RRF fusion
+  // hybrid_recall now uses 4 retrieval lanes: pgvector cosine + BM25 weighted (search_vec) +
+  // BM25 plain (search_vector GENERATED ALWAYS) + trigram fallback (code identifiers).
+  // RRF weights: vec=1.0, bm25_weighted=1.2, bm25_plain=0.8, trgm=0.5. A-MAC scoring preserved.
+  try {
+    const { data, error } = await supabase.rpc("apply_dual_bm25_hybrid_recall_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 017 RPC not yet registered — apply migrations/017_dual_bm25_hybrid_recall.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 017 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 017 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 017 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "4.7.0",
+    version: "4.8.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
