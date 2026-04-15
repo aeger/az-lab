@@ -54,6 +54,7 @@ check_migration "009 Trigram" "apply_trigram_fallback_if_missing"
 check_migration "011 agent_id+skills" "apply_agent_visibility_if_missing"
 check_migration "012 agent_scope" "apply_agent_scope_if_missing"
 check_migration "014 hybrid_search+consolidation" "apply_consolidation_migration_if_missing"
+check_migration "015 task_queue_dependencies" "apply_task_dependency_migration_if_missing"
 echo ""
 
 if ! command -v psql &>/dev/null; then
@@ -107,9 +108,22 @@ else
 fi
 
 echo ""
+TASK_DEP_EXISTS=$(curl -s "${SUPABASE_URL}/rest/v1/task_queue?select=blocked_by_task_ids&limit=0" \
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \
+  -H "apikey: ${SUPABASE_KEY}" 2>/dev/null | grep -c "42703" || true)
+
+if [ "${TASK_DEP_EXISTS}" -gt 0 ]; then
+  echo "Migration 015 (task_queue dependency tracking): PENDING"
+  apply_migration "${MIGRATIONS_DIR}/015_task_queue_dependencies.sql"
+else
+  echo "Migration 015 (task_queue dependency tracking): already applied"
+fi
+
+echo ""
 echo "--- Post-migration status ---"
 check_migration "011 agent_id+skills" "apply_agent_visibility_if_missing"
 check_migration "012 agent_scope" "apply_agent_scope_if_missing"
 check_migration "014 hybrid_search+consolidation" "apply_consolidation_migration_if_missing"
+check_migration "015 task_queue_dependencies" "apply_task_dependency_migration_if_missing"
 echo ""
 echo "Done."
