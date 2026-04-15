@@ -9,6 +9,12 @@ export type ContentMessage =
 
 // Background ← Popup/Sidepanel
 export type UIMessage =
+  | { type: 'NOTIF_LIST'; payload?: { status?: string; limit?: number } }
+  | { type: 'NOTIF_READ'; payload: { id: string } }
+  | { type: 'NOTIF_READ_ALL' }
+  | { type: 'NOTIF_SOUND_TEST'; payload: { urgency: string } }
+  | { type: 'GET_SOUND_PREFS' }
+  | { type: 'SET_SOUND_PREFS'; payload: Record<string, unknown> }
   | { type: 'CHAT_SEND'; payload: { message: string; includePageContext: boolean } }
   | { type: 'MEMORY_SEARCH'; payload: { query: string; type?: string } }
   | { type: 'MEMORY_STORE'; payload: { name: string; type: string; description: string; content: string; tags: string[] } }
@@ -21,6 +27,8 @@ export type UIMessage =
 
 // Background → UI (responses)
 export type BackgroundResponse =
+  | { type: 'NOTIF_RESULTS'; payload: { notifications: unknown[]; unreadCount: number; criticalCount: number } }
+  | { type: 'SOUND_PREFS'; payload: Record<string, unknown> }
   | { type: 'CHAT_RESPONSE'; payload: ChatMessage }
   | { type: 'MEMORY_RESULTS'; payload: Memory[] }
   | { type: 'MEMORY_STORED'; payload: { success: boolean; error?: string } }

@@ -1,0 +1,23 @@
+services:
+  sentinel-api:
+    image: localhost/sentinel-api:latest
+    container_name: sentinel-api
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Mount Podman socket for container health monitoring
+      - /run/user/1000/podman/podman.sock:/run/podman/podman.sock:ro
+    networks:
+      - proxy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.sentinel-api.rule=Host(`sentinel-api.az-lab.dev`)
+      - traefik.http.routers.sentinel-api.entrypoints=websecure
+      - traefik.http.routers.sentinel-api.tls=true
+      - traefik.http.routers.sentinel-api.tls.certresolver=le
+      - traefik.http.routers.sentinel-api.middlewares=lan-allow@file
+      - traefik.http.services.sentinel-api.loadbalancer.server.port=3200
+
+networks:
+  proxy:
+    external: true

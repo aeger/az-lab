@@ -54,6 +54,37 @@ export interface ChatMessage {
   pageContext?: PageContext;
 }
 
+export type Urgency = 'critical' | 'high' | 'medium' | 'low';
+
+export interface SentinelNotification {
+  id: string;
+  source: string;
+  category: string;
+  urgency: Urgency;
+  severity: string;
+  status: 'unread' | 'read' | 'dismissed';
+  title: string;
+  body: string;
+  timestamp: string;
+  receivedAt: string;
+  readAt?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SoundPrefs {
+  critical: { soundId: string; volume: number; enabled: boolean };
+  high: { soundId: string; volume: number; enabled: boolean };
+  medium: { soundId: string; volume: number; enabled: boolean };
+  low: { soundId: string; volume: number; enabled: boolean };
+}
+
+export const DEFAULT_SOUND_PREFS: SoundPrefs = {
+  critical: { soundId: 'bass_alarm', volume: 0.9, enabled: true },
+  high: { soundId: 'sharp_chime', volume: 0.7, enabled: true },
+  medium: { soundId: 'soft_tone', volume: 0.5, enabled: true },
+  low: { soundId: 'gentle_pop', volume: 0.3, enabled: false },
+};
+
 export interface AgentStatus {
   memoryMcp: 'connected' | 'disconnected' | 'error';
   supabase: 'connected' | 'disconnected' | 'error';

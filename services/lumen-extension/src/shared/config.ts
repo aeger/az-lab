@@ -11,6 +11,8 @@ export const DEFAULT_CONFIG = {
   supabaseUrl: 'https://ogqjjlbupqnvlcyrfnxi.supabase.co',
   supabaseAnonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ncWpqbGJ1cHFudmxjeXJmbnhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwNDU1NzYsImV4cCI6MjA4OTYyMTU3Nn0.VVvHOmcR04gnVHa6k8_lHhdCt6zNhpHYbj4c68LkScc',
   agentBusUrl: 'http://192.168.1.181:8765',
+  sentinelApiUrl: 'https://sentinel-api.az-lab.dev',
+  sentinelApiKey: 'sentinel-c81bbb17bb17df0f46787983da69bcb40c7779a9e1292376',
   anthropicModel: 'claude-sonnet-4-6',
 } as const;
 
@@ -22,6 +24,9 @@ export const STORAGE_KEYS = {
   feedbackMemories: 'lumen_feedback_memories',
   sessionContext: 'lumen_session_context',
   lastStartup: 'lumen_last_startup',
+  lastNotifId: 'lumen_last_notif_id',        // dedup: last seen notification receivedAt
+  soundPrefs: 'lumen_sound_prefs',           // per-urgency sound preferences
+  notifHistory: 'lumen_notif_history',       // local notification cache
 } as const;
 
 // Alarm names (chrome.alarms for periodic tasks)
@@ -29,6 +34,7 @@ export const ALARMS = {
   heartbeat: 'lumen-heartbeat',
   taskPoll: 'lumen-task-poll',
   memorySync: 'lumen-memory-sync',
+  notifPoll: 'lumen-notif-poll',
 } as const;
 
 export type LumenConfig = {
@@ -37,6 +43,8 @@ export type LumenConfig = {
   supabaseUrl: string;
   supabaseAnonKey: string;
   agentBusUrl: string;
+  sentinelApiUrl: string;
+  sentinelApiKey: string;
   anthropicModel: string;
   anthropicApiKey?: string;
 };
