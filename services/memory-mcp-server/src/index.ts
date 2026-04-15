@@ -3,6 +3,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { createHmac } from "crypto";
+import WebSocket from "ws";
 import express, { Request, Response } from "express";
 import { z } from "zod";
 
@@ -10,6 +12,7 @@ import { z } from "zod";
 const PORT = parseInt(process.env.PORT || "3100", 10);
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || SUPABASE_KEY;
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://ollama:11434";
 const EMBED_MODEL = process.env.EMBED_MODEL || "nomic-embed-text";
 
@@ -20,6 +23,31 @@ const R2_BUCKET = process.env.R2_BUCKET || "az-lab-memory";
 
 const HA_URL = process.env.HA_URL || "";
 const HA_TOKEN = process.env.HA_TOKEN || "";
+
+// ── AIP: Agent Identity Protocol ────────────────────────────────────────────
+// Agents sign requests with HS256 JWTs. If AIP_SECRET is set, write ops will
+// stamp the verified caller identity as `source`/`updated_by` instead of
+// trusting the client-supplied value.
+const AIP_SECRET = process.env.AIP_SECRET || "";
+
+function verifyAipJwt(token: string): { sub: string } | null {
+  if (!AIP_SECRET) return null;
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const [headerB64, payloadB64, sigB64] = parts;
+    const expected = createHmac("sha256", AIP_SECRET)
+      .update(`${headerB64}.${payloadB64}`)
+      .digest("base64url");
+    if (expected !== sigB64) return null;
+    const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf-8"));
+    if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) return null;
+    if (!payload.sub || typeof payload.sub !== "string") return null;
+    return { sub: payload.sub };
+  } catch {
+    return null;
+  }
+}
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY");
@@ -101,12 +129,20 @@ async function detectConflicts(
   const conflictNames: string[] = [];
   for (const candidate of candidates) {
     if (mightContradict(newContent, candidate.content)) {
-      // Record conflict in DB
+      // Record contradiction conflict
       await supabase.from("memory_conflicts").upsert({
         memory_a_id: newMemoryId,
         memory_b_id: candidate.id,
         conflict_type: "contradiction",
         description: `New memory may contradict "${candidate.name}"`,
+        resolved: false,
+      }, { onConflict: "memory_a_id,memory_b_id" });
+      // Also record stale conflict against the older memory (new supersedes old)
+      await supabase.from("memory_conflicts").upsert({
+        memory_a_id: candidate.id,
+        memory_b_id: newMemoryId,
+        conflict_type: "stale",
+        description: `May be superseded by newer memory "${newContent.slice(0, 80)}..."`,
         resolved: false,
       }, { onConflict: "memory_a_id,memory_b_id" });
       // Flag both memories
@@ -116,6 +152,175 @@ async function detectConflicts(
   }
 
   return conflictNames.length > 0 ? conflictNames.join(", ") : null;
+}
+
+// ── Mem0 Conflict Resolution ──────────────────────────────────────────────────
+// Based on arXiv 2504.19413 — classify every write as ADD/UPDATE/DELETE/NOOP
+// to prevent stale/duplicate memory accumulation.
+// Heuristic mode (default): fast, no LLM required.
+// LLM mode: set LLM_URL to any OpenAI-compatible endpoint (e.g. NemoClaw NIM API).
+
+const LLM_URL = process.env.LLM_URL || "";
+const LLM_MODEL = process.env.LLM_MODEL || "llama3.2:3b";
+
+// TEI cross-encoder reranking (primary) — set RERANKER_URL to enable (e.g. http://tei-reranker:8080)
+const RERANKER_URL = process.env.RERANKER_URL || "";
+// Nemotron reranking (fallback) — set NVIDIA_API_KEY to enable
+const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "";
+const RERANK_URL = process.env.RERANK_URL || "http://192.168.1.183:8000";
+const RERANK_MODEL = process.env.RERANK_MODEL || "nvidia/nemotron-3-super-120b-a12b";
+const RERANK_TOP_K = parseInt(process.env.RERANK_TOP_K || "5", 10);
+
+type Mem0Action = "ADD" | "UPDATE" | "DELETE" | "NOOP";
+
+interface Mem0Decision {
+  action: Mem0Action;
+  target_id?: string;
+  target_name?: string;
+  rationale: string;
+}
+
+// Jaccard similarity on word tokens (fast, no embedding required)
+function textSimilarity(a: string, b: string): number {
+  const words = (t: string) => new Set(t.toLowerCase().match(/\b\w{3,}\b/g) || []);
+  const A = words(a);
+  const B = words(b);
+  const intersection = [...A].filter((w) => B.has(w)).length;
+  const union = new Set([...A, ...B]).size;
+  return union === 0 ? 1 : intersection / union;
+}
+
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+// Heuristic Mem0 classification (no LLM needed)
+function heuristicMem0(
+  newName: string,
+  newContent: string,
+  candidates: Array<{ id: string; name: string; content: string; similarity: number }>
+): Mem0Decision[] {
+  const decisions: Mem0Decision[] = [];
+
+  for (const c of candidates) {
+    const sim = c.similarity;
+
+    // Near-identical content → NOOP (highest priority, return immediately)
+    if (sim >= 0.95 && textSimilarity(newContent, c.content) >= 0.80) {
+      return [{ action: "NOOP", target_id: c.id, target_name: c.name,
+        rationale: `Already captured in "${c.name}" (${(sim * 100).toFixed(0)}% similar)` }];
+    }
+
+    const nameSimilar = levenshtein(c.name.toLowerCase(), newName.toLowerCase()) <= 3;
+    const contradicts = mightContradict(newContent, c.content);
+
+    if (contradicts && sim >= 0.72) {
+      // Contradicted/stale → DELETE the old one; new content will be ADDed after
+      decisions.push({ action: "DELETE", target_id: c.id, target_name: c.name,
+        rationale: `Contradicts stale memory "${c.name}" (sim=${(sim * 100).toFixed(0)}%)` });
+    } else if (sim >= 0.88 && nameSimilar && !contradicts) {
+      // High similarity + similar name → UPDATE in place (prevents cross-name duplicates)
+      decisions.push({ action: "UPDATE", target_id: c.id, target_name: c.name,
+        rationale: `Updates existing memory "${c.name}" (sim=${(sim * 100).toFixed(0)}%)` });
+    }
+  }
+
+  if (decisions.length === 0) {
+    decisions.push({ action: "ADD", rationale: "No conflicts with existing memories" });
+  }
+  return decisions;
+}
+
+// LLM-based Mem0 classification (falls back to heuristic on any failure)
+async function llmMem0(
+  newName: string,
+  newContent: string,
+  candidates: Array<{ id: string; name: string; content: string; similarity: number }>
+): Promise<Mem0Decision[]> {
+  const prompt = `You are a memory deduplication system. Given a new fact and existing similar memories, classify the required operation.
+
+New memory:
+Name: ${newName}
+Content: ${newContent.slice(0, 800)}
+
+Existing similar memories:
+${candidates.slice(0, 5).map((c, i) =>
+  `[${i + 1}] id=${c.id}\nname=${c.name}\ncontent=${c.content.slice(0, 400)}`
+).join("\n\n---\n")}
+
+Classify the operation required:
+- NOOP: New memory is fully captured by an existing one. No write needed.
+- UPDATE: New memory updates/corrects an existing one. Merge content into it.
+- DELETE: An existing memory is contradicted/stale. Remove it (new fact added separately).
+- ADD: Genuinely new fact with no significant overlap.
+
+Rules: NOOP only if content is essentially identical. Multiple DELETE decisions allowed. Prefer UPDATE over ADD when clearly the same topic. Respond with a JSON array only, no explanation outside JSON.
+
+Example: [{"action":"DELETE","target_id":"abc-123","target_name":"old fact","rationale":"contradicted by new IP"}]`;
+
+  try {
+    const res = await fetch(`${LLM_URL}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: LLM_MODEL,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0,
+        max_tokens: 600,
+      }),
+      signal: AbortSignal.timeout(25000),
+    });
+    if (!res.ok) throw new Error(`LLM HTTP ${res.status}`);
+    const json = (await res.json()) as any;
+    let raw = json.choices?.[0]?.message?.content?.trim() || "[]";
+    raw = raw.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+    let parsed: Mem0Decision[] = JSON.parse(raw);
+    if (!Array.isArray(parsed)) parsed = [parsed];
+    const valid = parsed.filter((d) => ["ADD", "UPDATE", "DELETE", "NOOP"].includes(d.action));
+    return valid.length > 0 ? valid : [{ action: "ADD", rationale: "LLM returned no valid decisions" }];
+  } catch (err: any) {
+    console.warn("[mem0] LLM classify failed:", err.message, "— heuristic fallback");
+    return heuristicMem0(newName, newContent, candidates);
+  }
+}
+
+// Entry point: fetch candidates then classify
+async function mem0Resolve(
+  name: string,
+  content: string,
+  type: string,
+  embedding: number[],
+  excludeId?: string
+): Promise<Mem0Decision[]> {
+  const { data: raw } = await supabase.rpc("match_memories", {
+    query_embedding: JSON.stringify(embedding),
+    match_threshold: 0.72,
+    match_count: 10,
+  });
+
+  if (!raw?.length) return [{ action: "ADD", rationale: "No similar memories found" }];
+
+  const candidates = (raw as any[])
+    .filter((m) => m.id !== excludeId && m.type === type)
+    .map((m) => ({ id: m.id, name: m.name, content: m.content, similarity: m.similarity as number }))
+    .slice(0, 8);
+
+  if (!candidates.length) return [{ action: "ADD", rationale: "No same-type candidates" }];
+
+  return LLM_URL
+    ? llmMem0(name, content, candidates)
+    : heuristicMem0(name, content, candidates);
 }
 
 // ── Embeddings ───────────────────────────────────────────────────────────────
@@ -139,6 +344,91 @@ function embedInput(name: string, description: string, content: string): string 
   return `${name}: ${description}\n\n${content}`.slice(0, 4000);
 }
 
+// ── TEI Cross-Encoder Reranking (primary) ─────────────────────────────────────
+// Calls bge-reranker-v2-m3 via HuggingFace TEI /rerank endpoint.
+// Returns reranked array on success, null on failure (triggers Nemotron fallback).
+// ~80ms latency, CPU-only, local — no external API required.
+async function rerankWithTEI(query: string, memories: any[]): Promise<any[] | null> {
+  if (!RERANKER_URL || memories.length <= 1) return null;
+  const texts = memories.map((m) =>
+    `${m.name} (${m.type}): ${m.description}\n${(m.content || "").slice(0, 400)}`
+  );
+  try {
+    const res = await fetch(`${RERANKER_URL}/rerank`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, texts, truncate: true }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const results = (await res.json()) as Array<{ index: number; score: number }>;
+    const sorted = results.sort((a, b) => b.score - a.score);
+    const reranked = sorted.map((r) => memories[r.index]);
+    console.log(`[rerank] TEI bge-reranker-v2-m3 reranked ${memories.length} memories`);
+    return reranked;
+  } catch (err: any) {
+    console.warn("[rerank] TEI unavailable:", err.message, "— falling back to Nemotron");
+    return null;
+  }
+}
+
+// ── Nemotron Reranking (fallback) ─────────────────────────────────────────────
+// Retrieves top-20 from hybrid recall, then asks Nemotron 120B to reorder by
+// relevance, returning top RERANK_TOP_K. Falls back to original order on failure.
+async function rerankMemories(query: string, memories: any[]): Promise<any[]> {
+  if (!NVIDIA_API_KEY || memories.length <= 1) return memories;
+
+  const snippets = memories.map((m, i) =>
+    `[${i}] ${m.name} (${m.type}): ${m.description}\n${(m.content || "").slice(0, 250)}`
+  ).join("\n\n");
+
+  const prompt = `You are a memory relevance ranker. Given the search query and candidate memories, return a JSON array of candidate indices ordered from most to least relevant to the query. Include all indices.
+
+Query: "${query}"
+
+Candidates:
+${snippets}
+
+Respond with only a JSON array of indices, e.g.: [2, 0, 4, 1, 3]`;
+
+  try {
+    const res = await fetch(`${RERANK_URL}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${NVIDIA_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: RERANK_MODEL,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0,
+        max_tokens: 120,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) throw new Error(`Rerank HTTP ${res.status}`);
+    const json = await res.json() as any;
+    let raw = (json.choices?.[0]?.message?.content || "").trim();
+    raw = raw.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+    const indices: number[] = JSON.parse(raw);
+    if (!Array.isArray(indices)) throw new Error("Non-array response");
+    const seen = new Set<number>();
+    const reranked: any[] = [];
+    for (const i of indices) {
+      if (typeof i === "number" && i >= 0 && i < memories.length && !seen.has(i)) {
+        reranked.push(memories[i]);
+        seen.add(i);
+      }
+    }
+    // Append any memories not mentioned by Nemotron
+    for (let i = 0; i < memories.length; i++) {
+      if (!seen.has(i)) reranked.push(memories[i]);
+    }
+    console.log(`[rerank] Nemotron reranked ${memories.length} memories`);
+    return reranked;
+  } catch (err: any) {
+    console.warn("[rerank] Nemotron rerank failed:", err.message, "— original order preserved");
+    return memories;
+  }
+}
+
 // R2 client (optional — file tools disabled if not configured)
 const r2Enabled = !!(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY);
 const r2 = r2Enabled
@@ -159,11 +449,210 @@ const SOURCE_TRUST: Record<string, string> = {
   "manual": "verified",
 };
 
+// ── Startup Migration ────────────────────────────────────────────────────────
+// Attempts to add link_type column to memory_links via the pre-registered
+// add_link_type_if_missing() SECURITY DEFINER function.
+// If the function doesn't exist yet, this is a no-op — apply migrations/001_add_link_type.sql
+// via the Supabase SQL editor to bootstrap.
+async function applyStartupMigrations(): Promise<void> {
+  // Migration 001: link_type column on memory_links
+  try {
+    const { data, error } = await supabase.rpc("add_link_type_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 001 RPC not yet registered — apply migrations/001_add_link_type.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 001 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 001 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 001 skipped:", err.message);
+  }
+
+  // Migration 003: adaptive decay columns (last_accessed_at, importance_score)
+  try {
+    const { data, error } = await supabase.rpc("apply_adaptive_decay_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 003 RPC not yet registered — apply migrations/003_adaptive_decay.sql in Supabase SQL editor to enable adaptive decay.");
+      } else {
+        console.warn("Migration 003 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 003 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 003 skipped:", err.message);
+  }
+
+  // Migration 004: PageRank scoring over Zettelkasten memory link graph
+  try {
+    const { data, error } = await supabase.rpc("apply_pagerank_migration_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 004 RPC not yet registered — apply migrations/004_pagerank.sql in Supabase SQL editor to enable PageRank scoring.");
+      } else {
+        console.warn("Migration 004 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 004 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 004 skipped:", err.message);
+  }
+
+  // Migration 005: Add 'duplicate' to memory_conflicts conflict_type check constraint
+  try {
+    const { data, error } = await supabase.rpc("apply_duplicate_conflict_type_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 005 RPC not yet registered — apply migrations/005_add_duplicate_conflict_type.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 005 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 005 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 005 skipped:", err.message);
+  }
+
+  // Migration 007: BM25 search_vector GENERATED ALWAYS + updated hybrid_recall
+  try {
+    const { data, error } = await supabase.rpc("apply_bm25_migration_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 007 RPC not yet registered — apply migrations/007_bm25_generated_vector.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 007 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 007 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 007 skipped:", err.message);
+  }
+
+  // Migration 008: Switch BM25 path from search_vector to search_vec (weighted: name=A, desc=B, content=C)
+  // Note: migration 009 supersedes 008 (includes search_vec) so PGRST202 on this sentinel is expected
+  // and harmless — migration 009 sentinel confirms the work is done.
+  try {
+    const { data, error } = await supabase.rpc("apply_search_vec_migration_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 008 sentinel not registered (superseded by 009 — OK).");
+      } else {
+        console.warn("Migration 008 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 008 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 008 skipped:", err.message);
+  }
+
+  // Migration 009: Trigram fallback for zero-BM25-hit queries (code identifiers with underscores)
+  try {
+    const { data, error } = await supabase.rpc("apply_trigram_fallback_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 009 RPC not yet registered — apply migrations/009_trigram_fallback.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 009 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 009 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 009 skipped:", err.message);
+  }
+
+  // Migration 010: agent_id + visibility columns for multi-agent memory isolation
+  try {
+    const { data, error } = await supabase.rpc("apply_agent_visibility_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 010 RPC not yet registered — apply migrations/010_agent_visibility.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 010 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 010 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 010 skipped:", err.message);
+  }
+
+  // Migration 012: agent_scope text[] — per-agent visibility array (prevents cross-agent context bleed)
+  try {
+    const { data, error } = await supabase.rpc("apply_agent_scope_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 012 RPC not yet registered — apply migrations/012_agent_scope.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 012 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 012 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 012 skipped:", err.message);
+  }
+
+  // Migration 013: A-MAC 5-dimension memory decay scoring (ICLR 2026)
+  // Replaces single-scalar ACT-R decay with composite: α*recency + β*access_freq + γ*novelty + δ*importance + ε*utility
+  try {
+    const { data, error } = await supabase.rpc("apply_amac_scoring_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 013 RPC not yet registered — apply migrations/013_amac_scoring.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 013 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 013 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 013 skipped:", err.message);
+  }
+
+  // Migration 014: hybrid_search_memories() + consolidate_similar_memories() + pg_cron job
+  // hybrid_search_memories: pgvector cosine + tsvector BM25 (search_vec weighted + search_vector plain) via RRF
+  // consolidate_similar_memories: merges memory pairs with cosine similarity > 0.90, weekly pg_cron job
+  try {
+    const { data, error } = await supabase.rpc("apply_consolidation_migration_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 014 RPC not yet registered — apply migrations/014_hybrid_search_and_consolidation.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 014 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 014 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 014 skipped:", err.message);
+  }
+}
+
 // ── MCP Server Factory ───────────────────────────────────────────────────────
-function createMcpServer(): McpServer {
+function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "3.4.0",
+    version: "4.7.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -179,8 +668,12 @@ function createMcpServer(): McpServer {
       content: z.string().describe("Full memory content. For feedback/project types, include Why and How to apply."),
       tags: z.array(z.string()).optional().describe("Tags for categorization and search"),
       source: z.string().optional().describe("Who is writing: claude-code, claude-ai, manual"),
+      importance_score: z.number().min(0).max(1).optional().describe("Importance 0-1 (default 0.5). Higher = decays slower and ranks higher in recall. Use 0.8+ for critical long-term facts, 0.2 for ephemeral context."),
+      agent_id: z.string().optional().describe("Agent that owns this memory: wren, iris, atlas, forge, volt. Used with visibility=private for agent-scoped memories."),
+      visibility: z.enum(["shared", "private"]).optional().describe("shared (default): visible to all agents. private: visible only to agent_id owner."),
+      agent_scope: z.array(z.string()).optional().describe("Which agents can see this memory. Default ['shared'] = all agents. E.g. ['wren','iris'] = only Wren and Iris. Requires migration 012."),
     },
-    async ({ type, name, description, content, tags, source }) => {
+    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope }) => {
       // Security gate — scan all text fields before touching the DB
       const scanTargets: Array<[string, string]> = [
         ["name", name], ["description", description], ["content", content],
@@ -192,25 +685,37 @@ function createMcpServer(): McpServer {
         }
       }
 
-      const src = source || "claude-code";
+      // AIP: verified caller identity overrides client-supplied source
+      const src = callerIdentity || source || "claude-code";
       const memTags = tags || [];
 
+      // Fetch existing same-name memory (with content for NOOP check)
       const { data: existing } = await supabase
         .from("memories")
-        .select("id")
+        .select("id, content")
         .eq("name", name)
         .maybeSingle();
 
       const embedding = await embed(embedInput(name, description, content));
       const embedNote = embedding ? "" : " (no embedding — Ollama unavailable)";
 
+      // ── Same-name path ──────────────────────────────────────────────────────
       if (existing) {
+        // Mem0 NOOP: content is essentially unchanged — skip write
+        if (existing.content && textSimilarity(existing.content, content) >= 0.85) {
+          return { content: [{ type: "text" as const, text: `NOOP: Memory "${name}" content is unchanged (Jaccard ≥ 85%). No write needed.` }] };
+        }
+
         const update: Record<string, unknown> = { type, description, content, tags: memTags, source: src };
         if (embedding) update.embedding = JSON.stringify(embedding);
+        if (importance_score !== undefined) update.importance_score = importance_score;
+        if (agent_id) update.agent_id = agent_id;
+        if (visibility) update.visibility = visibility;
+        if (agent_scope) update.agent_scope = agent_scope;
         const { error } = await supabase.from("memories").update(update).eq("id", existing.id);
         if (error) return { content: [{ type: "text" as const, text: `Error updating memory: ${error.message}` }] };
 
-        // Re-link on update: remove old related_to links and rebuild
+        // Re-link on update
         let linkNote = "";
         if (embedding) {
           await supabase.from("memory_links").delete().eq("source_id", existing.id).eq("relationship", "related_to");
@@ -222,26 +727,63 @@ function createMcpServer(): McpServer {
           if (similar?.length) {
             const links = similar
               .filter((m: any) => m.id !== existing.id)
-              .map((m: any) => ({ source_id: existing.id, target_id: m.id, relationship: "related_to", strength: Math.min(m.similarity, 1.0) }));
+              .map((m: any) => ({ source_id: existing.id, target_id: m.id, relationship: "related_to", link_type: "semantic", strength: Math.min(m.similarity, 1.0) }));
             if (links.length) {
               await supabase.from("memory_links").upsert(links, { onConflict: "source_id,target_id,relationship" });
               linkNote = ` Re-linked to ${links.length} related memor${links.length === 1 ? "y" : "ies"}.`;
             }
           }
         }
-        // Re-run conflict detection on update
         const updateConflicts = await detectConflicts(existing.id, content, type, memTags, embedding);
         const updateConflictNote = updateConflicts ? ` ⚠️ Possible contradiction with: ${updateConflicts}` : "";
         return { content: [{ type: "text" as const, text: `Updated memory "${name}" (${type})${embedNote}.${linkNote}${updateConflictNote}` }] };
       }
 
+      // ── New-name path: full Mem0 conflict resolution ────────────────────────
+      let mem0Note = "";
+      if (embedding) {
+        const decisions = await mem0Resolve(name, content, type, embedding);
+
+        for (const d of decisions) {
+          if (d.action === "NOOP") {
+            console.log(`[mem0] NOOP "${name}": ${d.rationale}`);
+            return { content: [{ type: "text" as const, text: `NOOP: Fact already captured in "${d.target_name}". No write needed. (${d.rationale})` }] };
+          }
+
+          if (d.action === "UPDATE" && d.target_id) {
+            // Update the existing differently-named memory in place
+            console.log(`[mem0] UPDATE "${d.target_name}": ${d.rationale}`);
+            const upd: Record<string, unknown> = { description, content, tags: memTags, source: src };
+            upd.embedding = JSON.stringify(embedding);
+            if (importance_score !== undefined) upd.importance_score = importance_score;
+            const { error: updErr } = await supabase.from("memories").update(upd).eq("id", d.target_id);
+            if (!updErr) {
+              return { content: [{ type: "text" as const, text: `mem0 UPDATE: merged "${name}" into existing memory "${d.target_name}". (${d.rationale})${embedNote}` }] };
+            }
+          }
+
+          if (d.action === "DELETE" && d.target_id) {
+            // Remove stale/contradicted memory before inserting the new one
+            console.log(`[mem0] DELETE "${d.target_name}": ${d.rationale}`);
+            await supabase.from("memory_links").delete().or(`source_id.eq.${d.target_id},target_id.eq.${d.target_id}`);
+            await supabase.from("memories").delete().eq("id", d.target_id);
+            mem0Note += ` Removed stale memory "${d.target_name}".`;
+          }
+        }
+      }
+
+      // ── INSERT new memory ───────────────────────────────────────────────────
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
       if (embedding) insert.embedding = JSON.stringify(embedding);
+      if (importance_score !== undefined) insert.importance_score = importance_score;
+      if (agent_id) insert.agent_id = agent_id;
+      if (visibility) insert.visibility = visibility;
+      if (agent_scope) insert.agent_scope = agent_scope;
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
 
-      // Auto-link: find related memories and create bidirectional links
+      // Auto-link
       let linkNote = "";
       if (embedding && inserted?.id) {
         const { data: similar } = await supabase.rpc("match_memories", {
@@ -252,7 +794,7 @@ function createMcpServer(): McpServer {
         if (similar?.length) {
           const links = similar
             .filter((m: any) => m.id !== inserted.id)
-            .map((m: any) => ({ source_id: inserted.id, target_id: m.id, relationship: "related_to", strength: Math.min(m.similarity, 1.0) }));
+            .map((m: any) => ({ source_id: inserted.id, target_id: m.id, relationship: "related_to", link_type: "semantic", strength: Math.min(m.similarity, 1.0) }));
           if (links.length) {
             await supabase.from("memory_links").upsert(links, { onConflict: "source_id,target_id,relationship" });
             linkNote = ` Linked to ${links.length} related memor${links.length === 1 ? "y" : "ies"}.`;
@@ -260,11 +802,10 @@ function createMcpServer(): McpServer {
         }
       }
 
-      // Conflict detection
       const conflicts = await detectConflicts(inserted.id, content, type, memTags, embedding);
       const conflictNote = conflicts ? ` ⚠️ Possible contradiction with: ${conflicts}` : "";
 
-      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${conflictNote}` }] };
+      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${mem0Note}${conflictNote}` }] };
     }
   );
 
@@ -278,53 +819,155 @@ function createMcpServer(): McpServer {
       tags: z.array(z.string()).optional().describe("Filter by tags (any match)"),
       limit: z.number().optional().describe("Max results (default 10)"),
       semantic: z.boolean().optional().describe("Force semantic search (default: true when Ollama available)"),
+      agent_id: z.string().optional().describe("Filter by agent ownership: returns shared memories + private memories owned by this agent_id. Omit to return all shared memories."),
+      agent_scope: z.string().optional().describe("Filter by agent_scope array: pass agent name (e.g. 'wren') to see only memories scoped to 'shared' or this agent. Requires migration 012."),
     },
-    async ({ query, type, tags, limit, semantic }) => {
+    async ({ query, type, tags, limit, semantic, agent_id, agent_scope }) => {
       const maxResults = limit || 10;
 
-      // Try semantic search when query is provided and semantic not explicitly disabled
+      // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled.
+      // hybrid_recall with null embedding degrades gracefully to BM25-only (tsvector ts_rank),
+      // ensuring BM25 is always used for text queries even when Ollama is unavailable.
       if (query && semantic !== false) {
         const queryEmbedding = await embed(query);
-        if (queryEmbedding) {
-          const { data, error } = await supabase.rpc("match_memories", {
-            query_embedding: JSON.stringify(queryEmbedding),
-            match_threshold: 0.4,
-            match_count: maxResults,
-          });
+        const hybridMode = queryEmbedding ? "hybrid BM25+vector" : "BM25-only";
+        // Build RPC params — only include p_agent_id when agent isolation is needed.
+        // Omitting it lets the call succeed against the 5-param DB function (migration 009)
+        // while remaining forward-compatible with the 6-param version (migration 010).
+        const rpcParams: Record<string, unknown> = {
+          p_query_text: query,
+          p_query_embedding: queryEmbedding ? JSON.stringify(queryEmbedding) : null,
+          p_match_threshold: queryEmbedding ? 0.3 : 0.0,
+          p_match_count: maxResults * 2, // wider pool, filter below
+          p_filter_type: type || null,
+        };
+        if (agent_id) rpcParams.p_agent_id = agent_id;
+        if (agent_scope) rpcParams.p_agent_scope = agent_scope;
+        const { data, error } = await supabase.rpc("hybrid_recall", rpcParams);
 
-          if (!error && data && data.length > 0) {
-            // Apply type + tag filters client-side
-            let filtered = data as any[];
-            if (type) filtered = filtered.filter((m) => m.type === type);
-            if (tags?.length) filtered = filtered.filter((m) => tags.some((t) => m.tags?.includes(t)));
-
-            if (filtered.length > 0) {
-              // Touch all returned memories (update access_count + accessed_at)
-              await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
-
-              // Fetch links for the top result
-              let linkSection = "";
-              const top = filtered[0];
-              const { data: linked } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
-              if (linked?.length) {
-                const linkLines = linked.map((l: any) => `  - **${l.name}** (${l.relationship}, strength ${l.strength.toFixed(2)}): ${l.description}`);
-                linkSection = `\n\n**Linked memories (${linked.length}):**\n${linkLines.join("\n")}`;
-              }
-
-              const results = filtered.map((m: any, i: number) => {
-                const tagStr = m.tags?.length ? ` [${m.tags.join(", ")}]` : "";
-                const rank = m.rank ? ` (rank ${(m.rank * 100).toFixed(0)}%)` : "";
-                const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
-                const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
-                return `## ${m.name} (${m.type})${tagStr}${rank}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
-              });
-              return {
-                content: [{ type: "text" as const, text: `Found ${filtered.length} memor${filtered.length === 1 ? "y" : "ies"} (semantic+decay):\n\n${results.join("\n\n---\n\n")}` }],
-              };
+        if (!error && data && data.length > 0) {
+          // Apply tag filters client-side
+          let filtered = data as any[];
+          if (tags?.length) filtered = filtered.filter((m) => tags.some((t) => m.tags?.includes(t)));
+          // Reranking: TEI cross-encoder (primary, local) → Nemotron LLM (fallback)
+          const rerankPool = filtered.slice(0, 20);
+          let rerankLabel = "";
+          if (rerankPool.length > 1) {
+            const teiResult = await rerankWithTEI(query, rerankPool);
+            if (teiResult) {
+              filtered = [...teiResult, ...filtered.slice(20)];
+              rerankLabel = "+tei-rerank";
+            } else if (NVIDIA_API_KEY) {
+              const reranked = await rerankMemories(query, rerankPool);
+              filtered = [...reranked, ...filtered.slice(20)];
+              rerankLabel = "+rerank";
             }
           }
-          // Fall through to keyword search if semantic returns nothing
+          const rerankEnabled = rerankLabel !== "";
+          const finalLimit = rerankEnabled ? Math.min(RERANK_TOP_K, maxResults) : maxResults;
+          const hybridModeLabel = `${hybridMode}${rerankLabel}`;
+          filtered = filtered.slice(0, finalLimit);
+
+          if (filtered.length > 0) {
+            await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
+
+            // Fetch temporal/causal linked memories for all top results and apply score boost
+            const filteredIds = new Set(filtered.map((m: any) => m.id));
+            const boostedExtras: Map<string, { mem: any; boost: number }> = new Map();
+
+            // For each top result, fetch its links and check for temporal/causal types
+            const linkFetches = await Promise.all(
+              filtered.map(async (m: any) => {
+                const { data: links } = await supabase
+                  .from("memory_links")
+                  .select("target_id, link_type, strength")
+                  .eq("source_id", m.id)
+                  .in("link_type", ["temporal", "causal"]);
+                return { sourceId: m.id, links: links || [] };
+              })
+            );
+
+            // Collect unique target IDs for temporal/causal links not already in results
+            const tcTargetIds: string[] = [];
+            for (const { links } of linkFetches) {
+              for (const link of links) {
+                if (!filteredIds.has(link.target_id) && !tcTargetIds.includes(link.target_id)) {
+                  tcTargetIds.push(link.target_id);
+                }
+              }
+            }
+
+            // Fetch those extra memories and assign boosted scores
+            if (tcTargetIds.length > 0) {
+              const { data: extraMems } = await supabase
+                .from("memories")
+                .select("id, type, name, description, content, tags, source, conflict_flagged")
+                .in("id", tcTargetIds);
+              if (extraMems) {
+                for (const em of extraMems) {
+                  // Find max boost from any temporal/causal link pointing to this memory
+                  let maxBoost = 0;
+                  for (const { links } of linkFetches) {
+                    const link = links.find((l: any) => l.target_id === em.id);
+                    if (link) maxBoost = Math.max(maxBoost, 0.1 * (link.strength || 1.0));
+                  }
+                  boostedExtras.set(em.id, {
+                    mem: { ...em, hybrid_score: (filtered[filtered.length - 1]?.hybrid_score || 0.5) + maxBoost },
+                    boost: maxBoost,
+                  });
+                }
+              }
+            }
+
+            // Fetch links for the top result to show in the link section
+            let linkSection = "";
+            const top = filtered[0];
+            const { data: linked } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
+            if (linked?.length) {
+              // Fetch link_type for each linked memory from memory_links
+              const { data: linkTypeRows } = await supabase
+                .from("memory_links")
+                .select("target_id, link_type")
+                .eq("source_id", top.id)
+                .in("target_id", linked.map((l: any) => l.id));
+              const linkTypeMap: Record<string, string> = {};
+              for (const lt of (linkTypeRows || [])) {
+                linkTypeMap[lt.target_id] = lt.link_type || "semantic";
+              }
+              const linkLines = linked.map((l: any) => {
+                const lt = linkTypeMap[l.id] || "semantic";
+                return `  - **${l.name}** (${l.relationship}, type:${lt}, strength ${l.strength.toFixed(2)}): ${l.description}`;
+              });
+              linkSection = `\n\n**Linked memories (${linked.length}):**\n${linkLines.join("\n")}`;
+            }
+
+            const results = filtered.map((m: any, i: number) => {
+              const tagStr = m.tags?.length ? ` [${m.tags.join(", ")}]` : "";
+              const scoreStr = m.hybrid_score ? ` (score ${(m.hybrid_score * 100).toFixed(0)}%)` : "";
+              const importanceStr = m.importance_score !== undefined && m.importance_score !== 0.5 ? ` imp:${m.importance_score.toFixed(2)}` : "";
+              const accessStr = m.access_count > 0 ? ` accessed:${m.access_count}x` : "";
+              const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
+              const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
+              return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
+            });
+
+            // Append temporal/causal boosted extras not already in results
+            for (const { mem, boost } of boostedExtras.values()) {
+              const tagStr = mem.tags?.length ? ` [${mem.tags.join(", ")}]` : "";
+              const scoreStr = ` (score ${((mem.hybrid_score || 0) * 100).toFixed(0)}% +boost:${(boost * 100).toFixed(0)}%)`;
+              const trust = SOURCE_TRUST[mem.source] ? ` · trust:${SOURCE_TRUST[mem.source]}` : "";
+              const conflictFlag = mem.conflict_flagged ? " ⚠️" : "";
+              results.push(`## ${mem.name} (${mem.type})${tagStr}${scoreStr}${trust}${conflictFlag} [temporal/causal link]\n_${mem.description}_\n\n${mem.content}`);
+            }
+
+            const totalCount = filtered.length + boostedExtras.size;
+            const boostNote = boostedExtras.size > 0 ? ` (${boostedExtras.size} added via temporal/causal links)` : "";
+            return {
+              content: [{ type: "text" as const, text: `Found ${totalCount} memor${totalCount === 1 ? "y" : "ies"} (${hybridModeLabel})${boostNote}:\n\n${results.join("\n\n---\n\n")}` }],
+            };
+          }
         }
+        // Fall through to keyword search if hybrid/BM25 returns nothing
       }
 
       // Keyword / filter search fallback
@@ -337,6 +980,8 @@ function createMcpServer(): McpServer {
       if (type) q = q.eq("type", type);
       if (tags && tags.length > 0) q = q.overlaps("tags", tags);
       if (query) q = q.or(`name.ilike.%${query}%,description.ilike.%${query}%,content.ilike.%${query}%`);
+      // Agent visibility filter: when agent_id set, return shared + own private; else return shared only (or all if visibility column not yet added)
+      if (agent_id) q = q.or(`visibility.eq.shared,and(visibility.eq.private,agent_id.eq.${agent_id})`);
 
       const { data, error } = await q;
 
@@ -373,7 +1018,61 @@ function createMcpServer(): McpServer {
       const { error } = await supabase.from("memories").delete().eq("id", existing.id);
 
       if (error) return { content: [{ type: "text" as const, text: `Error deleting: ${error.message}` }] };
+      console.log(`[aip] forget "${name}" by ${callerIdentity || "unverified"}`);
       return { content: [{ type: "text" as const, text: `Deleted memory "${name}". Audit log preserved.` }] };
+    }
+  );
+
+  // ── Tool: add_memory_link ────────────────────────────────────────────────────
+  server.tool(
+    "add_memory_link",
+    "Create a typed Zettelkasten link between two memories. Link types: semantic (topically related), temporal (time-ordered sequence), causal (A caused/led to B), entity (same entity referenced). Temporal and causal links receive a recall score boost.",
+    {
+      source_id: z.string().uuid().describe("UUID of the source memory"),
+      target_id: z.string().uuid().describe("UUID of the target memory"),
+      relationship: z.string().optional().describe("Relationship label, e.g. 'causes', 'precedes', 'related_to', 'references' (default: related_to)"),
+      link_type: z.enum(["semantic", "temporal", "causal", "entity"]).optional().describe("MAGMA link type — semantic: topically related, temporal: time-ordered, causal: A caused B, entity: same entity (default: semantic)"),
+      strength: z.number().min(0).max(1).optional().describe("Link strength 0-1 (default: 1.0)"),
+    },
+    async ({ source_id, target_id, relationship, link_type, strength }) => {
+      // Validate both memories exist
+      const { data: srcMem } = await supabase.from("memories").select("id, name").eq("id", source_id).maybeSingle();
+      if (!srcMem) return { content: [{ type: "text" as const, text: `Source memory not found: ${source_id}` }] };
+
+      const { data: tgtMem } = await supabase.from("memories").select("id, name").eq("id", target_id).maybeSingle();
+      if (!tgtMem) return { content: [{ type: "text" as const, text: `Target memory not found: ${target_id}` }] };
+
+      const rel = relationship || "related_to";
+      const ltype = link_type || "semantic";
+      const str = strength ?? 1.0;
+
+      const { error } = await supabase
+        .from("memory_links")
+        .upsert(
+          { source_id, target_id, relationship: rel, link_type: ltype, strength: str },
+          { onConflict: "source_id,target_id,relationship" }
+        );
+
+      if (error) {
+        // If link_type column doesn't exist yet, fall back to insert without it
+        if (error.message?.includes("link_type")) {
+          const { error: fallbackErr } = await supabase
+            .from("memory_links")
+            .upsert(
+              { source_id, target_id, relationship: rel, strength: str },
+              { onConflict: "source_id,target_id,relationship" }
+            );
+          if (fallbackErr) return { content: [{ type: "text" as const, text: `Error creating link: ${fallbackErr.message}. Note: run migrations/001_add_link_type.sql to enable typed links.` }] };
+          return { content: [{ type: "text" as const, text: `Linked "${srcMem.name}" → "${tgtMem.name}" (${rel}, strength ${str.toFixed(2)}) — warning: link_type not persisted, apply migrations/001_add_link_type.sql.` }] };
+        }
+        return { content: [{ type: "text" as const, text: `Error creating link: ${error.message}` }] };
+      }
+
+      const boostNote = ltype === "temporal" || ltype === "causal" ? " (recall-boosted)" : "";
+      console.log(`[aip] add_memory_link "${srcMem.name}"→"${tgtMem.name}" by ${callerIdentity || "unverified"}`);
+      return {
+        content: [{ type: "text" as const, text: `Linked "${srcMem.name}" → "${tgtMem.name}" (${rel}, type:${ltype}${boostNote}, strength ${str.toFixed(2)})` }],
+      };
     }
   );
 
@@ -516,6 +1215,7 @@ function createMcpServer(): McpServer {
           return { content: [{ type: "text" as const, text: `File uploaded to R2 but DB insert failed: ${error.message}. Key: ${key}` }] };
         }
 
+        console.log(`[aip] remember_file "${filename}" (${body.length}B) by ${callerIdentity || "unverified"}`);
         return {
           content: [{ type: "text" as const, text: `Stored file "${filename}" (${(body.length / 1024).toFixed(1)} KB, ${mime})\nR2 key: ${key}${memory_name ? `\nLinked to memory: ${memory_name}` : ""}` }],
         };
@@ -604,7 +1304,51 @@ function createMcpServer(): McpServer {
         const { error } = await supabase.from("memory_files").delete().eq("id", file.id);
         if (error) return { content: [{ type: "text" as const, text: `R2 file deleted but DB cleanup failed: ${error.message}` }] };
 
+        console.log(`[aip] forget_file "${filename}" by ${callerIdentity || "unverified"}`);
         return { content: [{ type: "text" as const, text: `Deleted file "${filename}" from storage and database.` }] };
+      }
+    );
+
+    // ── Tool: store_file ─────────────────────────────────────────────────────
+    // Large-object convention: use this instead of embedding content in Supabase
+    // when the payload exceeds ~8KB. Key format: agent/YYYY-MM-DD/name.md
+    server.tool(
+      "store_file",
+      "Write text content directly to R2 by key — no Supabase record. Use this for large payloads (>8KB) that would bloat memory storage. Key format: agent/YYYY-MM-DD/descriptive-name.md",
+      {
+        key: z.string().describe("R2 object key, e.g. 'wren/2026-03-26/research-notes.md'"),
+        content: z.string().describe("Text content to store"),
+        content_type: z.string().optional().describe("MIME type (default: text/plain for .txt, text/markdown for .md)"),
+      },
+      async ({ key, content, content_type }) => {
+        const ext = key.split(".").pop()?.toLowerCase() || "";
+        const mime = content_type || (ext === "md" ? "text/markdown" : ext === "json" ? "application/json" : "text/plain");
+        const body = Buffer.from(content, "utf-8");
+        try {
+          await r2!.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: body, ContentType: mime }));
+          return { content: [{ type: "text" as const, text: `Stored ${body.length.toLocaleString()} bytes → ${R2_BUCKET}/${key}` }] };
+        } catch (err: any) {
+          return { content: [{ type: "text" as const, text: `store_file failed: ${err.message}` }] };
+        }
+      }
+    );
+
+    // ── Tool: get_file ───────────────────────────────────────────────────────
+    server.tool(
+      "get_file",
+      "Read text content from R2 by key. Companion to store_file for large-object retrieval. Returns the raw text content.",
+      {
+        key: z.string().describe("R2 object key to retrieve, e.g. 'wren/2026-03-26/research-notes.md'"),
+      },
+      async ({ key }) => {
+        try {
+          const response = await r2!.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }));
+          if (!response.Body) return { content: [{ type: "text" as const, text: `Empty response for key: ${key}` }] };
+          const text = await response.Body.transformToString("utf-8");
+          return { content: [{ type: "text" as const, text }] };
+        } catch (err: any) {
+          return { content: [{ type: "text" as const, text: `get_file failed for "${key}": ${err.message}` }] };
+        }
       }
     );
   }
@@ -629,7 +1373,8 @@ function createMcpServer(): McpServer {
         if (threat) return { content: [{ type: "text" as const, text: `Blocked: ${field} matches threat pattern '${threat}'. Skill not saved.` }] };
       }
 
-      const src = source || "claude-code";
+      // AIP: verified caller identity overrides client-supplied source
+      const src = callerIdentity || source || "claude-code";
       const skillTriggers = triggers || [];
       const skillPlatforms = platforms || [];
       const embedding = await embed(embedInput(name, description, content));
@@ -721,6 +1466,7 @@ function createMcpServer(): McpServer {
     async ({ name }) => {
       const { error } = await supabase.from("skills").delete().eq("name", name);
       if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      console.log(`[aip] delete_skill "${name}" by ${callerIdentity || "unverified"}`);
       return { content: [{ type: "text" as const, text: `Deleted skill "${name}".` }] };
     }
   );
@@ -820,6 +1566,7 @@ function createMcpServer(): McpServer {
 
       const contentNote = merged_content ? " Content updated." : "";
       const tagNote = mergedTags.length > (primary.tags?.length || 0) ? ` Tags merged: [${mergedTags.join(", ")}].` : "";
+      console.log(`[aip] merge_memories "${secondary_name}"→"${primary_name}" by ${callerIdentity || "unverified"}`);
       return {
         content: [{ type: "text" as const, text: `Merged "${secondary_name}" into "${primary_name}".${contentNote}${tagNote} Secondary memory deleted, links redirected.` }],
       };
@@ -851,6 +1598,74 @@ function createMcpServer(): McpServer {
       });
       return {
         content: [{ type: "text" as const, text: `${data.length} stale memor${data.length === 1 ? "y" : "ies"} (inactive ${days_inactive}d, uses ≤${max_uses}, no links):\n\n${lines.join("\n\n")}\n\nReview and use forget() to prune any that are outdated.` }],
+      };
+    }
+  );
+
+  // ── Tool: get_memory_block ───────────────────────────────────────────────────
+  server.tool(
+    "get_memory_block",
+    "Read a named memory block for a specific agent. Used for cross-agent whisper channel (e.g. guidance, pending_items, project_context).",
+    {
+      agent: z.string().describe("Agent name, e.g. 'wren', 'iris'"),
+      block_name: z.string().describe("Block name: guidance, user_prefs, project_context, session_patterns, pending_items, active_task"),
+    },
+    async ({ agent, block_name }) => {
+      const { data, error } = await supabase
+        .from("memory_blocks")
+        .select("content, updated_at, updated_by")
+        .eq("agent", agent)
+        .eq("block_name", block_name)
+        .maybeSingle();
+
+      if (error) return { content: [{ type: "text" as const, text: `Error reading memory block: ${error.message}` }] };
+      if (!data) return { content: [{ type: "text" as const, text: `No block '${block_name}' found for agent '${agent}'.` }] };
+
+      const ts = data.updated_at ? ` (updated ${new Date(data.updated_at).toISOString().slice(0, 16)} by ${data.updated_by || "unknown"})` : "";
+      return {
+        content: [{ type: "text" as const, text: `[${agent}/${block_name}]${ts}\n\n${data.content}` }],
+      };
+    }
+  );
+
+  // ── Tool: set_memory_block ───────────────────────────────────────────────────
+  server.tool(
+    "set_memory_block",
+    "Upsert a named memory block for a specific agent. Use this for the cross-agent whisper channel — write to another agent's guidance or pending_items block.",
+    {
+      agent: z.string().describe("Agent name, e.g. 'wren', 'iris'"),
+      block_name: z.string().describe("Block name: guidance, user_prefs, project_context, session_patterns, pending_items, active_task"),
+      content: z.string().describe("Full content to store in the block"),
+      updated_by: z.string().optional().describe("Who is writing (default: caller identity)"),
+    },
+    async ({ agent, block_name, content, updated_by }) => {
+      const threat = scanContent(content);
+      if (threat) {
+        return { content: [{ type: "text" as const, text: `Blocked: content matches threat pattern '${threat}'. Block not written.` }] };
+      }
+
+      const contentHash = Buffer.from(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(content))
+      ).toString("hex").slice(0, 16);
+
+      const { error } = await supabase
+        .from("memory_blocks")
+        .upsert(
+          {
+            agent,
+            block_name,
+            content,
+            content_hash: contentHash,
+            // AIP: verified caller identity overrides client-supplied updated_by
+            updated_by: callerIdentity || updated_by || "claude-code",
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "agent,block_name" }
+        );
+
+      if (error) return { content: [{ type: "text" as const, text: `Error writing memory block: ${error.message}` }] };
+      return {
+        content: [{ type: "text" as const, text: `Wrote block '${block_name}' for agent '${agent}' (hash: ${contentHash}).` }],
       };
     }
   );
@@ -949,17 +1764,47 @@ function createMcpServer(): McpServer {
 // ── Express + Transport ─────────────────────────────────────────────────────
 const app = express();
 
+// CORS: allow browser extension (chrome-extension://) and localhost origins
+app.use((req: Request, res: Response, next: () => void) => {
+  const origin = req.headers.origin || "";
+  if (origin.startsWith("chrome-extension://") || origin.startsWith("moz-extension://") || origin.startsWith("http://localhost") || origin.startsWith("http://127.0.0.1")) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, mcp-session-id, Authorization");
+    res.setHeader("Access-Control-Expose-Headers", "mcp-session-id");
+  }
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
+
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = (r2 ? 13 : 10) + (haEnabled ? 3 : 0) + 3; // +3: find_duplicates, merge_memories, list_stale_memories
-  res.json({ status: "ok", service: "memory-mcp-server", version: "3.4.0", tools: toolCount, r2: r2Enabled, ha: haEnabled });
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
+  res.json({ status: "ok", service: "memory-mcp-server", version: "4.7.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
 const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
 
 app.post("/mcp", async (req: Request, res: Response) => {
+  // AIP: extract and verify caller-identity JWT from Authorization header
+  let callerIdentity: string | null = null;
+  const authHeader = req.headers.authorization || "";
+  if (authHeader.startsWith("Bearer ") && AIP_SECRET) {
+    const token = authHeader.slice(7);
+    const payload = verifyAipJwt(token);
+    if (payload) {
+      callerIdentity = payload.sub;
+      console.log(`[aip] verified caller: ${callerIdentity}`);
+    } else {
+      console.warn("[aip] invalid/expired JWT presented — caller unverified");
+    }
+  }
+
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
   if (sessionId && sessions.has(sessionId)) {
@@ -968,9 +1813,9 @@ app.post("/mcp", async (req: Request, res: Response) => {
     return;
   }
 
-  // New session — new server instance
+  // New session — new server instance with verified caller identity bound
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
-  const server = createMcpServer();
+  const server = createMcpServer(callerIdentity);
 
   transport.onclose = () => {
     const sid = (transport as any).sessionId;
@@ -1008,8 +1853,86 @@ app.delete("/mcp", async (req: Request, res: Response) => {
   res.status(400).json({ error: "No session found." });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  const toolCount = (r2 ? 13 : 10) + (haEnabled ? 3 : 0) + 3;
-  console.log(`Memory MCP Server v3.4.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"})`);
+app.listen(PORT, "0.0.0.0", async () => {
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
+  console.log(`Memory MCP Server v4.7.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
+  await applyStartupMigrations();
+  startMemorySyncListener();
 });
+
+// ── Cross-agent memory sync (Supabase Realtime) ──────────────────────────────
+// Subscribes to high-importance memory writes from other agents using raw
+// Phoenix v1.0.0 WebSocket — supabase-js hardcodes vsn=2.0.0 which this
+// project's Realtime server doesn't support.
+function startMemorySyncListener() {
+  const RT_URL = `${SUPABASE_URL.replace("https://", "wss://")}/realtime/v1/websocket?apikey=${SUPABASE_ANON_KEY}&vsn=1.0.0`;
+
+  let ws: any = null;
+  let heartbeat: NodeJS.Timeout | null = null;
+  let retryTimer: NodeJS.Timeout | null = null;
+  let ref = 0;
+
+  function cleanup() {
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    if (ws) { try { ws.close(); } catch {} ws = null; }
+  }
+
+  function connect() {
+    cleanup();
+    ws = new WebSocket(RT_URL);
+
+    ws.on("open", () => {
+      ref = 0;
+      // Join the channel
+      ws!.send(JSON.stringify({
+        topic: "realtime:memory-sync",
+        event: "phx_join",
+        payload: { config: { broadcast: { self: false }, presence: { key: "" }, postgres_changes: [{ event: "*", schema: "public", table: "memories" }] } },
+        ref: String(++ref),
+        join_ref: "1",
+      }));
+      // Heartbeat every 25s
+      heartbeat = setInterval(() => {
+        ws!.send(JSON.stringify({ topic: "phoenix", event: "heartbeat", payload: {}, ref: String(++ref) }));
+      }, 25_000);
+    });
+
+    ws.on("message", (raw: any) => {
+      let msg: any;
+      try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+      if (msg.event === "phx_reply" && msg.payload?.status === "ok" && msg.topic === "realtime:memory-sync") {
+        console.log("[memory-sync] Realtime subscription active — watching importance>=0.8 cross-agent writes");
+        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        return;
+      }
+
+      if (msg.event === "postgres_changes") {
+        const rec = msg.payload?.data?.record || msg.payload?.record;
+        if (!rec) return;
+        const importance = rec.importance_score ?? 0;
+        if (importance < 0.8) return;
+        const src = rec.source || "unknown";
+        if (src === "wren") return;
+        const event = (msg.payload?.data?.type || "CHANGE").toUpperCase();
+        console.log(`[memory-sync] ${event} from ${src}: "${rec.name}" (importance=${importance}, type=${rec.type})`);
+      }
+    });
+
+    ws.on("error", (e: any) => {
+      console.warn(`[memory-sync] WS error: ${e.message} — reconnecting in 30s`);
+      cleanup();
+      retryTimer = setTimeout(connect, 30_000);
+    });
+
+    ws.on("close", () => {
+      cleanup();
+      retryTimer = setTimeout(connect, 30_000);
+    });
+  }
+
+  connect();
+  process.on("SIGTERM", cleanup);
+  process.on("SIGINT",  cleanup);
+}

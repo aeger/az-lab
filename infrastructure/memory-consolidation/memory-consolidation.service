@@ -1,0 +1,18 @@
+[Unit]
+Description=Episodic-to-Semantic Memory Consolidation
+Documentation=https://github.com/almty1/azlab/tree/main/infrastructure/memory-consolidation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/azlab/infrastructure/memory-consolidation/consolidate_episodic_memories.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=memory-consolidation
+
+# Script reads credentials from memory-mcp-server/.env; also inherit env for ANTHROPIC_API_KEY
+EnvironmentFile=-%h/azlab/services/memory-mcp-server/.env
+
+[Install]
+WantedBy=default.target

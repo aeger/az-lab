@@ -9,13 +9,9 @@ services:
     networks:
       - proxy
 
-    dns:
-      - 1.1.1.1
-      - 8.8.8.8
-
     ports:
-      - "80:80"
-      - "443:443"
+      - "192.168.1.181:80:80"
+      - "192.168.1.181:443:443"
 
     env_file:
       - ./cf.env
@@ -46,6 +42,13 @@ services:
       - "--entrypoints.websecure.address=:443"
       - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.metrics.address=:8082"
+
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.addEntryPointsLabels=true"
+      - "--metrics.prometheus.addRoutersLabels=true"
+      - "--metrics.prometheus.addServicesLabels=true"
+      - "--metrics.prometheus.entryPoint=metrics"
 
       - "--providers.docker=true"
       - "--providers.docker.endpoint=unix:///var/run/docker.sock"

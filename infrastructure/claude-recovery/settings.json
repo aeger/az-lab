@@ -18,7 +18,10 @@
       "mcp__claude_ai_Vercel__*",
       "mcp__claude_ai_Gmail__*",
       "mcp__claude_ai_Google_Calendar__*",
-      "mcp__claude_ai_Supabase__*"
+      "mcp__claude_ai_Supabase__*",
+      "mcp__plugin_discord_discord__*",
+      "mcp__memory-mcp__*",
+      "mcp__agent-bus__*"
     ],
     "deny": [
       "Bash(sudo rm -rf /)",
@@ -29,7 +32,8 @@
       "/home/almty1/.ssh",
       "/tmp",
       "/home/almty1/claude/goals/completed",
-      "/home/almty1/.claude/projects/-home-almty1/memory"
+      "/home/almty1/.claude/projects/-home-almty1/memory",
+      "/home/almty1/.claude/hooks"
     ]
   },
   "hooks": {
@@ -41,6 +45,97 @@
             "command": "bash /home/almty1/claude/scripts/sync-memory.sh",
             "timeout": 10,
             "statusMessage": "Syncing memory from Supabase..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/almty1/.claude/hooks/session-start.sh",
+            "timeout": 10,
+            "statusMessage": "Restoring session context..."
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/almty1/.claude/hooks/pre-compact.sh",
+            "timeout": 15,
+            "statusMessage": "Saving working context before compaction..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); if [[ \"$f\" == *.yaml || \"$f\" == *.yml ]]; then python3 -c \"import yaml; yaml.safe_load(open('$f'))\" 2>&1 || echo \"YAML INVALID: $f\"; elif [[ \"$f\" == *.json ]]; then python3 -c \"import json; json.load(open('$f'))\" 2>&1 || echo \"JSON INVALID: $f\"; fi",
+            "timeout": 10,
+            "statusMessage": "Validating file syntax..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/almty1/.claude/hooks/discord-activity.sh",
+            "timeout": 5,
+            "statusMessage": "Logging activity..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/almty1/.wren-watchdog/heartbeat-writer.sh",
+            "timeout": 3,
+            "statusMessage": "Heartbeat..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/almty1/.claude/hooks/heartbeat-on-stop.sh",
+            "timeout": 3,
+            "statusMessage": "Heartbeat..."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/almty1/.claude/hooks/transcript-on-stop.sh",
+            "timeout": 10,
+            "statusMessage": "Queuing transcript for Iris..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/almty1/.claude/hooks/pre-tool-use.sh",
+            "timeout": 3,
+            "statusMessage": "Logging tool use..."
           }
         ]
       }

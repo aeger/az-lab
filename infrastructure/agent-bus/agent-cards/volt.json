@@ -1,0 +1,71 @@
+{
+  "name": "volt",
+  "displayName": "Volt",
+  "description": "Nemotron 120B inference agent on nemoclaw-01 (VM 108). Local LLM inference via NVIDIA NIM API. Used for privacy-sensitive tasks, high-volume generation, and NemoClaw sandbox experiments.",
+  "url": "http://192.168.1.183",
+  "version": "1.0.0",
+  "protocolVersion": "0.3",
+  "defaultInputModes": ["application/json", "text/plain"],
+  "defaultOutputModes": ["application/json", "text/plain"],
+  "supportsAuthenticatedExtendedCard": false,
+  "model": "nvidia/nemotron-3-super-120b-a12b",
+  "runtime": "nvidia-nim",
+  "host": "nemoclaw-01",
+  "skills": [
+    {
+      "id": "text_generation",
+      "name": "Text Generation",
+      "description": "Generate text completions with the local Nemotron 120B model",
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["application/json", "text/plain"]
+    },
+    {
+      "id": "code_generation",
+      "name": "Code Generation",
+      "description": "Generate and complete code snippets using local inference",
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["application/json", "text/plain"]
+    },
+    {
+      "id": "summarization",
+      "name": "Summarization",
+      "description": "Summarize long documents or conversation histories locally",
+      "inputModes": ["text/plain"],
+      "outputModes": ["text/plain"]
+    },
+    {
+      "id": "classification",
+      "name": "Classification",
+      "description": "Classify text or tasks using local inference (no data leaves the lab)",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "privacy_sensitive_inference",
+      "name": "Privacy-Sensitive Inference",
+      "description": "Handle tasks containing PII or sensitive data that must not leave the homelab",
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["application/json", "text/plain"]
+    }
+  ],
+  "accepted_tasks": [
+    "text_generation", "code_generation", "summarization", "classification",
+    "privacy_sensitive_inference", "high_volume_generation", "nemoclaw_experiments"
+  ],
+  "contact": {
+    "discord_channel": "claude-code",
+    "queue": "task_queue",
+    "queue_target": "nemotron",
+    "routing_tag": "nemotron"
+  },
+  "securitySchemes": {
+    "nimBearer": {
+      "type": "http",
+      "scheme": "bearer",
+      "description": "NVIDIA NIM API key — see credentials table"
+    }
+  },
+  "security": [
+    {"nimBearer": []}
+  ]
+}

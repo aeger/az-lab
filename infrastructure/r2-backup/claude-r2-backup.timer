@@ -1,0 +1,11 @@
+[Unit]
+Description=az-lab R2 Backup Timer — daily at 02:00 UTC
+After=network-online.target
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 UTC
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

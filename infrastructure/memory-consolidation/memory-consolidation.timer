@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily Episodic-to-Semantic Memory Consolidation Timer
+After=network-online.target
+
+[Timer]
+# Run daily at 04:00 UTC — after research triggers (02:00) and prune job (02:00),
+# before the working day starts. New episodic memories from overnight research
+# will be available for consolidation.
+OnCalendar=*-*-* 04:00:00 UTC
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

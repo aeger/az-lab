@@ -23,13 +23,30 @@ services:
       - GOOGLE_SERVICE_ACCOUNT_KEY=${GOOGLE_SERVICE_ACCOUNT_KEY:-}
       - GOOGLE_CALENDAR_IDS=${GOOGLE_CALENDAR_IDS:-}
       - ADMIN_SECRET=${ADMIN_SECRET:-changeme}
+      - GMAIL_CLIENT_ID=${GMAIL_CLIENT_ID:-}
+      - GMAIL_CLIENT_SECRET=${GMAIL_CLIENT_SECRET:-}
+      - GMAIL_REFRESH_TOKEN=${GMAIL_REFRESH_TOKEN:-}
       - RUSTDESK_HOST=${RUSTDESK_HOST:-}
       - RUSTDESK_KEY=${RUSTDESK_KEY:-}
       - HA_URL=${HA_URL:-}
       - HA_ACCESS_TOKEN=${HA_ACCESS_TOKEN:-}
+      - SUPABASE_URL=${SUPABASE_URL:-}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:-}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_CHANNEL_ID=${DISCORD_CHANNEL_ID:-}
+      - TERMINAL_SSH_KEY=/run/secrets/terminal_ssh_key
+      - TERMINAL_SSH_HOST=192.168.1.181
+      - TERMINAL_SSH_USER=almty1
+      - CLOUDFLARE_DNS_API_TOKEN=${CLOUDFLARE_DNS_API_TOKEN:-}
+      - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID:-}
+      - TRAEFIK_DYNAMIC_DIR=/traefik-dynamic
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
     volumes:
       - ./config:/app/config:ro
       - ./data:/app/data:rw
+      - /home/almty1/.ssh/id_ed25519_claude_desktop:/run/secrets/terminal_ssh_key:ro
+      - /home/almty1/azlab/infrastructure/traefik/dynamic:/traefik-dynamic:rw
     networks:
       - proxy
     labels:
@@ -46,6 +63,8 @@ services:
     image: louislam/uptime-kuma:1
     container_name: uptime-kuma
     restart: unless-stopped
+    dns:
+      - 192.168.99.2
     volumes:
       - uptime-kuma-data:/app/data
     networks:

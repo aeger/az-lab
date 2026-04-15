@@ -1,0 +1,60 @@
+{
+  "name": "forge",
+  "displayName": "Forge",
+  "description": "Claude Code Desktop agent on Windows workstation. Local code editing, git operations, and development environment management on the Windows dev machine.",
+  "url": "local://forge",
+  "version": "1.0.0",
+  "protocolVersion": "0.3",
+  "defaultInputModes": ["application/json", "text/plain"],
+  "defaultOutputModes": ["application/json", "text/plain"],
+  "supportsAuthenticatedExtendedCard": false,
+  "model": "claude-sonnet-4-6",
+  "runtime": "claude-code-desktop",
+  "host": "windows-workstation",
+  "skills": [
+    {
+      "id": "code_editing",
+      "name": "Code Editing",
+      "description": "Edit and refactor code files on the Windows dev machine",
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["application/json", "text/plain"]
+    },
+    {
+      "id": "git_workflow",
+      "name": "Git Workflow",
+      "description": "Git operations: commit, branch, merge, PR creation",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "local_dev_environment",
+      "name": "Local Dev Environment",
+      "description": "Manage Windows dev environment, WSL, and local tools",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "local_build_and_test",
+      "name": "Local Build and Test",
+      "description": "Run builds and test suites on the Windows dev machine",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    }
+  ],
+  "accepted_tasks": [
+    "code_editing", "refactoring", "local_dev_environment", "git_workflow",
+    "windows_side_debugging", "local_build_and_test"
+  ],
+  "contact": {
+    "discord_channel": "claude-code",
+    "queue": "task_queue",
+    "queue_target": "claude-code-desktop"
+  },
+  "securitySchemes": {
+    "none": {
+      "type": "none",
+      "description": "Local desktop process — not network-accessible"
+    }
+  },
+  "security": []
+}

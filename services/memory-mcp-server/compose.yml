@@ -19,8 +19,28 @@ services:
       - PORT=3100
       - OLLAMA_URL=http://ollama:11434
       - EMBED_MODEL=nomic-embed-text
+      # Mem0 LLM classification (optional — heuristic mode if unset)
+      # Set to NemoClaw NIM API for LLM-based ADD/UPDATE/DELETE/NOOP decisions
+      - LLM_URL=${LLM_URL:-}
+      - LLM_MODEL=${LLM_MODEL:-llama3.2:3b}
+      # TEI cross-encoder reranking (primary — local, fast, ~80ms)
+      # bge-reranker-v2-m3 served by tei-reranker container below
+      - RERANKER_URL=http://tei-reranker:8080
+      # Nemotron reranking (fallback when TEI unavailable — skipped if NVIDIA_API_KEY unset)
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - RERANK_URL=${RERANK_URL:-http://192.168.1.183:8000}
+      - RERANK_MODEL=${RERANK_MODEL:-nvidia/nemotron-3-super-120b-a12b}
+      - RERANK_TOP_K=${RERANK_TOP_K:-5}
       - HA_URL=${HA_URL}
       - HA_TOKEN=${HA_TOKEN}
+      # AIP: Agent Identity Protocol — shared HS256 secret for caller-identity JWTs
+      # Agents sign: {"sub":"wren","iss":"az-lab","iat":<unix>,"exp":<unix+3600>}
+      # If unset, AIP verification is disabled (backward-compatible)
+      - AIP_SECRET=${AIP_SECRET:-}
+    depends_on:
+      tei-reranker:
+        condition: service_healthy
+        required: false
     ports:
       - "127.0.0.1:3100:3100"
     networks:
@@ -32,6 +52,28 @@ services:
       - "traefik.http.routers.memory-mcp.tls=true"
       - "traefik.http.routers.memory-mcp.middlewares=lan-allow@file"
       - "traefik.http.services.memory-mcp.loadbalancer.server.port=3100"
+
+  # ─── TEI Cross-Encoder Reranker ─────────────────────────────────────────────
+  # bge-reranker-v2-m3: lightweight cross-encoder, ~570MB, CPU-only, ~80ms latency
+  # First start downloads model from HuggingFace into tei-model-cache volume
+  tei-reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    container_name: az-tei-reranker
+    restart: unless-stopped
+    command: --model-id BAAI/bge-reranker-v2-m3 --port 8080
+    volumes:
+      - tei-model-cache:/data
+    networks:
+      - proxy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  tei-model-cache:
 
 networks:
   proxy:
