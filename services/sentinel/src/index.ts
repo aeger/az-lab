@@ -10,15 +10,18 @@ import { SoundDirector } from './lib/sound-director';
 import { HealthReportScheduler } from './lib/health-report';
 import { healthRouter } from './routes/health';
 import { notificationsRouter } from './routes/notifications';
+import { settingsRouter } from './routes/settings';
+import { extensionRouter } from './routes/extension';
+import { actionsRouter } from './routes/actions';
 import { CollectorConfig } from './types';
 
 // Collectors
-import { createSupabaseCollector } from './collectors/supabase';
-import { createHACollector } from './collectors/homeassistant';
+import { createTaskQueueCollector } from './collectors/task-queue';
+import { createHACollector } from './collectors/home-assistant';
 import { createDiscordCollector } from './collectors/discord';
 import { createGrafanaCollector } from './collectors/grafana';
 import { createServicesCollector } from './collectors/services';
-import { createClaudeHealthCollector } from './collectors/claude-health';
+import { createAgentHealthCollector } from './collectors/agent-health';
 import { createGoalsCollector } from './collectors/goals';
 
 const app = express();
@@ -68,10 +71,10 @@ if (config.discord.breakingAlertsEnabled && config.discord.alertChannelId) {
 }
 
 // Build collectors
-const collectors: CollectorConfig[] = [
+const collectors = [
   {
     name: 'task_queue',
-    fn: createSupabaseCollector(),
+    fn: createTaskQueueCollector(),
     intervalMs: config.supabase.pollInterval,
     enabled: isCollectorEnabled('task_queue'),
   },
@@ -101,7 +104,7 @@ const collectors: CollectorConfig[] = [
   },
   {
     name: 'agent_health',
-    fn: createClaudeHealthCollector(),
+    fn: createAgentHealthCollector(),
     intervalMs: 60_000, // every 60 seconds
     enabled: isCollectorEnabled('agent_health'),
   },
@@ -137,6 +140,9 @@ healthReport.start();
 // Routes
 app.use('/api', healthRouter(poller, guardian));
 app.use('/api', notificationsRouter(store, digest));
+app.use('/api', settingsRouter(store));
+app.use('/api', extensionRouter(store));
+app.use('/api', actionsRouter(store));
 
 // Run startup migrations (non-blocking)
 runMigrations().catch(err => console.error('[migrate] startup error:', err.message));
@@ -145,7 +151,7 @@ runMigrations().catch(err => console.error('[migrate] startup error:', err.messa
 app.listen(config.port, () => {
   const enabled = collectors.filter(c => c.enabled).map(c => c.name);
   const disabled = collectors.filter(c => !c.enabled).map(c => c.name);
-  console.log(`[sentinel-api] v1.0.0 listening on :${config.port}`);
+  console.log(`[sentinel-api] v2.0.0 listening on :${config.port}`);
   console.log(`[sentinel-api] collectors enabled: ${enabled.join(', ') || 'none'}`);
   if (disabled.length) console.log(`[sentinel-api] collectors disabled (missing config): ${disabled.join(', ')}`);
 });

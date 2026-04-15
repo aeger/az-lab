@@ -2,12 +2,22 @@ import { config } from '../config';
 import type { SentinelNotification, NotificationStatus, QueryOptions, NotificationsResponse, HistoryResponse } from '../types';
 import { severityToUrgency } from '../types';
 
+export interface NotificationSettings {
+  sounds: Record<string, boolean>;
+  thresholds: Record<string, number>;
+  enabledSources: Record<string, boolean>;
+  snoozeMinutes: number;
+  fusionMode?: boolean;
+}
+
 export class NotificationStore {
   private notifications = new Map<string, SentinelNotification>();
   private seen = new Set<string>();
   private pruneTimer: NodeJS.Timeout | null = null;
   private onNewCallbacks: Array<(n: SentinelNotification) => void> = [];
   private persistErrors = new Map<string, number>();
+  private settings: NotificationSettings | null = null;
+  private snoozed = new Map<string, number>(); // key -> until timestamp
 
   onNew(cb: (n: SentinelNotification) => void) {
     this.onNewCallbacks.push(cb);
@@ -232,5 +242,75 @@ export class NotificationStore {
         this.seen.delete(`${n.source}:${n.category}:${n.sourceId}`);
       }
     }
+  }
+
+  async getSettings(): Promise<NotificationSettings | null> {
+    if (this.settings) return this.settings;
+    // Load from Supabase if configured
+    const key = config.supabase.serviceKey || config.supabase.anonKey;
+    if (config.supabase.url && key) {
+      try {
+        const url = `${config.supabase.url}/rest/v1/sentinel_settings?select=*`;
+        const res = await fetch(url, {
+          headers: {
+            'apikey': key,
+            'Authorization': `Bearer ${key}`,
+          },
+        });
+        if (res.ok) {
+          const rows: any[] = await res.json();
+          if (rows.length > 0) {
+            this.settings = rows[0].settings as NotificationSettings;
+            return this.settings;
+          }
+        }
+      } catch (err) {
+        console.error('[store] failed to load settings:', err);
+      }
+    }
+    return null;
+  }
+
+  async saveSettings(settings: NotificationSettings): Promise<void> {
+    this.settings = settings;
+    const key = config.supabase.serviceKey || config.supabase.anonKey;
+    if (config.supabase.url && key) {
+      try {
+        const url = `${config.supabase.url}/rest/v1/sentinel_settings`;
+        await fetch(url, {
+          method: 'POST',
+          headers: {
+            'apikey': key,
+            'Authorization': `Bearer ${key}`,
+            'Content-Type': 'application/json',
+            'Prefer': 'resolution=ignore-duplicates',
+          },
+          body: JSON.stringify({ id: 'default', settings }),
+        });
+      } catch (err) {
+        console.error('[store] failed to save settings:', err);
+      }
+    }
+  }
+
+  async setSnoozed(key: string, minutes: number): Promise<void> {
+    const until = Date.now() + minutes * 60 * 1000;
+    this.snoozed.set(key, until);
+  }
+
+  isSnoozed(key: string): boolean {
+    const until = this.snoozed.get(key);
+    if (!until) return false;
+    if (Date.now() > until) {
+      this.snoozed.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  async checkExtensionHealth(extensionId: string): Promise<boolean> {
+    // Check if extension has recent heartbeat
+    // This is a simple check — in production, would query registered clients
+    return true;
   }
 }
