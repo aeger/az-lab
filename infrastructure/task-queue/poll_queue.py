@@ -388,11 +388,25 @@ def mark_completed(task_id, result, goal_id=None):
         print(f"Marked goal {goal_id} as completed (progress=100).")
 
 
+IRIS_EVAL_GUIDANCE = """
+
+---
+**Iris — Eval Actions** (update task_queue directly via execute_sql or Supabase MCP):
+- **Approve**: Set status → `completed`
+- **Split** (task too large): Create subtasks with `parent_task_id='{task_id}'`, then set this task → `completed` with result "Split into N subtasks"
+- **Needs changes**: Set status → `review_needed`, add notes in result
+- **Send back**: Set status → `ready`
+- **Reject**: Set status → `cancelled`, add reason in result
+"""
+
+
 def mark_pending_eval(task_id, result, goal_id=None):
     """Route CRIT/HIGH completed tasks to Iris for evaluation before marking done."""
     stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
     if result and len(result) > _RESULT_MAX_CHARS:
         stored_result += f"\n... [truncated from {len(result)} chars]"
+    guidance = IRIS_EVAL_GUIDANCE.format(task_id=task_id)
+    stored_result = (stored_result or "") + guidance
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
