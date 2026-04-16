@@ -38,7 +38,7 @@ HOSTNAME = socket.gethostname()
 # Model tiering — route tasks to the right model based on priority and tags
 MODEL_DEFAULT = "claude-sonnet-4-6"          # medium/high (priority 1-2)
 MODEL_HAIKU   = "claude-haiku-4-5-20251001"  # low priority (3+) or tagged "haiku"/"quick"
-MODEL_OPUS    = "claude-opus-4-6"            # CRIT (priority 0), default heavy-reasoning path
+MODEL_OPUS    = "claude-opus-4-7"            # CRIT (priority 0), default heavy-reasoning path
 MODEL_GEMINI3 = "gemini-3-deep-think"        # CRIT with "gemini"/"deepthink" tag
 
 # Google Generative AI API (Gemini 3 Deep Think)
@@ -114,21 +114,37 @@ Respond with ONLY the target name, nothing else. No punctuation, no explanation.
 Task title: {title}
 Task description: {description}"""
 
-# Discord notifications via webhook (more reliable than bot DMs)
-DISCORD_WEBHOOK_FILE = os.path.expanduser("~/claude/agent-bus/discord_webhooks.json")
+# Discord notifications — via bot API (agent-bus/notify.py), webhook fallback
+_NOTIFY_MOD = None
 
-def _get_webhook_url():
+def _get_notify():
+    global _NOTIFY_MOD
+    if _NOTIFY_MOD is not None:
+        return _NOTIFY_MOD
     try:
-        with open(DISCORD_WEBHOOK_FILE) as f:
-            hooks = json.load(f)
-            return hooks.get("claude-code")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "notify",
+            os.path.expanduser("~/claude/agent-bus/notify.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _NOTIFY_MOD = mod
     except Exception:
-        return None
+        _NOTIFY_MOD = False  # sentinel: don't retry
+    return _NOTIFY_MOD
 
 def discord_notify(message):
     """Post a notification to the claude-code Discord channel. Best-effort — never raises."""
     try:
-        url = _get_webhook_url()
+        mod = _get_notify()
+        if mod:
+            mod.send(message)
+            return
+        # Legacy webhook fallback
+        webhook_file = os.path.expanduser("~/claude/agent-bus/discord_webhooks.json")
+        with open(webhook_file) as f:
+            url = json.load(f).get("claude-code")
         if not url:
             return
         body = json.dumps({"content": message}).encode()
@@ -313,16 +329,21 @@ def mark_in_progress(task_id):
     pass  # 'claimed' already signals in-progress; schema has no in_progress status
 
 
+_AUTO_COMPLETABLE_STATUSES = {"in_progress", "active", "claimed"}
+
 def update_goal_notes(goal_id, note_line, progress=None, status=None):
     """Append a timestamped note to goals.notes, optionally update progress/status. Best-effort."""
     try:
-        rows = api_request("GET", "goals", params={"id": f"eq.{goal_id}", "select": "notes"})
-        existing = (rows[0].get("notes") or "") if rows else ""
-        updated = (existing.rstrip("\n") + "\n" + note_line).lstrip("\n")
+        rows = api_request("GET", "goals", params={"id": f"eq.{goal_id}", "select": "notes,status"})
+        existing_notes = (rows[0].get("notes") or "") if rows else ""
+        current_status = (rows[0].get("status") or "") if rows else ""
+        updated = (existing_notes.rstrip("\n") + "\n" + note_line).lstrip("\n")
         patch = {"notes": updated}
         if progress is not None:
             patch["progress"] = progress
-        if status is not None:
+        # Only auto-set status if the goal is currently in an active state.
+        # This prevents overriding a manual status reset (e.g. planned) back to completed.
+        if status is not None and (status != "completed" or current_status in _AUTO_COMPLETABLE_STATUSES):
             patch["status"] = status
         api_request("PATCH", f"goals?id=eq.{goal_id}", data=patch)
     except Exception as e:
