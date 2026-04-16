@@ -332,12 +332,27 @@ def mark_in_progress(task_id):
 _AUTO_COMPLETABLE_STATUSES = {"in_progress", "active", "claimed"}
 
 def update_goal_notes(goal_id, note_line, progress=None, status=None):
-    """Append a timestamped note to goals.notes, optionally update progress/status. Best-effort."""
+    """Append a timestamped note to goals.notes (JSON array format), optionally update progress/status. Best-effort."""
     try:
         rows = api_request("GET", "goals", params={"id": f"eq.{goal_id}", "select": "notes,status"})
-        existing_notes = (rows[0].get("notes") or "") if rows else ""
+        existing_raw = (rows[0].get("notes") or "") if rows else ""
         current_status = (rows[0].get("status") or "") if rows else ""
-        updated = (existing_notes.rstrip("\n") + "\n" + note_line).lstrip("\n")
+
+        # Parse existing notes — support both JSON array (new) and plain text (legacy)
+        existing_items = []
+        if existing_raw:
+            try:
+                parsed = json.loads(existing_raw)
+                if isinstance(parsed, list):
+                    existing_items = [str(x) for x in parsed if x]
+            except (json.JSONDecodeError, ValueError):
+                # Legacy plain text — migrate to single-item array
+                existing_items = [existing_raw] if existing_raw.strip() else []
+
+        # Append new note as a new item
+        existing_items.append(note_line)
+        updated = json.dumps(existing_items)
+
         patch = {"notes": updated}
         if progress is not None:
             patch["progress"] = progress
