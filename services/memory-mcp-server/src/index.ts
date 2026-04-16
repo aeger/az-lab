@@ -646,13 +646,52 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 014 skipped:", err.message);
   }
+
+  // Migration 017: Dual-BM25 hybrid_recall — adds search_vector plain lane to RRF fusion
+  // hybrid_recall now uses 4 retrieval lanes: pgvector cosine + BM25 weighted (search_vec) +
+  // BM25 plain (search_vector GENERATED ALWAYS) + trigram fallback (code identifiers).
+  // RRF weights: vec=1.0, bm25_weighted=1.2, bm25_plain=0.8, trgm=0.5. A-MAC scoring preserved.
+  try {
+    const { data, error } = await supabase.rpc("apply_dual_bm25_hybrid_recall_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 017 RPC not yet registered — apply migrations/017_dual_bm25_hybrid_recall.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 017 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 017 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 017 skipped:", err.message);
+  }
+
+  // Migration 018: Type-differentiated decay half-lives (arxiv 2502.06975)
+  // project memories → 7-day half-life (λ=0.0990); feedback/user/reference → 30-day (λ=0.0231)
+  // Prevents stale task context from contaminating recall of durable facts.
+  try {
+    const { data, error } = await supabase.rpc("apply_type_decay_migration_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 018 RPC not yet registered — apply migrations/018_type_differentiated_decay.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 018 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 018 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 018 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "4.7.0",
+    version: "4.9.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -875,23 +914,24 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
             const filteredIds = new Set(filtered.map((m: any) => m.id));
             const boostedExtras: Map<string, { mem: any; boost: number }> = new Map();
 
-            // For each top result, fetch its links and check for temporal/causal types
+            // Spreading activation: for each top result, fetch 1-hop links (all types, strength > 0.72)
+            // Surfaces contextually connected memories that pure cosine similarity misses (Synapse 2026)
             const linkFetches = await Promise.all(
               filtered.map(async (m: any) => {
                 const { data: links } = await supabase
                   .from("memory_links")
                   .select("target_id, link_type, strength")
                   .eq("source_id", m.id)
-                  .in("link_type", ["temporal", "causal"]);
+                  .gte("strength", 0.72);
                 return { sourceId: m.id, links: links || [] };
               })
             );
 
-            // Collect unique target IDs for temporal/causal links not already in results
+            // Collect unique target IDs from spreading activation (cap at 5 extra memories)
             const tcTargetIds: string[] = [];
             for (const { links } of linkFetches) {
               for (const link of links) {
-                if (!filteredIds.has(link.target_id) && !tcTargetIds.includes(link.target_id)) {
+                if (!filteredIds.has(link.target_id) && !tcTargetIds.includes(link.target_id) && tcTargetIds.length < 5) {
                   tcTargetIds.push(link.target_id);
                 }
               }
@@ -957,11 +997,11 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
               const scoreStr = ` (score ${((mem.hybrid_score || 0) * 100).toFixed(0)}% +boost:${(boost * 100).toFixed(0)}%)`;
               const trust = SOURCE_TRUST[mem.source] ? ` · trust:${SOURCE_TRUST[mem.source]}` : "";
               const conflictFlag = mem.conflict_flagged ? " ⚠️" : "";
-              results.push(`## ${mem.name} (${mem.type})${tagStr}${scoreStr}${trust}${conflictFlag} [temporal/causal link]\n_${mem.description}_\n\n${mem.content}`);
+              results.push(`## ${mem.name} (${mem.type})${tagStr}${scoreStr}${trust}${conflictFlag} [spreading-activation]\n_${mem.description}_\n\n${mem.content}`);
             }
 
             const totalCount = filtered.length + boostedExtras.size;
-            const boostNote = boostedExtras.size > 0 ? ` (${boostedExtras.size} added via temporal/causal links)` : "";
+            const boostNote = boostedExtras.size > 0 ? ` (${boostedExtras.size} added via spreading-activation)` : "";
             return {
               content: [{ type: "text" as const, text: `Found ${totalCount} memor${totalCount === 1 ? "y" : "ies"} (${hybridModeLabel})${boostNote}:\n\n${results.join("\n\n---\n\n")}` }],
             };
@@ -1068,7 +1108,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         return { content: [{ type: "text" as const, text: `Error creating link: ${error.message}` }] };
       }
 
-      const boostNote = ltype === "temporal" || ltype === "causal" ? " (recall-boosted)" : "";
+      const boostNote = str >= 0.72 ? " (spreading-activation eligible)" : "";
       console.log(`[aip] add_memory_link "${srcMem.name}"→"${tgtMem.name}" by ${callerIdentity || "unverified"}`);
       return {
         content: [{ type: "text" as const, text: `Linked "${srcMem.name}" → "${tgtMem.name}" (${rel}, type:${ltype}${boostNote}, strength ${str.toFixed(2)})` }],
@@ -1784,7 +1824,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "4.7.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "4.9.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -1855,7 +1895,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v4.7.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v4.9.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
