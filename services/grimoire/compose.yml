@@ -1,0 +1,31 @@
+name: az-lab-grimoire
+
+services:
+  grimoire:
+    image: az-grimoire:latest
+    build:
+      context: /home/almty1/grimoire
+      dockerfile: /home/almty1/grimoire/Dockerfile
+    container_name: az-grimoire
+    restart: unless-stopped
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - SUPABASE_URL=${SUPABASE_URL:-}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:-}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY:-}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-}
+      - NEXTAUTH_URL=https://grimoire.az-lab.dev
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grimoire.rule=Host(`grimoire.az-lab.dev`)"
+      - "traefik.http.routers.grimoire.entrypoints=websecure"
+      - "traefik.http.routers.grimoire.tls=true"
+      - "traefik.http.routers.grimoire.tls.certresolver=le"
+      - "traefik.http.routers.grimoire.middlewares=lan-allow@file"
+      - "traefik.http.services.grimoire.loadbalancer.server.port=3000"
+
+networks:
+  proxy:
+    external: true
