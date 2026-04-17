@@ -14,7 +14,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 SUPABASE_URL = "https://ogqjjlbupqnvlcyrfnxi.supabase.co"
 
@@ -363,6 +363,79 @@ def update_goal_notes(goal_id, note_line, progress=None, status=None):
         api_request("PATCH", f"goals?id=eq.{goal_id}", data=patch)
     except Exception as e:
         print(f"update_goal_notes failed (non-fatal): {e}", file=sys.stderr)
+
+
+def _next_cron_str(schedule: str) -> str | None:
+    """Return ISO timestamp of next run for a schedule string.
+
+    Supported: 'daily', 'weekly', or a 5-field cron expression.
+    Returns None if the schedule is unrecognized (treat as one-time).
+    """
+    now = datetime.now(timezone.utc)
+    if schedule == "daily":
+        return (now + timedelta(days=1)).isoformat()
+    if schedule == "weekly":
+        return (now + timedelta(weeks=1)).isoformat()
+    # Try basic cron expression parsing (5 fields: min hour dom mon dow)
+    parts = schedule.strip().split()
+    if len(parts) == 5:
+        try:
+            minute = int(parts[0]) if parts[0] != "*" else now.minute
+            hour   = int(parts[1]) if parts[1] != "*" else now.hour
+            # Find the next occurrence at the specified hour:minute
+            candidate = now.replace(minute=minute, hour=hour, second=0, microsecond=0)
+            if candidate <= now:
+                candidate += timedelta(days=1)
+            # Handle day-of-week (0=Sun…6=Sat, or 7=Sun)
+            if parts[4] != "*":
+                target_dow = int(parts[4]) % 7  # normalize 7→0 (Sun)
+                days_ahead = (target_dow - candidate.weekday() - 1) % 7
+                candidate += timedelta(days=days_ahead)
+            return candidate.isoformat()
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def requeue_recurring(task: dict) -> bool:
+    """If the task has a recurring_schedule, create the next occurrence and return True."""
+    ctx = task.get("context") or {}
+    # Schedule stored in context.recurring_schedule (no column migration required)
+    schedule = ctx.get("recurring_schedule") or task.get("recurring_schedule") or ""
+    schedule = schedule.strip()
+    if not schedule:
+        return False
+
+    next_run = _next_cron_str(schedule)
+    if not next_run:
+        print(f"Unrecognized schedule '{schedule}' on task {task['id']} — treating as one-time.")
+        return False
+
+    # Copy the original task as a new ready task, preserving key fields
+    new_ctx = {k: v for k, v in ctx.items() if k not in ("checklist", "archived_at", "pre_archive_status", "_retry_hint", "_prior_failure")}
+    new_ctx["recurring_schedule"] = schedule
+    new_ctx["recurring_parent_id"] = task["id"]
+
+    new_task = {
+        "title": task.get("title", ""),
+        "description": task.get("description"),
+        "priority": task.get("priority", 2),
+        "target": task.get("target"),
+        "tags": task.get("tags") or [],
+        "source": "recurring",
+        "status": "ready",
+        "goal_id": task.get("goal_id"),
+        "context": new_ctx,
+    }
+    try:
+        created = api_request("POST", "task_queue", data=new_task)
+        new_id = created[0]["id"] if isinstance(created, list) else created.get("id", "?")
+        print(f"Recurring: queued next occurrence {new_id} (schedule={schedule}, next≈{next_run[:16]})")
+        log_activity("status", f"Recurring re-queue: {schedule} → task {new_id}", task_id=task["id"])
+        return True
+    except Exception as e:
+        print(f"Failed to requeue recurring task: {e}", file=sys.stderr)
+        return False
 
 
 def mark_completed(task_id, result, goal_id=None):
@@ -1071,6 +1144,7 @@ def main():
             print(f"Task {task_id} pending evaluation by Iris.")
         else:
             mark_completed(task_id, result, goal_id=goal_id)
+            requeue_recurring(task)
             discord_notify(f"✅ Done: {title} — {summary}")
             print(f"Task {task_id} completed.")
     except Exception as e:
