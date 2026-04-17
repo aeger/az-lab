@@ -956,8 +956,68 @@ def mark_pending_jeff_action(task_id: str, result: str, reason: str, title: str 
     print(f"Task {task_id} transitioned to pending_jeff_action.")
 
 
+def recover_stuck_tasks():
+    """Reset tasks stuck in claimed/in_progress_agent for >30 min with no recent agent_activity."""
+    from datetime import timedelta
+    try:
+        cutoff_claimed = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        stuck = api_request(
+            "GET",
+            "task_queue",
+            params={
+                "status": "in.(claimed,in_progress_agent)",
+                "claimed_at": f"lt.{cutoff_claimed}",
+                "select": "id,title,claimed_at",
+                "limit": "20",
+            },
+        )
+        if not stuck:
+            return
+
+        cutoff_activity = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        recovered = []
+        for task in stuck:
+            task_id = task["id"]
+            # Check for recent agent_activity on this task
+            recent = api_request(
+                "GET",
+                "agent_activity",
+                params={
+                    "task_id": f"eq.{task_id}",
+                    "created_at": f"gt.{cutoff_activity}",
+                    "select": "id",
+                    "limit": "1",
+                },
+            )
+            if recent:
+                continue  # still alive — skip
+
+            # No recent activity → reset to ready
+            api_request(
+                "PATCH",
+                f"task_queue?id=eq.{task_id}",
+                data={"status": "ready", "claimed_by": None, "claimed_at": None},
+            )
+            log_activity("status", f"Auto-recovered stuck task → ready", task_id=task_id)
+            recovered.append(task["title"])
+            print(f"Recovered stuck task {task_id}: {task['title']}")
+
+        if recovered:
+            titles = ", ".join(recovered[:3])
+            extra = f" (+{len(recovered) - 3} more)" if len(recovered) > 3 else ""
+            discord_notify(
+                f"♻️ **Stuck task recovery:** {len(recovered)} task(s) reset to ready\n"
+                f"{titles}{extra}"
+            )
+    except Exception as e:
+        print(f"recover_stuck_tasks failed (non-fatal): {e}", file=sys.stderr)
+
+
 def main():
     print(f"[{datetime.now().isoformat()}] Polling task queue on {HOSTNAME}...")
+
+    # Auto-recover tasks stuck in claimed/in_progress_agent
+    recover_stuck_tasks()
 
     # Route any unclassified tasks first
     route_auto_tasks()
