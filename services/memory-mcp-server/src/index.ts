@@ -685,13 +685,32 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 018 skipped:", err.message);
   }
+
+  // Migration 020: Fix oid-ambiguous sentinel + add concurrent_write conflict type
+  // Also extends memory_conflicts constraint to allow 'concurrent_write' type.
+  // Apply migrations/020_fixes_and_concurrent_write.sql via Supabase SQL editor if needed.
+  try {
+    const { data, error } = await supabase.rpc("apply_migration_020_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 020 RPC not yet registered — apply migrations/020_fixes_and_concurrent_write.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 020 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 020 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 020 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "4.9.0",
+    version: "5.0.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -728,10 +747,10 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       const src = callerIdentity || source || "claude-code";
       const memTags = tags || [];
 
-      // Fetch existing same-name memory (with content for NOOP check)
+      // Fetch existing same-name memory (with content for NOOP check + concurrent write detection)
       const { data: existing } = await supabase
         .from("memories")
-        .select("id, content")
+        .select("id, content, agent_id, updated_at")
         .eq("name", name)
         .maybeSingle();
 
@@ -743,6 +762,31 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         // Mem0 NOOP: content is essentially unchanged — skip write
         if (existing.content && textSimilarity(existing.content, content) >= 0.85) {
           return { content: [{ type: "text" as const, text: `NOOP: Memory "${name}" content is unchanged (Jaccard ≥ 85%). No write needed.` }] };
+        }
+
+        // ── Rec 3: Concurrent write detection (last-write-wins with conflict logging) ──
+        // If a different agent wrote this memory within the last 30 minutes, log the conflict.
+        // We still apply the write (last-write-wins) but record it for audit purposes.
+        if (agent_id && existing.agent_id && existing.agent_id !== agent_id && existing.updated_at) {
+          const minutesSinceLastWrite = (Date.now() - new Date(existing.updated_at).getTime()) / 60000;
+          if (minutesSinceLastWrite < 30) {
+            // Log to agent_activity as a status event (memory_log has action constraint)
+            await supabase.from("agent_activity").insert({
+              agent: agent_id,
+              activity_type: "status",
+              content: `[concurrent_write] "${name}" overwritten by ${agent_id} ${Math.round(minutesSinceLastWrite)}m after ${existing.agent_id} wrote it — last-write-wins applied`,
+              metadata: {
+                memory_name: name,
+                prior_agent: existing.agent_id,
+                overwriting_agent: agent_id,
+                minutes_since_prior_write: Math.round(minutesSinceLastWrite),
+                last_write_wins: true,
+              },
+            });
+            // Also flag the memory for review
+            await supabase.from("memories").update({ conflict_flagged: true }).eq("id", existing.id);
+            console.log(`[concurrent_write] "${name}": ${agent_id} overwrote ${existing.agent_id}'s write from ${Math.round(minutesSinceLastWrite)}m ago`);
+          }
         }
 
         const update: Record<string, unknown> = { type, description, content, tags: memTags, source: src };
@@ -1437,6 +1481,94 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
     }
   );
 
+  // ── Tool: record_task_completion ─────────────────────────────────────────────
+  // Rec 2: Post-task skill auto-capture hook. Call at the end of any multi-step task.
+  // If tool_count >= 5, auto-generates a skill draft and saves it to the skills table.
+  server.tool(
+    "record_task_completion",
+    "Record a completed task for procedural memory capture. If tool_count >= 5, automatically extracts and saves a reusable skill to the skills table. Call this at the end of any complex multi-step task.",
+    {
+      task_summary: z.string().describe("Brief description of what was accomplished"),
+      tool_count: z.number().int().min(0).describe("Number of tool calls made during this task"),
+      steps: z.array(z.string()).optional().describe("Key steps taken (ordered) — used to generate skill content"),
+      agent_id: z.string().optional().describe("Agent completing the task (e.g. 'wren', 'iris')"),
+      skill_name: z.string().optional().describe("Override auto-generated skill name slug (kebab-case)"),
+    },
+    async ({ task_summary, tool_count, steps, agent_id, skill_name }) => {
+      const src = callerIdentity || agent_id || "claude-code";
+
+      // Log task completion to agent_activity regardless of tool_count
+      await supabase.from("agent_activity").insert({
+        agent: src,
+        activity_type: "status",
+        content: `[task_complete] ${task_summary} (${tool_count} tool calls)`,
+        metadata: { tool_count, skill_captured: tool_count >= 5 },
+      });
+
+      if (tool_count < 5) {
+        return { content: [{ type: "text" as const, text: `Task logged (${tool_count} tool calls — below 5 threshold, no skill auto-captured).` }] };
+      }
+
+      // ── Auto-generate skill name from task summary ──────────────────────────
+      const stopwords = new Set(["the","and","for","with","from","this","that","into","via","using","when","then","also","after","before"]);
+      const autoWords = task_summary.toLowerCase().match(/\b[a-z]{3,}\b/g)?.filter((w) => !stopwords.has(w)).slice(0, 5) || [];
+      const autoName = skill_name || (autoWords.length >= 2 ? autoWords.join("-") : `auto-skill-${Date.now()}`);
+
+      // ── Build skill content from steps or summary ───────────────────────────
+      const stepsContent = steps?.length
+        ? `## Steps\n${steps.map((s, i) => `${i + 1}. ${s}`).join("\n")}`
+        : `## Task Summary\n${task_summary}`;
+
+      let skillContent = `${stepsContent}\n\n## Notes\n- Auto-captured from ${tool_count}-tool-call session by ${src} on ${new Date().toISOString().slice(0, 10)}`;
+
+      // ── LLM enhancement (optional — uses NemoClaw NIM API if configured) ───
+      if (LLM_URL && steps?.length) {
+        try {
+          const llmResp = await fetch(`${LLM_URL}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...(NVIDIA_API_KEY ? { Authorization: `Bearer ${NVIDIA_API_KEY}` } : {}) },
+            body: JSON.stringify({
+              model: LLM_MODEL,
+              messages: [{
+                role: "user",
+                content: `Convert this task completion record into a concise, reusable skill guide in markdown (max 400 words). Focus on steps that can be reused in future sessions.\n\nTask: ${task_summary}\nTool calls: ${tool_count}\nKey steps:\n${steps.join("\n")}`,
+              }],
+              max_tokens: 600,
+            }),
+            signal: AbortSignal.timeout(15000),
+          });
+          if (llmResp.ok) {
+            const llmJson = await llmResp.json() as any;
+            const llmContent = llmJson.choices?.[0]?.message?.content;
+            if (llmContent) skillContent = llmContent + `\n\n_Auto-captured from ${tool_count}-tool-call session by ${src}_`;
+          }
+        } catch { /* fall through to heuristic content */ }
+      }
+
+      // ── Check if skill already exists ───────────────────────────────────────
+      const { data: existingSkill } = await supabase.from("skills").select("id").eq("name", autoName).maybeSingle();
+      const skillEmbedding = await embed(embedInput(autoName, task_summary, skillContent));
+
+      if (existingSkill) {
+        const upd: Record<string, unknown> = { description: task_summary, content: skillContent, source: src };
+        if (skillEmbedding) upd.embedding = JSON.stringify(skillEmbedding);
+        const { error } = await supabase.from("skills").update(upd).eq("id", existingSkill.id);
+        if (error) return { content: [{ type: "text" as const, text: `Auto-capture failed (update): ${error.message}` }] };
+        return { content: [{ type: "text" as const, text: `Auto-updated skill "${autoName}" (${tool_count} tool calls, ${src}). Review with list_skills.` }] };
+      }
+
+      const ins: Record<string, unknown> = {
+        name: autoName, title: task_summary, description: task_summary,
+        content: skillContent, source: src, triggers: [], platforms: [],
+      };
+      if (skillEmbedding) ins.embedding = JSON.stringify(skillEmbedding);
+
+      const { error } = await supabase.from("skills").insert(ins);
+      if (error) return { content: [{ type: "text" as const, text: `Auto-capture failed (insert): ${error.message}` }] };
+      return { content: [{ type: "text" as const, text: `Auto-captured skill "${autoName}" from ${tool_count}-tool-call task. Review and refine with list_skills / save_skill.` }] };
+    }
+  );
+
   // ── Tool: recall_skill ───────────────────────────────────────────────────────
   server.tool(
     "recall_skill",
@@ -1823,8 +1955,8 @@ app.use((req: Request, res: Response, next: () => void) => {
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "4.9.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 7; // +7: memory blocks (get/set) + add_memory_link + record_task_completion; r2: remember_file, recall_file, forget_file, store_file, get_file
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.0.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
