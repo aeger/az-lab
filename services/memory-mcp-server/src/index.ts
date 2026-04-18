@@ -704,13 +704,31 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 020 skipped:", err.message);
   }
+
+  // Migration 021: Skills decay scoring — last_used, success_rate, updated match_skills RPC
+  // Apply migrations/021_skills_decay_scoring.sql via Supabase SQL editor if needed.
+  try {
+    const { data, error } = await supabase.rpc("apply_skills_decay_scoring_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 021 RPC not yet registered — apply migrations/021_skills_decay_scoring.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 021 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 021 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 021 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.0.0",
+    version: "5.1.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -1493,8 +1511,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       steps: z.array(z.string()).optional().describe("Key steps taken (ordered) — used to generate skill content"),
       agent_id: z.string().optional().describe("Agent completing the task (e.g. 'wren', 'iris')"),
       skill_name: z.string().optional().describe("Override auto-generated skill name slug (kebab-case)"),
+      success: z.boolean().optional().describe("Whether the task succeeded (true) or failed (false). Updates success_rate on the named skill if provided."),
     },
-    async ({ task_summary, tool_count, steps, agent_id, skill_name }) => {
+    async ({ task_summary, tool_count, steps, agent_id, skill_name, success }) => {
       const src = callerIdentity || agent_id || "claude-code";
 
       // Log task completion to agent_activity regardless of tool_count
@@ -1502,8 +1521,20 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         agent: src,
         activity_type: "status",
         content: `[task_complete] ${task_summary} (${tool_count} tool calls)`,
-        metadata: { tool_count, skill_captured: tool_count >= 5 },
+        metadata: { tool_count, skill_captured: tool_count >= 5, success },
       });
+
+      // ── Update skill success_rate if skill_name + success provided ──────────
+      if (skill_name !== undefined && success !== undefined) {
+        const { data: existingSkill } = await supabase.from("skills").select("id, use_count, success_rate").eq("name", skill_name).maybeSingle();
+        if (existingSkill) {
+          const n = Math.max((existingSkill.use_count || 1), 1);
+          const oldRate = existingSkill.success_rate ?? 0.5;
+          // Bayesian incremental mean: new_rate = old_rate + (outcome - old_rate) / n
+          const newRate = Math.max(0, Math.min(1, oldRate + ((success ? 1.0 : 0.0) - oldRate) / n));
+          await supabase.from("skills").update({ success_rate: newRate }).eq("id", existingSkill.id);
+        }
+      }
 
       if (tool_count < 5) {
         return { content: [{ type: "text" as const, text: `Task logged (${tool_count} tool calls — below 5 threshold, no skill auto-captured).` }] };
@@ -1584,7 +1615,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (name) {
         const { data, error } = await supabase.from("skills").select("*").eq("name", name).maybeSingle();
         if (error || !data) return { content: [{ type: "text" as const, text: `Skill "${name}" not found.` }] };
-        await supabase.from("skills").update({ use_count: (data.use_count || 0) + 1 }).eq("id", data.id);
+        await supabase.from("skills").update({ use_count: (data.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", data.id);
         return { content: [{ type: "text" as const, text: `# ${data.title}\n_${data.description}_\n\n${data.content}` }] };
       }
 
@@ -1593,7 +1624,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (queryEmbedding) {
           const { data, error } = await supabase.rpc("match_skills", { query_embedding: JSON.stringify(queryEmbedding), match_count: maxResults });
           if (!error && data?.length > 0) {
-            for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1 }).eq("id", s.id);
+            for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", s.id);
             const results = data.map((s: any) => `# ${s.title} (${(s.similarity * 100).toFixed(0)}% match)\n_${s.description}_\n\n${s.content}`);
             return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
           }
@@ -1602,7 +1633,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const { data, error } = await supabase.from("skills").select("*")
           .or(`name.ilike.%${query}%,title.ilike.%${query}%,description.ilike.%${query}%`).limit(maxResults);
         if (error || !data?.length) return { content: [{ type: "text" as const, text: "No matching skills found." }] };
-        const results = data.map((s) => `# ${s.title}\n_${s.description}_\n\n${s.content}`);
+        for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", s.id);
+        const results = data.map((s: any) => `# ${s.title}\n_${s.description}_\n\n${s.content}`);
         return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
       }
 
@@ -1956,7 +1988,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 7; // +7: memory blocks (get/set) + add_memory_link + record_task_completion; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.0.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.1.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -2027,7 +2059,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v4.9.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v5.1.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
