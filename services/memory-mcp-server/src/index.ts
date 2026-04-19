@@ -523,6 +523,23 @@ async function applyStartupMigrations(): Promise<void> {
     console.warn("Migration 005 skipped:", err.message);
   }
 
+  // Migration 006: episodic + semantic types in memories.type check constraint
+  try {
+    const { data, error } = await supabase.rpc("apply_episodic_semantic_types_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 006 RPC not yet registered — apply migrations/006_episodic_semantic_types.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 006 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 006 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 006 skipped:", err.message);
+  }
+
   // Migration 007: BM25 search_vector GENERATED ALWAYS + updated hybrid_recall
   try {
     const { data, error } = await supabase.rpc("apply_bm25_migration_if_missing");

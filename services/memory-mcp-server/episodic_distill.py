@@ -501,7 +501,24 @@ def main():
     start = datetime.now(timezone.utc)
 
     # 1. Fetch high-access memories eligible for consolidation
-    # Target project/feedback/reference — az-lab does not use 'episodic' type
+    # Phase 0: pure episodic type memories (any access count, older than 6h)
+    episodic_cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    try:
+        episodic_memories = supa_get("memories", {
+            "type": "eq.episodic",
+            "tags": f"not.cs.{{{CONSOLIDATED_TAG}}}",
+            "created_at": f"lt.{episodic_cutoff}",
+            "select": "id,name,description,content,tags,access_count,embedding",
+            "order": "created_at.asc",
+            "limit": "200",
+        })
+    except Exception as e:
+        log.warning(f"Failed to fetch episodic type memories: {e}")
+        episodic_memories = []
+
+    # Phase 1: high-access project/feedback/reference memories
+    # Target project/feedback/reference — these are used as the primary az-lab types.
+    # Episodic type memories are handled in Phase 0 above.
     try:
         memories = supa_get("memories", {
             "type": "in.(project,feedback,reference)",
@@ -515,7 +532,7 @@ def main():
         log.error(f"Failed to fetch memories for consolidation: {e}")
         sys.exit(1)
 
-    log.info(f"Found {len(memories)} eligible memories for consolidation (access_count>={MIN_ACCESS_COUNT})")
+    log.info(f"Found {len(episodic_memories)} pure episodic type memories, {len(memories)} high-access memories for consolidation (access_count>={MIN_ACCESS_COUNT})")
 
     use_nemoclaw = bool(NEMOCLAW_KEY)
     use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
@@ -527,6 +544,79 @@ def main():
     else:
         llm_status = "heuristic"
     log.info(f"Summarization mode: {llm_status}")
+
+    # ── Phase 0: Consolidate pure episodic type memories → semantic ──────────
+    p0_created = 0
+    if episodic_memories:
+        log.info(f"=== Phase 0: Pure episodic type consolidation ({len(episodic_memories)} memories) ===")
+        for m in episodic_memories:
+            emb = m.get("embedding")
+            if isinstance(emb, str):
+                try:
+                    m["embedding"] = json.loads(emb)
+                except Exception:
+                    m["embedding"] = None
+
+        ep_clusters = cluster_memories(episodic_memories)
+        # If no clusters (no embeddings), treat all as one batch
+        if not ep_clusters and episodic_memories:
+            log.info(f"[Phase 0] No embedding-based clusters — batch consolidating {len(episodic_memories)} episodic memories")
+            # Process in batches of 10
+            for i in range(0, len(episodic_memories), 10):
+                batch = episodic_memories[i:i+10]
+                content = None
+                if use_nemoclaw:
+                    content = summarize_cluster_llm(batch)
+                if not content and use_haiku:
+                    content = summarize_cluster_haiku(batch)
+                if not content:
+                    content = summarize_cluster_heuristic(batch)
+                top_mem = max(batch, key=lambda m: m.get("access_count", 0))
+                sem_name = f"semantic:{top_mem['name']}"
+                sem_id = write_semantic_memory(sem_name,
+                    f"Distilled from {len(batch)} episodic memories ({llm_status})",
+                    content, ["distilled", "episodic-origin"])
+                if sem_id:
+                    if sem_id == "ok":
+                        result = supa_get("memories", {"name": f"eq.{sem_name}", "select": "id"})
+                        sem_id = result[0]["id"] if result else None
+                    if sem_id:
+                        for ep in batch:
+                            create_link(sem_id, ep["id"], "distilled_from", "semantic")
+                        for ep in batch:
+                            mark_consolidated(ep["id"], ep.get("tags") or [])
+                        p0_created += 1
+                        log.info(f"[Phase 0] Created '{sem_name}' from {len(batch)} episodic memories")
+        else:
+            log.info(f"[Phase 0] {len(ep_clusters)} clusters found")
+            for cluster_idxs in ep_clusters[:MAX_CLUSTERS]:
+                cluster_mems = [episodic_memories[i] for i in cluster_idxs]
+                content = None
+                if use_nemoclaw:
+                    content = summarize_cluster_llm(cluster_mems)
+                if not content and use_haiku:
+                    content = summarize_cluster_haiku(cluster_mems)
+                if not content:
+                    content = summarize_cluster_heuristic(cluster_mems)
+                top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
+                sem_name = f"semantic:{top_mem['name']}"
+                sem_id = write_semantic_memory(sem_name,
+                    f"Distilled from {len(cluster_mems)} episodic memories ({llm_status})",
+                    content, ["distilled", "episodic-origin"])
+                if sem_id:
+                    if sem_id == "ok":
+                        result = supa_get("memories", {"name": f"eq.{sem_name}", "select": "id"})
+                        sem_id = result[0]["id"] if result else None
+                    if sem_id:
+                        for ep in cluster_mems:
+                            create_link(sem_id, ep["id"], "distilled_from", "semantic")
+                        for ep in cluster_mems:
+                            mark_consolidated(ep["id"], ep.get("tags") or [])
+                        p0_created += 1
+                        log.info(f"[Phase 0] Created '{sem_name}' from {len(cluster_mems)} episodic memories")
+        log.info(f"=== Phase 0 complete: {p0_created} semantic memories created from episodic ===")
+    else:
+        log.info("[Phase 0] No pure episodic type memories to process.")
 
     if not memories:
         log.info("[Phase 1] Nothing to distill.")
@@ -608,13 +698,14 @@ def main():
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     log.info(f"=== Phase 2 complete: {p2_created}/{p2_processed} clusters → reference memories ({elapsed2:.1f}s) ===")
-    log.info(f"=== Total: {created_semantic + p2_created} new memories created in {elapsed:.1f}s ===")
+    log.info(f"=== Total: {p0_created + created_semantic + p2_created} new memories created in {elapsed:.1f}s ===")
 
-    total_created = created_semantic + p2_created
+    total_created = p0_created + created_semantic + p2_created
     if total_created > 0:
-        ep_note = f"{created_semantic} semantic from episodic" if created_semantic > 0 else ""
+        p0_note = f"{p0_created} semantic from episodic-type" if p0_created > 0 else ""
+        ep_note = f"{created_semantic} semantic from high-access" if created_semantic > 0 else ""
         pr_note = f"{p2_created} reference from project" if p2_created > 0 else ""
-        parts = [p for p in [ep_note, pr_note] if p]
+        parts = [p for p in [p0_note, ep_note, pr_note] if p]
         send_discord(
             f"🧠 Memory consolidation: {', '.join(parts)} "
             f"({llm_status}, {elapsed:.0f}s)"
