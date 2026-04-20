@@ -739,13 +739,31 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 021 skipped:", err.message);
   }
+
+  // Migration 022: Skill-memory auto-linking — skill_memory_links table + link_memories_to_skills()
+  // Apply migrations/022_skill_memory_links.sql via Supabase SQL editor if needed.
+  try {
+    const { data, error } = await supabase.rpc("apply_skill_memory_links_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 022 RPC not yet registered — apply migrations/022_skill_memory_links.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 022 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 022 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 022 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.1.0",
+    version: "5.2.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -988,6 +1006,15 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
 
           if (filtered.length > 0) {
             await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
+
+            // Skill-memory auto-linking: fire-and-forget, threshold 0.75 cosine
+            // Upserts skill_memory_links rows for skills semantically close to recalled memories.
+            void Promise.resolve(supabase.rpc("link_memories_to_skills", {
+              p_memory_ids: filtered.map((m: any) => m.id),
+              p_similarity_threshold: 0.75,
+            })).then(({ data: linkCount }) => {
+              if ((linkCount as number) > 0) console.log(`[skill-link] ${linkCount} new skill-memory link(s) from recall`);
+            }).catch(() => {});
 
             // Fetch temporal/causal linked memories for all top results and apply score boost
             const filteredIds = new Set(filtered.map((m: any) => m.id));
