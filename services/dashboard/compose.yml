@@ -5,8 +5,8 @@ services:
   dashboard:
     image: az-dashboard:latest
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: /home/almty1/dashboard
+      dockerfile: /home/almty1/azlab/services/dashboard/Dockerfile
     container_name: az-dashboard
     restart: unless-stopped
     environment:
@@ -34,19 +34,16 @@ services:
       - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:-}
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
       - DISCORD_CHANNEL_ID=${DISCORD_CHANNEL_ID:-}
+      - TRAEFIK_DYNAMIC_DIR=/traefik-dynamic
       - TERMINAL_SSH_KEY=/run/secrets/terminal_ssh_key
       - TERMINAL_SSH_HOST=192.168.1.181
       - TERMINAL_SSH_USER=almty1
-      - CLOUDFLARE_DNS_API_TOKEN=${CLOUDFLARE_DNS_API_TOKEN:-}
-      - CLOUDFLARE_ZONE_ID=${CLOUDFLARE_ZONE_ID:-}
-      - TRAEFIK_DYNAMIC_DIR=/traefik-dynamic
-    stop_grace_period: 30s
-    stop_signal: SIGTERM
     volumes:
       - ./config:/app/config:ro
-      - ./data:/app/data:rw
-      - /home/almty1/.ssh/id_ed25519_claude_desktop:/run/secrets/terminal_ssh_key:ro
+      - /home/almty1/azlab/services/dashboard/data:/app/data:rw
+      - /home/almty1/.dashboard-terminal-key:/run/secrets/terminal_ssh_key:ro
       - /home/almty1/azlab/infrastructure/traefik/dynamic:/traefik-dynamic:rw
+      - /home/almty1/azlab/services/rustdesk/data:/app/rustdesk-data:ro
     networks:
       - proxy
     labels:
@@ -54,7 +51,7 @@ services:
       - "traefik.http.routers.dashboard.rule=Host(`home.az-lab.dev`)"
       - "traefik.http.routers.dashboard.entrypoints=websecure"
       - "traefik.http.routers.dashboard.tls=true"
-      - "traefik.http.routers.dashboard.tls.certresolver=le"
+      # TODO: Re-evaluate Authelia SSO for external access (photos, portainer, etc.)
       - "traefik.http.routers.dashboard.middlewares=lan-allow@file"
       - "traefik.http.services.dashboard.loadbalancer.server.port=3000"
 
@@ -63,8 +60,6 @@ services:
     image: louislam/uptime-kuma:1
     container_name: uptime-kuma
     restart: unless-stopped
-    dns:
-      - 192.168.99.2
     volumes:
       - uptime-kuma-data:/app/data
     networks:
@@ -74,7 +69,6 @@ services:
       - "traefik.http.routers.uptime-kuma.rule=Host(`uptime.az-lab.dev`)"
       - "traefik.http.routers.uptime-kuma.entrypoints=websecure"
       - "traefik.http.routers.uptime-kuma.tls=true"
-      - "traefik.http.routers.uptime-kuma.tls.certresolver=le"
       - "traefik.http.routers.uptime-kuma.middlewares=lan-allow@file"
       - "traefik.http.services.uptime-kuma.loadbalancer.server.port=3001"
 
@@ -103,7 +97,6 @@ services:
       - "traefik.http.routers.immich.rule=Host(`photos.az-lab.dev`)"
       - "traefik.http.routers.immich.entrypoints=websecure"
       - "traefik.http.routers.immich.tls=true"
-      - "traefik.http.routers.immich.tls.certresolver=le"
       - "traefik.http.routers.immich.middlewares=lan-allow@file"
       - "traefik.http.services.immich.loadbalancer.server.port=2283"
       - "traefik.docker.network=proxy"

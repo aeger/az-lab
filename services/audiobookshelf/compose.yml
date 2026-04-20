@@ -1,0 +1,36 @@
+services:
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:latest
+    container_name: audiobookshelf
+    restart: unless-stopped
+    environment:
+      - TZ=America/Phoenix
+    volumes:
+      - audiobookshelf-audiobooks:/audiobooks:Z
+      - audiobookshelf-podcasts:/podcasts:Z
+      - audiobookshelf-metadata:/metadata:Z
+      - audiobookshelf-config:/config:Z
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.audiobookshelf.rule=Host(`abs.az-lab.dev`)"
+      - "traefik.http.routers.audiobookshelf.entrypoints=websecure"
+      - "traefik.http.routers.audiobookshelf.tls=true"
+      - "traefik.http.routers.audiobookshelf.tls.certresolver=le"
+      - "traefik.http.routers.audiobookshelf.middlewares=lan-allow@file"
+      - "traefik.http.services.audiobookshelf.loadbalancer.server.port=80"
+
+networks:
+  proxy:
+    external: true
+
+volumes:
+  audiobookshelf-audiobooks:
+    external: true
+  audiobookshelf-podcasts:
+    external: true
+  audiobookshelf-metadata:
+    external: true
+  audiobookshelf-config:
+    external: true

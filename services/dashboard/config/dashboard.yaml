@@ -28,7 +28,7 @@ lab:
   adguard_url: "http://192.168.99.2"
   portainer_url: "http://192.168.1.181:9000"
   hosts:
-    - { name: "MS-01", node_exporter_instance: "node_exporter:9100" }
+    - { name: "svc-podman-01", node_exporter_instance: "node_exporter:9100" }
   quick_links:
     - { name: "Proxmox", url: "https://proxmox.az-lab.dev:8006", icon: "proxmox" }
     - { name: "Portainer", url: "https://portainer.az-lab.dev", icon: "portainer" }
@@ -37,6 +37,11 @@ lab:
     - { name: "AdGuard", url: "http://192.168.99.2", icon: "adguard" }
     - { name: "Uptime Kuma", url: "https://uptime.az-lab.dev", icon: "uptime-kuma" }
     - { name: "Immich", url: "https://photos.az-lab.dev", icon: "immich" }
+    - { name: "Calibre", url: "https://calibre.az-lab.dev", icon: "calibre" }
+    - { name: "Audiobookshelf", url: "https://abs.az-lab.dev", icon: "audiobookshelf" }
+    - { name: "Changedetection", url: "https://changedetect.az-lab.dev", icon: "changedetect" }
+    - { name: "Shelfmark", url: "https://shelfmark.az-lab.dev", icon: "shelfmark" }
+    - { name: "Grocy", url: "https://grocy.az-lab.dev", icon: "grocy" }
   tech_news_feeds:
     - { url: "https://www.reddit.com/r/homelab/.rss", name: "r/homelab" }
     - { url: "https://www.reddit.com/r/selfhosted/.rss", name: "r/selfhosted" }

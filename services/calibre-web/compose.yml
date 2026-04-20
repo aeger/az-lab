@@ -1,0 +1,31 @@
+services:
+  calibre-web-automated:
+    image: crocodilestick/calibre-web-automated:latest
+    container_name: calibre-web-automated
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Phoenix
+      - NETWORK_SHARE_MODE=false
+      - TRUSTED_PROXY_COUNT=1
+      # HARDCOVER_TOKEN configured in Calibre-Web general settings (not compose)
+    volumes:
+      - /home/almty1/calibre-config:/config
+      - /mnt/calibre/ingest:/cwa-book-ingest
+      - /mnt/calibre/library:/calibre-library
+      - /home/almty1/calibre-metadata/metadata.db:/calibre-library/metadata.db
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.calibre.rule=Host(`calibre.az-lab.dev`)"
+      - "traefik.http.routers.calibre.entrypoints=websecure"
+      - "traefik.http.routers.calibre.tls=true"
+      - "traefik.http.routers.calibre.tls.certresolver=le"
+      - "traefik.http.routers.calibre.middlewares=lan-allow@file"
+      - "traefik.http.services.calibre.loadbalancer.server.port=8083"
+
+networks:
+  proxy:
+    external: true

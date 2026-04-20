@@ -4,17 +4,19 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import LabSubNav from '@/components/lab/LabSubNav'
+import { useKeyboard, getShortcutLabel } from '@/lib/hooks/useKeyboard'
 import type { Goal } from '@/app/api/goals/route'
 
 // ── tree builder ───────────────────────────────────────────────────────────────
 
 function buildTree(flat: Goal[]): Goal[] {
   const map = new Map<string, Goal>()
-  flat.forEach((g) => { g.children = []; map.set(g.id, g) })
+  flat.forEach((g) => { map.set(g.id, { ...g, children: [] }) })
   const roots: Goal[] = []
   flat.forEach((g) => {
-    if (g.parent_id && map.has(g.parent_id)) map.get(g.parent_id)!.children!.push(g)
-    else roots.push(g)
+    const node = map.get(g.id)!
+    if (g.parent_id && map.has(g.parent_id)) map.get(g.parent_id)!.children!.push(node)
+    else roots.push(node)
   })
   const sort = (nodes: Goal[]) => {
     nodes.sort((a, b) => a.sort_order - b.sort_order)
@@ -65,6 +67,13 @@ function nodeMatchesSearch(goal: Goal, text: string): boolean {
 
 const ALL_STATUSES = ['active', 'planned', 'paused', 'blocked', 'completed', 'archived'] as const
 const ALL_LEVELS   = ['vision', 'strategy', 'milestone', 'objective'] as const
+
+const LEVEL_DISPLAY: Record<string, string> = {
+  vision:    'Vision',
+  strategy:  'Goal',
+  milestone: 'Milestone',
+  objective: 'Task',
+}
 
 const STATUS_PILL: Record<string, { on: string; border: string; dim: string }> = {
   active:    { on: '#60a5fa', border: 'rgba(96,165,250,0.4)',   dim: 'rgba(96,165,250,0.07)'   },
@@ -145,7 +154,7 @@ function FilterBar({ filterStatuses, filterLevels, onToggleStatus, onToggleLevel
               }}
               className="text-[10px] font-semibold px-2.5 py-1 rounded-full uppercase tracking-wide transition-all duration-150 hover:scale-105"
             >
-              {l}
+              {LEVEL_DISPLAY[l] ?? l}
             </button>
           )
         })}
@@ -223,6 +232,8 @@ const LEVEL_BADGE: Record<string, string> = {
   objective: 'bg-zinc-800/50 text-zinc-500',
 }
 
+
+
 const STATUS_ICON: Record<string, string> = {
   active:    '● ',
   completed: '✓ ',
@@ -242,25 +253,62 @@ function StatusBadge({ status }: { status: string }) {
 function LevelBadge({ level }: { level: string }) {
   return (
     <span className={`text-[10px] font-semibold px-2 py-0.5 rounded uppercase tracking-wide ${LEVEL_BADGE[level] ?? LEVEL_BADGE.milestone}`}>
-      {level}
+      {LEVEL_DISPLAY[level] ?? level}
     </span>
   )
 }
 
-function ProgressBar({ value, status }: { value: number; status: string }) {
-  const color = status === 'completed' ? 'bg-green-500' :
+const RUNNING_TASK_STATUSES = new Set(['in_progress_agent', 'claimed', 'in_progress_jeff'])
+
+function computeChildProgress(goal: Goal): number {
+  const objectives = (goal.children ?? []).filter(c => c.level === 'objective')
+  if (!objectives.length) return goal.progress
+  const sum = objectives.reduce((acc, c) => acc + (c.status === 'completed' ? 100 : c.progress), 0)
+  return Math.round(sum / objectives.length)
+}
+
+function calculateAggregateProgress(goal: Goal): number {
+  if (!goal.children || goal.children.length === 0) return goal.progress
+  const childProgress = goal.children.map(c => calculateAggregateProgress(c))
+  return Math.round(childProgress.reduce((sum, p) => sum + p, 0) / childProgress.length)
+}
+
+function TitleProgressBar({ goal }: { goal: Goal }) {
+  const isVisionOrStrategy = goal.level === 'vision' || goal.level === 'strategy'
+  const displayProgress = isVisionOrStrategy ? calculateAggregateProgress(goal) : goal.progress
+  const color = goal.status === 'completed' ? 'bg-green-400' : 'bg-amber-400'
+
+  return (
+    <div className="h-0.5 bg-zinc-800/50 rounded-full overflow-hidden mt-1.5 mb-2">
+      <div
+        className={`h-full rounded-full ${color} transition-all duration-300 opacity-60`}
+        style={{ width: `${displayProgress}%` }}
+      />
+    </div>
+  )
+}
+
+function ProgressBar({ value, status, taskStatus }: { value: number; status: string; taskStatus?: TaskStatus }) {
+  const isRunning = taskStatus ? RUNNING_TASK_STATUSES.has(taskStatus.status) : false
+  const color = isRunning          ? 'bg-blue-500' :
+                status === 'completed' ? 'bg-green-500' :
                 status === 'blocked'   ? 'bg-amber-500' :
                 status === 'paused'    ? 'bg-yellow-500' : 'progress-purple'
   const fillStyle: React.CSSProperties = {
-    width: `${value}%`,
-    ...(status === 'active' ? { boxShadow: '0 0 6px rgba(167,139,250,0.4)' } : {}),
+    width: `${Math.max(value, isRunning ? 3 : 0)}%`,
+    ...(isRunning ? { boxShadow: '0 0 8px rgba(59,130,246,0.6)', animation: 'pulse 2s infinite' } :
+        status === 'active' ? { boxShadow: '0 0 6px rgba(167,139,250,0.4)' } : {}),
   }
   return (
     <div className="flex items-center gap-2">
       <div className="flex-1 h-2 bg-zinc-800 rounded-full overflow-hidden">
         <div className={`h-full rounded-full ${color}`} style={fillStyle} />
       </div>
-      <span className="text-[10px] text-zinc-500 tabular-nums w-7 text-right">{value}%</span>
+      {isRunning ? (
+        <span className="text-[10px] text-blue-400 tabular-nums whitespace-nowrap">In Progress</span>
+      ) : (
+        <span className="text-[10px] text-zinc-500 tabular-nums w-7 text-right">{value}%</span>
+      )}
     </div>
   )
 }
@@ -272,11 +320,13 @@ interface ScheduleFormProps {
   onClose: () => void
 }
 
-function GoalEditForm({ goal, onClose, onSaved }: { goal: Goal; onClose: () => void; onSaved: () => void }) {
+function GoalEditForm({ goal, flat = [], onClose, onSaved }: { goal: Goal; flat?: Goal[]; onClose: () => void; onSaved: () => void }) {
   const [form, setForm] = useState({
     title: goal.title,
     description: goal.description ?? '',
     notes: goal.notes ?? '',
+    level: goal.level,
+    parent_id: goal.parent_id ?? '',
     priority: goal.priority,
     target_date: goal.target_date ?? '',
     tags: (goal.tags ?? []).join(', '),
@@ -284,8 +334,29 @@ function GoalEditForm({ goal, onClose, onSaved }: { goal: Goal; onClose: () => v
   })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [reviewAgent, setReviewAgent] = useState<string>('')
+
+  // Derived parent options based on level
+  const visions    = flat.filter(g => g.level === 'vision'    && g.status !== 'archived' && g.id !== goal.id)
+  const strategies = flat.filter(g => g.level === 'strategy'  && g.status !== 'archived' && g.id !== goal.id)
+  const milestones = flat.filter(g => g.level === 'milestone' && g.status !== 'archived' && g.id !== goal.id)
+
+  // For task parent: group milestones by their parent goal
+  const milestonesByGoal = strategies.map(s => ({
+    goal: s,
+    milestones: milestones.filter(m => m.parent_id === s.id),
+  })).filter(g => g.milestones.length > 0)
+  const orphanMilestones = milestones.filter(m => !strategies.find(s => s.id === m.parent_id))
+
+  const parentRequired = form.level === 'milestone' || form.level === 'objective'
+  const canSave = form.title.trim() && (!parentRequired || form.parent_id)
+
+  function handleLevelChange(level: Goal['level']) {
+    setForm(f => ({ ...f, level, parent_id: '' }))
+  }
 
   async function handleSave() {
+    if (!canSave) { setError(parentRequired ? 'Parent is required for this type' : 'Title is required'); return }
     setSaving(true)
     setError(null)
     try {
@@ -298,6 +369,10 @@ function GoalEditForm({ goal, onClose, onSaved }: { goal: Goal; onClose: () => v
           target_date: form.target_date || null,
           description: form.description || null,
           notes: form.notes || null,
+          parent_id: form.parent_id || null,
+          reviewAgent: reviewAgent || null,
+          // Lock progress if user explicitly changed it from the original value
+          ...(form.progress !== goal.progress ? { progress_locked: true } : {}),
         }),
       })
       if (res.ok) onSaved()
@@ -305,32 +380,86 @@ function GoalEditForm({ goal, onClose, onSaved }: { goal: Goal; onClose: () => v
     } catch { setError('Save failed') } finally { setSaving(false) }
   }
 
+  const inputCls = 'w-full bg-zinc-900/60 border border-zinc-700/50 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-zinc-500'
+  const labelCls = 'text-[10px] text-zinc-500 uppercase tracking-wider block mb-1'
+
   return (
     <div className="mt-3 p-3 rounded-lg bg-zinc-800/60 border border-zinc-700/50 space-y-2.5">
       <div className="flex items-center justify-between mb-1">
-        <span className="text-xs font-semibold text-zinc-300">Edit Goal</span>
+        <span className="text-xs font-semibold text-zinc-300">Edit {LEVEL_DISPLAY[form.level] ?? form.level}</span>
         <button onClick={onClose} className="text-zinc-600 hover:text-zinc-400 text-sm">✕</button>
       </div>
+
+      {/* Level selector */}
+      <div className="grid grid-cols-4 gap-1">
+        {(['vision', 'strategy', 'milestone', 'objective'] as Goal['level'][]).map(lv => (
+          <button
+            key={lv}
+            type="button"
+            onClick={() => handleLevelChange(lv)}
+            className={`py-1 rounded text-[10px] font-semibold border transition-colors ${
+              form.level === lv
+                ? 'bg-purple-900/50 border-purple-700/60 text-purple-300'
+                : 'bg-zinc-900/40 border-zinc-700/40 text-zinc-500 hover:text-zinc-300 hover:border-zinc-600'
+            }`}
+          >
+            {LEVEL_DISPLAY[lv]}
+          </button>
+        ))}
+      </div>
+
+      {/* Parent selector — changes based on level */}
+      {form.level === 'strategy' && visions.length > 0 && (
+        <div>
+          <label className={labelCls}>Vision (optional)</label>
+          <select value={form.parent_id} onChange={e => setForm(f => ({ ...f, parent_id: e.target.value }))} className={inputCls}>
+            <option value="">No parent vision</option>
+            {visions.map(v => <option key={v.id} value={v.id}>{v.title}</option>)}
+          </select>
+        </div>
+      )}
+      {form.level === 'milestone' && (
+        <div>
+          <label className={labelCls}>Goal *</label>
+          <select value={form.parent_id} onChange={e => setForm(f => ({ ...f, parent_id: e.target.value }))} className={inputCls} required>
+            <option value="" disabled>Select a Goal…</option>
+            {strategies.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}
+          </select>
+        </div>
+      )}
+      {form.level === 'objective' && (
+        <div>
+          <label className={labelCls}>Milestone *</label>
+          <select value={form.parent_id} onChange={e => setForm(f => ({ ...f, parent_id: e.target.value }))} className={inputCls} required>
+            <option value="" disabled>Select a Milestone…</option>
+            {milestonesByGoal.map(({ goal: g, milestones: ms }) => (
+              <optgroup key={g.id} label={g.title}>
+                {ms.map(m => <option key={m.id} value={m.id}>{m.title}</option>)}
+              </optgroup>
+            ))}
+            {orphanMilestones.length > 0 && (
+              <optgroup label="— Other Milestones —">
+                {orphanMilestones.map(m => <option key={m.id} value={m.id}>{m.title}</option>)}
+              </optgroup>
+            )}
+          </select>
+        </div>
+      )}
+
       <div>
-        <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Title</label>
-        <input value={form.title} onChange={e => setForm(f => ({ ...f, title: e.target.value }))}
-               className="w-full bg-zinc-900/60 border border-zinc-700/50 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-zinc-500" />
+        <label className={labelCls}>Title</label>
+        <input value={form.title} onChange={e => setForm(f => ({ ...f, title: e.target.value }))} className={inputCls} />
       </div>
       <div>
-        <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Description</label>
+        <label className={labelCls}>Description</label>
         <textarea value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} rows={2}
                   className="w-full bg-zinc-900/60 border border-zinc-700/50 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-zinc-500 resize-none" />
       </div>
-      <div>
-        <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Notes</label>
-        <textarea value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} rows={3}
-                  className="w-full bg-zinc-900/60 border border-zinc-700/50 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500 resize-y font-mono" />
-      </div>
       <div className="grid grid-cols-3 gap-2">
         <div>
-          <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Priority</label>
+          <label className={labelCls}>Priority</label>
           <select value={form.priority} onChange={e => setForm(f => ({ ...f, priority: +e.target.value }))}
-                  className="w-full bg-zinc-900/60 border border-zinc-700/50 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none">
+                  className={inputCls}>
             <option value={0}>0 — Critical</option>
             <option value={1}>1 — High</option>
             <option value={2}>2 — Normal</option>
@@ -338,26 +467,54 @@ function GoalEditForm({ goal, onClose, onSaved }: { goal: Goal; onClose: () => v
           </select>
         </div>
         <div>
-          <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Progress %</label>
-          <input type="number" min={0} max={100} value={form.progress} onChange={e => setForm(f => ({ ...f, progress: +e.target.value }))}
-                 className="w-full bg-zinc-900/60 border border-zinc-700/50 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-zinc-500" />
+          <label className={labelCls}>
+            Progress %
+            {goal.progress_locked && <span className="ml-1 text-amber-500 normal-case">🔒 locked</span>}
+          </label>
+          <div className="flex gap-1">
+            <input type="number" min={0} max={100} value={form.progress} onChange={e => setForm(f => ({ ...f, progress: +e.target.value }))}
+                   className={inputCls} />
+            {goal.progress_locked && (
+              <button type="button"
+                onClick={async () => {
+                  await fetch(`/api/goals/${goal.id}/edit`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ progress_locked: false }),
+                  })
+                  onSaved()
+                }}
+                className="px-2 py-1 text-[10px] rounded border border-zinc-600 bg-zinc-800 text-zinc-400 hover:text-amber-300 hover:border-amber-600/50 whitespace-nowrap transition-colors"
+                title="Unlock — let task completion drive progress automatically"
+              >
+                Unlock
+              </button>
+            )}
+          </div>
         </div>
         <div>
-          <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Target Date</label>
+          <label className={labelCls}>Target Date</label>
           <input type="date" value={form.target_date} onChange={e => setForm(f => ({ ...f, target_date: e.target.value }))}
-                 className="w-full bg-zinc-900/60 border border-zinc-700/50 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-zinc-500" />
+                 className={inputCls} />
         </div>
       </div>
       <div>
-        <label className="text-[10px] text-zinc-500 uppercase tracking-wider block mb-1">Tags (comma-separated)</label>
-        <input value={form.tags} onChange={e => setForm(f => ({ ...f, tags: e.target.value }))}
-               className="w-full bg-zinc-900/60 border border-zinc-700/50 rounded px-2 py-1 text-xs text-zinc-200 focus:outline-none focus:border-zinc-500" />
+        <label className={labelCls}>Tags (comma-separated)</label>
+        <input value={form.tags} onChange={e => setForm(f => ({ ...f, tags: e.target.value }))} className={inputCls} />
       </div>
       {error && <p className="text-xs text-red-400">{error}</p>}
-      <div className="flex gap-2 pt-1">
-        <button onClick={handleSave} disabled={saving}
+      <div className="flex gap-2 pt-1 items-center">
+        <select value={reviewAgent} onChange={e => setReviewAgent(e.target.value)}
+                className="bg-zinc-900/60 border border-zinc-700/50 rounded px-2 py-1.5 text-xs text-zinc-400 focus:outline-none">
+          <option value="">No review</option>
+          <option value="claude-code">Wren (Claude Code)</option>
+          <option value="iris">Iris (Cowork)</option>
+          <option value="atlas">Atlas (Desktop)</option>
+          <option value="forge">Forge</option>
+        </select>
+        <button onClick={handleSave} disabled={saving || !canSave}
                 className="flex-1 py-1.5 rounded text-xs bg-sky-900/60 text-sky-300 hover:bg-sky-800/80 disabled:opacity-40">
-          {saving ? 'Saving…' : 'Save — Wren will review'}
+          {saving ? 'Saving…' : 'Save'}
         </button>
         <button onClick={onClose} className="px-3 py-1.5 rounded text-xs bg-zinc-700 hover:bg-zinc-600 text-zinc-300">Cancel</button>
       </div>
@@ -463,12 +620,173 @@ function ScheduleForm({ goal, onClose }: ScheduleFormProps) {
   )
 }
 
+// ── notes helpers ───────────────────────────────────────────────────────────────
+
+function parseNotes(raw: string | null | undefined): string[] {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) return parsed.filter((item): item is string => typeof item === 'string' && item.length > 0)
+  } catch {}
+  return [raw]
+}
+
+function serializeNotes(items: string[]): string | null {
+  const filtered = items.filter(s => s.trim())
+  return filtered.length ? JSON.stringify(filtered) : null
+}
+
+// ── notes popover (notebook icon + hover tooltip) ──────────────────────────────
+
+function NotesPopover({ notes }: { notes: string }) {
+  const [open, setOpen] = useState(false)
+  const items = parseNotes(notes)
+  const preview = items.map((n, i) => `${i + 1}. ${n.replace(/[#*`_~\[\]]/g, '').slice(0, 120)}`).join('\n')
+  return (
+    <div className="relative inline-flex items-center">
+      <button
+        className="text-[13px] leading-none text-zinc-500 hover:text-amber-400 transition-colors"
+        title="Has notes"
+        onMouseEnter={() => setOpen(true)}
+        onMouseLeave={() => setOpen(false)}
+        onClick={(e) => e.stopPropagation()}
+      >
+        📓
+      </button>
+      {open && (
+        <div
+          className="absolute bottom-full left-0 mb-1.5 z-50 w-72 max-h-48 overflow-y-auto bg-zinc-800 border border-zinc-700 rounded-lg p-2.5 text-[10px] text-zinc-300 shadow-2xl whitespace-pre-wrap"
+          onMouseEnter={() => setOpen(true)}
+          onMouseLeave={() => setOpen(false)}
+        >
+          {preview}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── read-only numbered notes display ────────────────────────────────────────────
+
+function NotesDisplay({ notes }: { notes: string }) {
+  const items = parseNotes(notes)
+  if (!items.length) return null
+  return (
+    <div className="space-y-1">
+      {items.map((item, i) => (
+        <div key={i} className="flex gap-1.5 text-xs text-zinc-400">
+          <span className="text-[10px] font-mono text-zinc-600 flex-shrink-0 mt-0.5 w-4 text-right">{i + 1}.</span>
+          <span className="leading-relaxed break-words">{item}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ── individual numbered notes editor ────────────────────────────────────────────
+
+function NotesList({ goal, onSaved }: { goal: Goal; onSaved: () => void }) {
+  const [items, setItems] = useState<string[]>(() => parseNotes(goal.notes))
+  const [editIdx, setEditIdx] = useState<number | null>(null)
+  const [editText, setEditText] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function persist(nextItems: string[]) {
+    setSaving(true); setError(null)
+    try {
+      const res = await fetch(`/api/goals/${goal.id}/edit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notes: serializeNotes(nextItems) }),
+      })
+      if (res.ok) { setItems(nextItems); onSaved() }
+      else { const d = await res.json(); setError(d.error ?? 'Save failed') }
+    } catch { setError('Save failed') } finally { setSaving(false) }
+  }
+
+  function startEdit(idx: number) { setEditIdx(idx); setEditText(items[idx]) }
+
+  function saveEdit() {
+    if (editIdx === null) return
+    const trimmed = editText.trim()
+    if (!trimmed) { deleteItem(editIdx); return }
+    const next = [...items]; next[editIdx] = trimmed
+    setEditIdx(null); persist(next)
+  }
+
+  function deleteItem(idx: number) {
+    setEditIdx(null)
+    persist(items.filter((_, i) => i !== idx))
+  }
+
+  function addNote() {
+    const next = [...items, '']
+    setItems(next); setEditIdx(next.length - 1); setEditText('')
+  }
+
+  return (
+    <div className="mt-2 p-2.5 rounded-lg bg-zinc-900/50 border border-zinc-700/40 space-y-1.5">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider">Notes</span>
+        <button onClick={addNote} disabled={saving}
+          className="text-[10px] px-2 py-0.5 rounded border border-zinc-600/50 bg-zinc-800/50 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors disabled:opacity-40">
+          + Add note
+        </button>
+      </div>
+      {items.length === 0 && (
+        <p className="text-[10px] text-zinc-600 italic">No notes yet — click + Add note</p>
+      )}
+      {items.map((item, idx) => (
+        <div key={idx} className="flex gap-2 items-start group/note">
+          <span className="text-[10px] font-mono text-zinc-600 mt-0.5 flex-shrink-0 w-4 text-right">{idx + 1}.</span>
+          {editIdx === idx ? (
+            <div className="flex-1 space-y-1">
+              <textarea
+                autoFocus
+                value={editText}
+                onChange={e => setEditText(e.target.value)}
+                rows={3}
+                className="w-full bg-zinc-900/60 border border-zinc-600/50 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500 resize-y font-mono placeholder:text-zinc-600"
+                placeholder="Note text…"
+                onKeyDown={e => { if (e.key === 'Escape') setEditIdx(null) }}
+              />
+              <div className="flex gap-1">
+                <button onClick={saveEdit} disabled={saving}
+                  className="text-[10px] px-2 py-0.5 rounded bg-sky-900/60 text-sky-300 hover:bg-sky-800/80 disabled:opacity-40">
+                  {saving ? '…' : 'Save'}
+                </button>
+                <button onClick={() => setEditIdx(null)}
+                  className="text-[10px] px-2 py-0.5 rounded border border-zinc-700/50 text-zinc-500 hover:text-zinc-300">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex-1 flex items-start gap-1">
+              <span className="flex-1 text-xs text-zinc-300 leading-relaxed whitespace-pre-wrap break-words">{item}</span>
+              <div className="flex gap-0.5 opacity-0 group-hover/note:opacity-100 transition-opacity flex-shrink-0">
+                <button onClick={() => startEdit(idx)}
+                  className="text-[10px] px-1.5 py-0.5 rounded border border-zinc-700/50 bg-zinc-800/50 text-zinc-500 hover:text-zinc-200">✎</button>
+                <button onClick={() => deleteItem(idx)} disabled={saving}
+                  className="text-[10px] px-1.5 py-0.5 rounded border border-red-900/50 text-red-600 hover:text-red-400 disabled:opacity-40">✕</button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+      {error && <p className="text-[10px] text-red-400">{error}</p>}
+    </div>
+  )
+}
+
 // ── goal card ──────────────────────────────────────────────────────────────────
 
 interface TaskCounts {
   active: number
   done: number
   blocked: number
+  partial: number
   total: number
   pct_complete: number
 }
@@ -484,6 +802,7 @@ interface TaskStatus {
 
 interface GoalCardProps {
   goal: Goal
+  flat?: Goal[]
   depth?: number
   onTrigger: (goal: Goal) => Promise<string>
   onFlag: (taskId: string) => Promise<void>
@@ -511,12 +830,14 @@ function TaskStatusBadge({ ts }: { ts: TaskStatus }) {
   )
 }
 
-function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskStatus, allTaskStatuses, filterStatuses, filterLevels, searchText = '', onArchive, onRestore, onRefresh }: GoalCardProps & { onArchive?: (id: string) => void; onRestore?: (id: string) => void; onRefresh?: () => void }) {
+function GoalCard({ goal, flat = [], depth = 0, onTrigger, onFlag, triggeredTaskId, taskStatus, allTaskStatuses, filterStatuses, filterLevels, searchText = '', onArchive, onRestore, onRefresh }: GoalCardProps & { onArchive?: (id: string) => void; onRestore?: (id: string) => void; onRefresh?: () => void }) {
   const daysLeft = goal.target_date
     ? Math.ceil((new Date(goal.target_date).getTime() - Date.now()) / 86400000)
     : null
   const hasChildren = (goal.children?.length ?? 0) > 0
   const [collapsed, setCollapsed] = useState(false)
+  const [cardExpanded, setCardExpanded] = useState(goal.level === 'vision' || goal.level === 'strategy')
+  const [showNotes, setShowNotes] = useState(false)
   const [showSchedule, setShowSchedule] = useState(false)
   const [showEdit, setShowEdit] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
@@ -603,6 +924,7 @@ function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskSta
   const levelStripe = LEVEL_STRIPE[goal.level] ?? LEVEL_STRIPE.milestone
   const statusMod = goal.status === 'blocked' ? 'ring-1 ring-amber-800/40' :
                     goal.status === 'completed' ? 'opacity-70' : ''
+  const noteCount = parseNotes(goal.notes).length
 
   const visibleChildren = (goal.children ?? []).filter((child) =>
     !filterStatuses || !filterLevels
@@ -612,7 +934,7 @@ function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskSta
 
   return (
     <div className={`${depth > 0 ? 'ml-4 border-l border-zinc-800/60 pl-4' : ''}`}>
-      <div className={`card-lift rounded-xl border border-zinc-800/60 bg-zinc-900/30 p-4 mb-3 ${levelStripe} ${statusMod}`}>
+      <div data-goal-id={goal.id} className={`card-lift rounded-xl border border-zinc-800/60 bg-zinc-900/30 p-4 mb-3 ${levelStripe} ${statusMod}`}>
         <div className="flex items-start justify-between gap-3 mb-3">
           <div className="flex items-center gap-2 flex-wrap">
             <LevelBadge level={goal.level} />
@@ -644,6 +966,7 @@ function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskSta
             )}
             {hasChildren && (
               <button
+                data-action="toggle-details"
                 onClick={() => setCollapsed((v) => !v)}
                 className="text-[10px] text-zinc-600 hover:text-zinc-300 transition-colors px-1.5 py-0.5 rounded border border-zinc-800/60 hover:border-zinc-600 bg-zinc-900/50 flex items-center gap-1"
                 title={collapsed ? 'Expand children' : 'Collapse children'}
@@ -655,23 +978,52 @@ function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskSta
           </div>
         </div>
 
-        <h3
-          className={`font-semibold mb-1 ${
-            goal.level === 'vision' ? 'text-xl font-bold text-white' :
-            goal.level === 'strategy' ? 'text-base text-zinc-100' :
-            'text-sm text-zinc-200'
-          }`}
-          style={goal.level === 'vision' ? { textShadow: '0 0 20px rgba(167,139,250,0.3)' } : undefined}
-        >{goal.title}</h3>
+        <div
+          className="flex items-center justify-between gap-2 mb-1 cursor-pointer group"
+          onClick={() => setCardExpanded(v => !v)}
+        >
+          <h3
+            className={`font-semibold flex-1 group-hover:text-white transition-colors ${
+              goal.level === 'vision' ? 'text-xl font-bold text-white' :
+              goal.level === 'strategy' ? 'text-base text-zinc-100' :
+              'text-sm text-zinc-200'
+            }`}
+            style={goal.level === 'vision' ? { textShadow: '0 0 20px rgba(167,139,250,0.3)' } : undefined}
+          >{goal.title}</h3>
+
+          <TitleProgressBar goal={goal} />
+
+          <div className="flex items-center gap-1.5 flex-shrink-0">
+            {!cardExpanded && goal.notes && <NotesPopover notes={goal.notes} />}
+            <span className="text-[10px] text-zinc-600 group-hover:text-zinc-400 transition-colors">{cardExpanded ? '▲' : '▼'}</span>
+          </div>
+        </div>
+
+        <TitleProgressBar goal={goal} />
 
         {goal.description && (
-          <p className="text-xs text-zinc-400 leading-relaxed mb-3">{goal.description}</p>
+          <div className="mb-3 max-h-40 overflow-y-auto pr-1">
+            <MarkdownPreview content={goal.description} />
+          </div>
         )}
 
-        <ProgressBar value={goal.progress} status={goal.status} />
+        <ProgressBar
+          value={
+            taskStatus?.counts && taskStatus.counts.total > 0 && !goal.progress_locked
+              ? taskStatus.counts.pct_complete
+              : goal.level === 'milestone' ? computeChildProgress(goal) : goal.progress
+          }
+          status={goal.status}
+          taskStatus={taskStatus}
+        />
 
         {taskStatus?.counts && taskStatus.counts.total > 0 && (
           <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+            <button
+              onClick={(e) => { e.stopPropagation(); setShowNotes(v => !v); if (!cardExpanded) setCardExpanded(true) }}
+              className={`text-[11px] px-1.5 py-0.5 rounded transition-colors flex-shrink-0 flex items-center gap-0.5 ${showNotes ? 'text-amber-400' : 'text-zinc-600 hover:text-zinc-400'}`}
+              title={noteCount > 0 ? `${noteCount} note${noteCount > 1 ? 's' : ''}` : 'Notes'}
+            >📓{noteCount > 0 && <span className="text-[9px] font-bold leading-none px-1 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30 min-w-[14px] text-center">{noteCount}</span>}</button>
             <span className="text-[9px] font-semibold text-zinc-600 uppercase tracking-wider">tasks</span>
             {taskStatus.counts.done > 0 && (
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-900/25 text-green-400 border border-green-800/30">
@@ -681,6 +1033,11 @@ function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskSta
             {taskStatus.counts.active > 0 && (
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/25 text-blue-400 border border-blue-800/30">
                 ● {taskStatus.counts.active}
+              </span>
+            )}
+            {(taskStatus.counts.partial ?? 0) > 0 && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-sky-900/25 text-sky-400 border border-sky-800/30">
+                ½ {taskStatus.counts.partial}
               </span>
             )}
             {taskStatus.counts.blocked > 0 && (
@@ -694,7 +1051,18 @@ function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskSta
           </div>
         )}
 
-        {goal.tags && goal.tags.length > 0 && (
+        {/* Notebook icon when no tasks exist — still show on its own line */}
+        {!(taskStatus?.counts && taskStatus.counts.total > 0) && (
+          <div className="flex items-center mt-1.5">
+            <button
+              onClick={(e) => { e.stopPropagation(); setShowNotes(v => !v); if (!cardExpanded) setCardExpanded(true) }}
+              className={`text-[11px] px-1.5 py-0.5 rounded transition-colors flex items-center gap-0.5 ${showNotes ? 'text-amber-400' : 'text-zinc-600 hover:text-zinc-400'}`}
+              title={noteCount > 0 ? `${noteCount} note${noteCount > 1 ? 's' : ''}` : 'Notes'}
+            >📓{noteCount > 0 && <span className="text-[9px] font-bold leading-none px-1 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30 min-w-[14px] text-center">{noteCount}</span>}</button>
+          </div>
+        )}
+
+        {cardExpanded && goal.tags && goal.tags.length > 0 && (
           <div className="flex gap-1.5 mt-2 flex-wrap">
             {goal.tags.map((t) => (
               <span key={t} className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800/60 text-zinc-500">{t}</span>
@@ -702,11 +1070,26 @@ function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskSta
           </div>
         )}
 
-        {goal.notes && (
-          <div className="mt-2 text-[11px] text-zinc-500 italic border-l-2 border-zinc-700 pl-2">{goal.notes}</div>
+        {showNotes && (
+          <>
+            {showNotes ? (
+              <NotesList goal={goal} onSaved={() => { onRefresh?.() }} />
+            ) : goal.notes ? (
+              <div className="mt-2 group/notes relative border-l-2 border-zinc-700/60 pl-2 max-h-28 overflow-y-auto">
+                <NotesDisplay notes={goal.notes} />
+                <button
+                  onClick={(e) => { e.stopPropagation(); setShowNotes(true) }}
+                  className="absolute top-0 right-0 hidden group-hover/notes:inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-zinc-800/90 border border-zinc-700/60 text-zinc-400 hover:text-zinc-200 transition-colors"
+                >
+                  ✎ Edit
+                </button>
+              </div>
+            ) : null}
+          </>
         )}
 
         {/* Action buttons */}
+        {cardExpanded && (
         <div className="mt-3 pt-3 border-t border-zinc-800/40 flex items-center gap-2 flex-wrap">
           <button
             onClick={handleTrigger}
@@ -745,7 +1128,7 @@ function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskSta
             {actionError && <span className="text-[10px] text-red-400 mr-1">{actionError}</span>}
             <a href={`/api/goals/${goal.id}/export?format=json`} download
                className="text-[10px] px-2 py-0.5 rounded border border-zinc-700/50 bg-zinc-800/50 text-zinc-500 hover:text-zinc-300">↓</a>
-            <button onClick={() => setShowEdit(!showEdit)}
+            <button data-action="edit" onClick={() => setShowEdit(!showEdit)}
                     className={`text-[10px] px-2 py-0.5 rounded border transition-colors ${showEdit ? 'border-sky-700/60 bg-sky-900/30 text-sky-300' : 'border-zinc-700/50 bg-zinc-800/50 text-zinc-400 hover:text-zinc-200'}`}>
               ✎ Edit
             </button>
@@ -755,18 +1138,20 @@ function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskSta
                 {archiving ? '…' : 'Restore'}
               </button>
             ) : (<>
-              {goal.status !== 'completed' && (
-                <button onClick={() => handleStatusChange('completed')} disabled={!!actionBusy}
-                        className="text-[10px] px-2 py-0.5 rounded border border-green-800/50 bg-green-900/20 text-green-400 hover:bg-green-900/40 disabled:opacity-50">
-                  {actionBusy === 'completed' ? '…' : '✓ Complete'}
-                </button>
-              )}
-              {goal.status !== 'cancelled' && (
-                <button onClick={() => handleStatusChange('cancelled')} disabled={!!actionBusy}
-                        className="text-[10px] px-2 py-0.5 rounded border border-amber-800/50 bg-amber-900/20 text-amber-400 hover:bg-amber-900/40 disabled:opacity-50">
-                  {actionBusy === 'cancelled' ? '…' : '✕ Cancel'}
-                </button>
-              )}
+              <select
+                value={goal.status}
+                onChange={e => handleStatusChange(e.target.value)}
+                disabled={!!actionBusy}
+                className="text-[10px] px-1.5 py-0.5 rounded border border-zinc-700/50 bg-zinc-800/60 text-zinc-300 focus:outline-none focus:border-zinc-500 disabled:opacity-50 cursor-pointer"
+              >
+                <option value="active">Active</option>
+                <option value="planned">Planned</option>
+                <option value="paused">Paused</option>
+                <option value="blocked">Blocked</option>
+                <option value="completed">Completed</option>
+                <option value="cancelled">Cancelled</option>
+              </select>
+              {actionBusy && <span className="text-[10px] text-zinc-500">…</span>}
               <button onClick={() => handleStatusChange('archived')} disabled={archiving || !!actionBusy}
                       className="text-[10px] px-2 py-0.5 rounded border border-zinc-700/50 bg-zinc-800/50 text-zinc-500 hover:text-zinc-400 disabled:opacity-50">
                 {archiving ? '…' : 'Archive'}
@@ -793,12 +1178,13 @@ function GoalCard({ goal, depth = 0, onTrigger, onFlag, triggeredTaskId, taskSta
             </div>
           )}
         </div>
+        )}
 
-        {showSchedule && (
+        {cardExpanded && showSchedule && (
           <ScheduleForm goal={goal} onClose={() => setShowSchedule(false)} />
         )}
-        {showEdit && (
-          <GoalEditForm goal={goal} onClose={() => setShowEdit(false)} onSaved={() => { setShowEdit(false); onRefresh?.() }} />
+        {cardExpanded && showEdit && (
+          <GoalEditForm goal={goal} flat={flat} onClose={() => setShowEdit(false)} onSaved={() => { setShowEdit(false); onRefresh?.() }} />
         )}
       </div>
 
@@ -855,7 +1241,7 @@ function SummaryTable({ flat, onClickStatus, onClickLevel, onClickAll }: Summary
     { label: 'Blocked', value: byStatus.blocked ?? 0, color: (byStatus.blocked ?? 0) > 0 ? 'text-amber-400' : 'text-zinc-600', onClick: () => onClickStatus?.('blocked'), hint: 'Filter blocked goals' },
     { label: 'Avg Progress', value: `${avgProgress}%`, color: 'text-zinc-300' },
     { label: 'Milestones', value: byLevel.milestone ?? 0, color: 'text-zinc-300', onClick: () => onClickLevel?.('milestone'), hint: 'Filter milestones' },
-    { label: 'Strategies', value: byLevel.strategy ?? 0, color: 'text-indigo-300', onClick: () => onClickLevel?.('strategy'), hint: 'Filter strategies' },
+    { label: 'Goals', value: byLevel.strategy ?? 0, color: 'text-indigo-300', onClick: () => onClickLevel?.('strategy'), hint: 'Filter goals' },
     { label: 'Vision Items', value: byLevel.vision ?? 0, color: 'text-purple-300', onClick: () => onClickLevel?.('vision'), hint: 'Filter vision items' },
   ]
 
@@ -1164,19 +1550,101 @@ function MarkdownPreview({ content }: { content: string }) {
   )
 }
 
+// ── notes editor (stateful, no DB — for creation forms) ──────────────────────
+
+function NotesEditorField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [items, setItems] = useState<string[]>(() => parseNotes(value))
+  const [editIdx, setEditIdx] = useState<number | null>(null)
+  const [editText, setEditText] = useState('')
+
+  function commit(next: string[]) {
+    setItems(next)
+    onChange(serializeNotes(next) ?? '')
+  }
+
+  function startEdit(idx: number) { setEditIdx(idx); setEditText(items[idx]) }
+
+  function saveEdit() {
+    if (editIdx === null) return
+    const trimmed = editText.trim()
+    const next = trimmed ? [...items] : items.filter((_, i) => i !== editIdx)
+    if (trimmed) next[editIdx] = trimmed
+    setEditIdx(null); commit(next)
+  }
+
+  function deleteItem(idx: number) { setEditIdx(null); commit(items.filter((_, i) => i !== idx)) }
+
+  function addNote() {
+    const next = [...items, '']
+    setItems(next); setEditIdx(next.length - 1); setEditText('')
+  }
+
+  return (
+    <div className="p-2.5 rounded-lg bg-zinc-900/50 border border-zinc-700/40 space-y-1.5">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider">Notes</span>
+        <button type="button" onClick={addNote}
+          className="text-[10px] px-2 py-0.5 rounded border border-zinc-600/50 bg-zinc-800/50 text-zinc-400 hover:text-zinc-200 hover:border-zinc-500 transition-colors">
+          + Add note
+        </button>
+      </div>
+      {items.length === 0 && (
+        <p className="text-[10px] text-zinc-600 italic">No notes yet — click + Add note</p>
+      )}
+      {items.map((item, idx) => (
+        <div key={idx} className="flex gap-2 items-start group/note">
+          <span className="text-[10px] font-mono text-zinc-600 mt-0.5 flex-shrink-0 w-4 text-right">{idx + 1}.</span>
+          {editIdx === idx ? (
+            <div className="flex-1 space-y-1">
+              <textarea
+                autoFocus
+                value={editText}
+                onChange={e => setEditText(e.target.value)}
+                rows={2}
+                className="w-full bg-zinc-900/60 border border-zinc-600/50 rounded px-2 py-1 text-xs text-zinc-300 focus:outline-none focus:border-zinc-500 resize-none font-mono placeholder:text-zinc-600"
+                placeholder="Note text…"
+                onKeyDown={e => { if (e.key === 'Escape') setEditIdx(null); if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveEdit() } }}
+              />
+              <div className="flex gap-1">
+                <button type="button" onClick={saveEdit}
+                  className="text-[10px] px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300">Save</button>
+                <button type="button" onClick={() => setEditIdx(null)}
+                  className="text-[10px] px-2 py-0.5 rounded text-zinc-500 hover:text-zinc-300">Cancel</button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex-1 flex items-start justify-between gap-1 group/item">
+              <span className="text-xs text-zinc-400 leading-relaxed flex-1 break-words">{item || <span className="italic text-zinc-600">empty</span>}</span>
+              <div className="flex gap-1 opacity-0 group-hover/item:opacity-100 transition-opacity flex-shrink-0">
+                <button type="button" onClick={() => startEdit(idx)} className="text-[10px] text-zinc-500 hover:text-zinc-300">✎</button>
+                <button type="button" onClick={() => deleteItem(idx)} className="text-[10px] text-zinc-600 hover:text-red-400">✕</button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // ── add goal modal ─────────────────────────────────────────────────────────────
 
 interface AddGoalPanelProps {
   flat: Goal[]
   onClose: () => void
   onCreated: () => void
+  initialLevel?: Goal['level']
 }
 
-function AddGoalPanel({ flat, onClose, onCreated }: AddGoalPanelProps) {
+const LEVEL_LABELS: Record<Goal['level'], string> = {
+  vision: 'Vision', strategy: 'Goal', milestone: 'Milestone', objective: 'Task',
+}
+
+function AddGoalPanel({ flat, onClose, onCreated, initialLevel }: AddGoalPanelProps) {
   const [form, setForm] = useState({
     title: '',
     description: '',
-    level: 'milestone' as Goal['level'],
+    level: (initialLevel ?? 'milestone') as Goal['level'],
     parent_id: '',
     status: 'planned' as Goal['status'],
     priority: 2,
@@ -1186,9 +1654,27 @@ function AddGoalPanel({ flat, onClose, onCreated }: AddGoalPanelProps) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [descTab, setDescTab] = useState<'edit' | 'preview'>('edit')
-  const [notesTab, setNotesTab] = useState<'edit' | 'preview'>('edit')
   const descRef = useRef<HTMLTextAreaElement>(null)
-  const notesRef = useRef<HTMLTextAreaElement>(null)
+
+  // Parent options derived from level
+  const visions    = flat.filter(g => g.level === 'vision'    && g.status !== 'archived')
+  const strategies = flat.filter(g => g.level === 'strategy'  && g.status !== 'archived')
+  const milestones = flat.filter(g => g.level === 'milestone' && g.status !== 'archived')
+
+  // Milestones grouped by parent goal for task parent picker
+  const milestonesByGoal = strategies.map(s => ({
+    goal: s,
+    milestones: milestones.filter(m => m.parent_id === s.id),
+  })).filter(g => g.milestones.length > 0)
+  const orphanMilestones = milestones.filter(m => !strategies.find(s => s.id === m.parent_id))
+
+  const parentRequired = form.level === 'milestone' || form.level === 'objective'
+  const canSubmit = form.title.trim() && (!parentRequired || form.parent_id)
+
+  function handleLevelChange(level: Goal['level']) {
+    setForm(f => ({ ...f, level, parent_id: '' }))
+    setError(null)
+  }
 
   function handleBackdrop(e: React.MouseEvent) {
     if (e.target === e.currentTarget) onClose()
@@ -1197,6 +1683,10 @@ function AddGoalPanel({ flat, onClose, onCreated }: AddGoalPanelProps) {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!form.title.trim()) { setError('Title is required'); return }
+    if (parentRequired && !form.parent_id) {
+      setError(form.level === 'milestone' ? 'Select a Goal parent' : 'Select a Milestone parent')
+      return
+    }
     setSaving(true)
     setError(null)
     try {
@@ -1216,13 +1706,8 @@ function AddGoalPanel({ flat, onClose, onCreated }: AddGoalPanelProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       })
-      if (res.ok) {
-        onCreated()
-        onClose()
-      } else {
-        const data = await res.json()
-        setError(data.error ?? 'Failed to create goal')
-      }
+      if (res.ok) { onCreated(); onClose() }
+      else { const data = await res.json(); setError(data.error ?? 'Failed to create') }
     } catch {
       setError('Request failed')
     } finally {
@@ -1246,25 +1731,78 @@ function AddGoalPanel({ flat, onClose, onCreated }: AddGoalPanelProps) {
         style={{ animation: 'slideInRight 0.2s ease-out' }}
       >
         <div className="flex items-center justify-between p-4 border-b border-zinc-800">
-          <h2 className="text-sm font-semibold text-zinc-200">Add New Goal</h2>
+          <h2 className="text-sm font-semibold text-zinc-200">New {LEVEL_LABELS[form.level]}</h2>
           <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200 text-lg leading-none">&times;</button>
         </div>
 
         <form onSubmit={handleSubmit} className="flex-1 p-5 space-y-4 overflow-y-auto">
-          {/* Row: Level + Status + Priority */}
-          <div className="grid grid-cols-3 gap-3">
+
+          {/* Level selector — tab style */}
+          <div>
+            <label className={labelCls}>Type</label>
+            <div className="grid grid-cols-4 gap-1">
+              {(['vision', 'strategy', 'milestone', 'objective'] as Goal['level'][]).map(lv => (
+                <button
+                  key={lv}
+                  type="button"
+                  onClick={() => handleLevelChange(lv)}
+                  className={`py-1.5 rounded-md text-xs font-semibold border transition-colors ${
+                    form.level === lv
+                      ? 'bg-purple-900/50 border-purple-700/60 text-purple-200'
+                      : 'bg-zinc-900/40 border-zinc-700/40 text-zinc-500 hover:text-zinc-300 hover:border-zinc-600'
+                  }`}
+                >
+                  {LEVEL_LABELS[lv]}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Parent picker — changes based on level */}
+          {form.level === 'strategy' && visions.length > 0 && (
             <div>
-              <label className={labelCls}>Level</label>
-              <select value={form.level} onChange={(e) => setForm((f) => ({ ...f, level: e.target.value as Goal['level'] }))} className={inputCls}>
-                <option value="vision">Vision</option>
-                <option value="strategy">Strategy</option>
-                <option value="milestone">Milestone</option>
-                <option value="objective">Objective</option>
+              <label className={labelCls}>Vision (optional)</label>
+              <select value={form.parent_id} onChange={e => setForm(f => ({ ...f, parent_id: e.target.value }))} className={inputCls}>
+                <option value="">No parent vision</option>
+                {visions.map(v => <option key={v.id} value={v.id}>{v.title}</option>)}
               </select>
             </div>
+          )}
+
+          {form.level === 'milestone' && (
+            <div>
+              <label className={labelCls}>Goal *</label>
+              <select value={form.parent_id} onChange={e => setForm(f => ({ ...f, parent_id: e.target.value }))} className={inputCls} required>
+                <option value="" disabled>Select a Goal…</option>
+                {strategies.map(s => <option key={s.id} value={s.id}>{s.title}</option>)}
+              </select>
+            </div>
+          )}
+
+          {form.level === 'objective' && (
+            <div>
+              <label className={labelCls}>Milestone *</label>
+              <select value={form.parent_id} onChange={e => setForm(f => ({ ...f, parent_id: e.target.value }))} className={inputCls} required>
+                <option value="" disabled>Select a Milestone…</option>
+                {milestonesByGoal.map(({ goal: g, milestones: ms }) => (
+                  <optgroup key={g.id} label={g.title}>
+                    {ms.map(m => <option key={m.id} value={m.id}>{m.title}</option>)}
+                  </optgroup>
+                ))}
+                {orphanMilestones.length > 0 && (
+                  <optgroup label="— Other Milestones —">
+                    {orphanMilestones.map(m => <option key={m.id} value={m.id}>{m.title}</option>)}
+                  </optgroup>
+                )}
+              </select>
+            </div>
+          )}
+
+          {/* Status + Priority + Target Date */}
+          <div className="grid grid-cols-3 gap-3">
             <div>
               <label className={labelCls}>Status</label>
-              <select value={form.status} onChange={(e) => setForm((f) => ({ ...f, status: e.target.value as Goal['status'] }))} className={inputCls}>
+              <select value={form.status} onChange={e => setForm(f => ({ ...f, status: e.target.value as Goal['status'] }))} className={inputCls}>
                 <option value="active">Active</option>
                 <option value="planned">Planned</option>
                 <option value="paused">Paused</option>
@@ -1273,29 +1811,16 @@ function AddGoalPanel({ flat, onClose, onCreated }: AddGoalPanelProps) {
             </div>
             <div>
               <label className={labelCls}>Priority</label>
-              <select value={form.priority} onChange={(e) => setForm((f) => ({ ...f, priority: Number(e.target.value) }))} className={inputCls}>
+              <select value={form.priority} onChange={e => setForm(f => ({ ...f, priority: Number(e.target.value) }))} className={inputCls}>
                 <option value={0}>0 — Critical</option>
                 <option value={1}>1 — High</option>
                 <option value={2}>2 — Normal</option>
                 <option value={3}>3 — Low</option>
               </select>
             </div>
-          </div>
-
-          {/* Row: Parent + Target Date */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className={labelCls}>Parent Goal (optional)</label>
-              <select value={form.parent_id} onChange={(e) => setForm((f) => ({ ...f, parent_id: e.target.value }))} className={inputCls}>
-                <option value="">— None —</option>
-                {flat.map((g) => (
-                  <option key={g.id} value={g.id}>[{g.level}] {g.title}</option>
-                ))}
-              </select>
-            </div>
             <div>
               <label className={labelCls}>Target Date</label>
-              <input type="date" value={form.target_date} onChange={(e) => setForm((f) => ({ ...f, target_date: e.target.value }))} className={inputCls} />
+              <input type="date" value={form.target_date} onChange={e => setForm(f => ({ ...f, target_date: e.target.value }))} className={inputCls} />
             </div>
           </div>
 
@@ -1305,14 +1830,14 @@ function AddGoalPanel({ flat, onClose, onCreated }: AddGoalPanelProps) {
             <input
               type="text"
               value={form.title}
-              onChange={(e) => setForm((f) => ({ ...f, title: e.target.value }))}
-              placeholder="Goal title…"
+              onChange={e => setForm(f => ({ ...f, title: e.target.value }))}
+              placeholder={`${LEVEL_LABELS[form.level]} title…`}
               className={inputCls}
-              required
+              autoFocus
             />
           </div>
 
-          {/* Description with markdown toolbar + preview */}
+          {/* Description */}
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className={labelCls}>Description</label>
@@ -1323,50 +1848,25 @@ function AddGoalPanel({ flat, onClose, onCreated }: AddGoalPanelProps) {
             </div>
             {descTab === 'edit' ? (
               <>
-                <MarkdownToolbar textareaRef={descRef} value={form.description} onChange={(v) => setForm((f) => ({ ...f, description: v }))} />
+                <MarkdownToolbar textareaRef={descRef} value={form.description} onChange={v => setForm(f => ({ ...f, description: v }))} />
                 <textarea
                   ref={descRef}
                   value={form.description}
-                  onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))}
-                  placeholder="Describe the goal… (supports **markdown**)"
-                  rows={10}
+                  onChange={e => setForm(f => ({ ...f, description: e.target.value }))}
+                  placeholder="Describe this… (supports **markdown**)"
+                  rows={8}
                   className="w-full text-xs bg-zinc-900 border border-zinc-700 rounded-b-md px-3 py-2 text-zinc-200 focus:outline-none focus:border-purple-600 placeholder-zinc-600 resize-y font-mono leading-relaxed"
                 />
               </>
             ) : (
-              <div className="min-h-[220px] bg-zinc-900/60 border border-zinc-700 rounded-md px-3 py-2">
+              <div className="min-h-[180px] bg-zinc-900/60 border border-zinc-700 rounded-md px-3 py-2">
                 <MarkdownPreview content={form.description} />
               </div>
             )}
           </div>
 
-          {/* Notes with markdown toolbar + preview */}
-          <div>
-            <div className="flex items-center justify-between mb-1">
-              <label className={labelCls}>Notes</label>
-              <div className="flex gap-0.5 -mb-px relative z-10">
-                <button type="button" className={tabBtn(notesTab === 'edit')} onClick={() => setNotesTab('edit')}>Edit</button>
-                <button type="button" className={tabBtn(notesTab === 'preview')} onClick={() => setNotesTab('preview')}>Preview</button>
-              </div>
-            </div>
-            {notesTab === 'edit' ? (
-              <>
-                <MarkdownToolbar textareaRef={notesRef} value={form.notes} onChange={(v) => setForm((f) => ({ ...f, notes: v }))} />
-                <textarea
-                  ref={notesRef}
-                  value={form.notes}
-                  onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))}
-                  placeholder="Internal notes, blockers, context… (supports **markdown**)"
-                  rows={5}
-                  className="w-full text-xs bg-zinc-900 border border-zinc-700 rounded-b-md px-3 py-2 text-zinc-200 focus:outline-none focus:border-purple-600 placeholder-zinc-600 resize-y font-mono leading-relaxed"
-                />
-              </>
-            ) : (
-              <div className="min-h-[100px] bg-zinc-900/60 border border-zinc-700 rounded-md px-3 py-2">
-                <MarkdownPreview content={form.notes} />
-              </div>
-            )}
-          </div>
+          {/* Notes — numbered list */}
+          <NotesEditorField value={form.notes} onChange={v => setForm(f => ({ ...f, notes: v }))} />
 
           {error && (
             <p className="text-xs text-red-400 border border-red-900/50 rounded-md px-3 py-2 bg-red-950/20">{error}</p>
@@ -1375,16 +1875,13 @@ function AddGoalPanel({ flat, onClose, onCreated }: AddGoalPanelProps) {
           <div className="flex gap-2 pt-2 pb-4">
             <button
               type="submit"
-              disabled={saving}
+              disabled={saving || !canSubmit}
               className="flex-1 text-xs px-3 py-2 rounded-md border border-purple-700/60 bg-purple-900/40 text-purple-200 hover:bg-purple-900/60 disabled:opacity-50 font-semibold transition-colors"
             >
-              {saving ? 'Saving…' : 'Create Goal'}
+              {saving ? 'Saving…' : `Create ${LEVEL_LABELS[form.level]}`}
             </button>
-            <button
-              type="button"
-              onClick={onClose}
-              className="text-xs px-3 py-2 rounded-md border border-zinc-700/50 bg-zinc-800/40 text-zinc-400 hover:text-zinc-200 transition-colors"
-            >
+            <button type="button" onClick={onClose}
+              className="text-xs px-3 py-2 rounded-md border border-zinc-700/50 bg-zinc-800/40 text-zinc-400 hover:text-zinc-200 transition-colors">
               Cancel
             </button>
           </div>
@@ -1697,6 +2194,419 @@ function GoalsArchiveSection({ onRestore }: { onRestore: () => void }) {
   )
 }
 
+// ── Vision Header (collapsible section header for vision-level goals) ──────────
+
+function VisionHeader({
+  goal, flat = [], isCollapsed, onToggle, strategyCount, onRefresh,
+}: {
+  goal: Goal; flat?: Goal[]; isCollapsed: boolean; onToggle: () => void
+  strategyCount: number; onRefresh: () => void
+}) {
+  const [showEdit, setShowEdit] = useState(false)
+  const [showDelete, setShowDelete] = useState(false)
+  const [busy, setBusy] = useState<string | null>(null)
+
+  async function updateStatus(status: string) {
+    setBusy(status)
+    await fetch(`/api/goals/${goal.id}/status`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    }).catch(() => {})
+    onRefresh(); setBusy(null)
+  }
+
+  async function handleDelete() {
+    setBusy('delete')
+    const res = await fetch(`/api/goals/${goal.id}/delete`, { method: 'POST' }).catch(() => null)
+    if (res?.ok) onRefresh()
+    setBusy(null); setShowDelete(false)
+  }
+
+  const [showNotes, setShowNotes] = useState(false)
+
+  return (
+    <div className="mb-10">
+      <div className="flex items-center gap-3 pb-3 border-b-2 border-purple-900/40 group">
+        <button onClick={onToggle} className="flex items-center gap-2.5 flex-1 text-left min-w-0">
+          <span className="text-xs text-purple-700 group-hover:text-purple-500 flex-shrink-0">{isCollapsed ? '▶' : '▼'}</span>
+          <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-purple-900/40 text-purple-400 border border-purple-800/40 uppercase tracking-wider flex-shrink-0">Vision</span>
+          <h2 className="text-xl font-bold text-white truncate" style={{ textShadow: '0 0 24px rgba(167,139,250,0.3)' }}>{goal.title}</h2>
+          <StatusBadge status={goal.status} />
+          {strategyCount > 0 && <span className="text-[10px] text-zinc-600 flex-shrink-0">{strategyCount} {strategyCount === 1 ? 'goal' : 'goals'}</span>}
+          {goal.notes && !showNotes && <NotesPopover notes={goal.notes} />}
+        </button>
+        <div className="flex items-center gap-1 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button onClick={() => { setShowNotes(v => !v); setShowEdit(false) }}
+                  className={`text-[10px] px-2 py-0.5 rounded border transition-colors ${showNotes ? 'border-amber-700/60 bg-amber-900/20 text-amber-300' : 'border-zinc-700/50 bg-zinc-800/50 text-zinc-500 hover:text-amber-300'}`}
+                  title="Notes">
+            📓
+          </button>
+          <button onClick={() => { setShowEdit(v => !v); setShowNotes(false) }}
+                  className={`text-[10px] px-2 py-0.5 rounded border transition-colors ${showEdit ? 'border-sky-700/60 bg-sky-900/30 text-sky-300' : 'border-zinc-700/50 bg-zinc-800/50 text-zinc-400 hover:text-zinc-200'}`}>
+            ✎
+          </button>
+          <select value={goal.status} onChange={e => updateStatus(e.target.value)} disabled={!!busy}
+                  className="text-[10px] px-1.5 py-0.5 rounded border border-zinc-700/50 bg-zinc-800/60 text-zinc-300 focus:outline-none disabled:opacity-50 cursor-pointer">
+            {['active','planned','paused','blocked','completed','cancelled'].map(s => (
+              <option key={s} value={s}>{s.charAt(0).toUpperCase()+s.slice(1)}</option>
+            ))}
+          </select>
+          <button onClick={() => setShowDelete(v => !v)}
+                  className="text-[10px] px-2 py-0.5 rounded border border-red-900/50 bg-red-950/20 text-red-500 hover:text-red-400">🗑</button>
+        </div>
+      </div>
+      {goal.description && (
+        <p className="text-sm text-zinc-500 mt-2 mb-1 ml-6 leading-relaxed">{goal.description}</p>
+      )}
+      {goal.notes && !showNotes && (
+        <div className="ml-6 mt-1 mb-1 border-l-2 border-zinc-700/60 pl-2 max-h-20 overflow-y-auto">
+          <NotesDisplay notes={goal.notes} />
+        </div>
+      )}
+      {showEdit && (
+        <div className="ml-6 mt-2">
+          <GoalEditForm goal={goal} flat={flat} onClose={() => setShowEdit(false)} onSaved={() => { setShowEdit(false); onRefresh() }} />
+        </div>
+      )}
+      {showNotes && (
+        <div className="ml-6 mt-2">
+          <NotesList goal={goal} onSaved={() => { onRefresh() }} />
+        </div>
+      )}
+      {showDelete && (
+        <div className="ml-6 mt-2 p-2 rounded-lg bg-red-950/30 border border-red-800/50 flex items-center gap-2">
+          <span className="text-xs text-red-300 flex-1">Delete &quot;{goal.title}&quot; permanently?</span>
+          <button onClick={handleDelete} disabled={busy === 'delete'}
+                  className="text-xs px-3 py-1 rounded bg-red-700 hover:bg-red-600 text-white disabled:opacity-50">
+            {busy === 'delete' ? '…' : 'Delete'}
+          </button>
+          <button onClick={() => setShowDelete(false)} className="text-xs px-3 py-1 rounded bg-zinc-700 text-zinc-300">Cancel</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Strategy Header ─────────────────────────────────────────────────────────────
+
+function StrategyHeader({
+  goal, flat = [], isCollapsed, onToggle, milestoneCount, isDragOver, onRefresh,
+}: {
+  goal: Goal; flat?: Goal[]; isCollapsed: boolean; onToggle: () => void
+  milestoneCount: number; isDragOver: boolean; onRefresh: () => void
+}) {
+  const [showEdit, setShowEdit] = useState(false)
+  const [showDelete, setShowDelete] = useState(false)
+  const [showNotes, setShowNotes] = useState(false)
+  const [busy, setBusy] = useState<string | null>(null)
+
+  async function updateStatus(status: string) {
+    setBusy(status)
+    await fetch(`/api/goals/${goal.id}/status`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    }).catch(() => {})
+    onRefresh(); setBusy(null)
+  }
+
+  async function handleDelete() {
+    setBusy('delete')
+    const res = await fetch(`/api/goals/${goal.id}/delete`, { method: 'POST' }).catch(() => null)
+    if (res?.ok) onRefresh()
+    setBusy(null); setShowDelete(false)
+  }
+
+  return (
+    <div className={`mb-4 rounded-xl p-3 border transition-all duration-150 ${isDragOver ? 'border-indigo-600/50 bg-indigo-900/15 ring-1 ring-indigo-500/30' : 'border-zinc-800/40 bg-zinc-900/20'}`}>
+      <div className="flex items-center gap-2 group">
+        <button onClick={onToggle} className="flex items-center gap-2 flex-1 text-left min-w-0">
+          <span className="text-[10px] text-indigo-700 group-hover:text-indigo-500 flex-shrink-0">{isCollapsed ? '▶' : '▼'}</span>
+          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-900/40 text-indigo-400 border border-indigo-800/40 uppercase tracking-wider flex-shrink-0">Goal</span>
+          <h3 className="text-base font-semibold text-zinc-200 truncate">{goal.title}</h3>
+          <StatusBadge status={goal.status} />
+          {milestoneCount > 0 && <span className="text-[10px] text-zinc-600 flex-shrink-0">{milestoneCount} milestone{milestoneCount !== 1 ? 's' : ''}</span>}
+          {isDragOver && <span className="text-[10px] text-indigo-400 animate-pulse flex-shrink-0">↓ drop here</span>}
+          {goal.notes && !showNotes && <NotesPopover notes={goal.notes} />}
+        </button>
+        <div className="flex items-center gap-1 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button onClick={() => { setShowNotes(v => !v); setShowEdit(false) }}
+                  className={`text-[10px] px-2 py-0.5 rounded border transition-colors ${showNotes ? 'border-amber-700/60 bg-amber-900/20 text-amber-300' : 'border-zinc-700/50 bg-zinc-800/50 text-zinc-500 hover:text-amber-300'}`}
+                  title="Notes">
+            📓
+          </button>
+          <button onClick={() => { setShowEdit(v => !v); setShowNotes(false) }}
+                  className={`text-[10px] px-2 py-0.5 rounded border transition-colors ${showEdit ? 'border-sky-700/60 bg-sky-900/30 text-sky-300' : 'border-zinc-700/50 bg-zinc-800/50 text-zinc-400 hover:text-zinc-200'}`}>
+            ✎
+          </button>
+          <select value={goal.status} onChange={e => updateStatus(e.target.value)} disabled={!!busy}
+                  className="text-[10px] px-1.5 py-0.5 rounded border border-zinc-700/50 bg-zinc-800/60 text-zinc-300 focus:outline-none disabled:opacity-50 cursor-pointer">
+            {['active','planned','paused','blocked','completed','cancelled'].map(s => (
+              <option key={s} value={s}>{s.charAt(0).toUpperCase()+s.slice(1)}</option>
+            ))}
+          </select>
+          <button onClick={() => setShowDelete(v => !v)}
+                  className="text-[10px] px-2 py-0.5 rounded border border-red-900/50 bg-red-950/20 text-red-500 hover:text-red-400">🗑</button>
+        </div>
+      </div>
+      {goal.description && (
+        <p className="text-xs text-zinc-500 mt-1.5 ml-5 leading-relaxed line-clamp-3">{goal.description}</p>
+      )}
+      {goal.notes && !showNotes && (
+        <div className="ml-5 mt-1 border-l-2 border-zinc-700/60 pl-2 max-h-16 overflow-y-auto">
+          <NotesDisplay notes={goal.notes} />
+        </div>
+      )}
+      {showEdit && (
+        <div className="ml-5 mt-2">
+          <GoalEditForm goal={goal} flat={flat} onClose={() => setShowEdit(false)} onSaved={() => { setShowEdit(false); onRefresh() }} />
+        </div>
+      )}
+      {showNotes && (
+        <div className="ml-5 mt-2">
+          <NotesList goal={goal} onSaved={() => { onRefresh() }} />
+        </div>
+      )}
+      {showDelete && (
+        <div className="ml-5 mt-2 p-2 rounded-lg bg-red-950/30 border border-red-800/50 flex items-center gap-2">
+          <span className="text-xs text-red-300 flex-1">Delete &quot;{goal.title}&quot; permanently?</span>
+          <button onClick={handleDelete} disabled={busy === 'delete'}
+                  className="text-xs px-3 py-1 rounded bg-red-700 hover:bg-red-600 text-white disabled:opacity-50">
+            {busy === 'delete' ? '…' : 'Delete'}
+          </button>
+          <button onClick={() => setShowDelete(false)} className="text-xs px-3 py-1 rounded bg-zinc-700 text-zinc-300">Cancel</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── HierarchyView ──────────────────────────────────────────────────────────────
+
+interface HierarchyViewProps {
+  flat: Goal[]
+  onTrigger: (goal: Goal) => Promise<string>
+  onFlag: (taskId: string) => Promise<void>
+  triggeredTasks: Record<string, string>
+  taskStatuses: Record<string, TaskStatus>
+  filterStatuses: Set<string>
+  filterLevels: Set<string>
+  searchText: string
+  onRefresh: () => void
+}
+
+function HierarchyView({
+  flat, onTrigger, onFlag, triggeredTasks, taskStatuses,
+  filterStatuses, filterLevels, searchText, onRefresh,
+}: HierarchyViewProps) {
+  const [dragItem, setDragItem] = useState<{ id: string; level: string } | null>(null)
+  const [dragOverId, setDragOverId] = useState<string | null>(null)
+  const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set())
+
+  function toggle(id: string) {
+    setCollapsedIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
+  }
+
+  async function reparent(itemId: string, newParentId: string) {
+    await fetch('/api/goals', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: itemId, parent_id: newParentId }),
+    }).catch(() => {})
+    onRefresh()
+  }
+
+  // Deduplicate flat by id before building the parent map (guards against
+  // duplicate entries that can arise from concurrent SSE + refresh updates)
+  const seenIds = new Set<string>()
+  const dedupedFlat = flat.filter(g => { if (seenIds.has(g.id)) return false; seenIds.add(g.id); return true })
+
+  // Build parent → sorted children map (exclude archived)
+  const byParent = new Map<string | null, Goal[]>()
+  for (const g of dedupedFlat) {
+    if (g.status === 'archived') continue
+    const key = g.parent_id ?? null
+    if (!byParent.has(key)) byParent.set(key, [])
+    byParent.get(key)!.push(g)
+  }
+  for (const ch of byParent.values()) ch.sort((a, b) => a.sort_order - b.sort_order || a.priority - b.priority)
+
+  const roots = byParent.get(null) ?? []
+  const visions = roots.filter(g => g.level === 'vision')
+  const orphanedStrategies = roots.filter(g => g.level === 'strategy')
+  const orphanedMilestones = roots.filter(g => g.level === 'milestone')
+
+  function passes(g: Goal) {
+    if (!filterStatuses.has(g.status)) return false
+    if (!filterLevels.has(g.level)) return false
+    if (searchText && !nodeMatchesSearch(g, searchText)) return false
+    return true
+  }
+
+  function renderObjective(obj: Goal) {
+    if (!passes(obj)) return null
+    return (
+      <div
+        key={obj.id}
+        draggable
+        onDragStart={(e) => { e.stopPropagation(); setDragItem({ id: obj.id, level: 'objective' }) }}
+        onDragEnd={() => { setDragItem(null); setDragOverId(null) }}
+        className="cursor-grab active:cursor-grabbing"
+      >
+        <GoalCard
+          goal={obj} flat={flat} depth={3}
+          onTrigger={onTrigger} onFlag={onFlag}
+          triggeredTaskId={triggeredTasks[obj.id]}
+          taskStatus={taskStatuses[obj.id]}
+          allTaskStatuses={taskStatuses}
+          onRefresh={onRefresh}
+        />
+      </div>
+    )
+  }
+
+  function renderMilestone(ms: Goal, orphaned = false) {
+    const objectives = (byParent.get(ms.id) ?? []).filter(g => g.level === 'objective')
+    const isDragTarget = dragItem?.level === 'objective' && dragOverId === ms.id
+    const msVisible = passes(ms)
+    const hasVisibleObj = objectives.some(passes)
+    if (!msVisible && !hasVisibleObj) return null
+
+    return (
+      <div
+        key={ms.id}
+        className={`mb-2 rounded-lg transition-all duration-150 ${isDragTarget ? 'ring-1 ring-blue-500/50 bg-blue-900/5' : ''}`}
+        onDragOver={dragItem?.level === 'objective' ? (e) => { e.preventDefault(); setDragOverId(ms.id) } : undefined}
+        onDragLeave={dragItem?.level === 'objective' ? (e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOverId(null) } : undefined}
+        onDrop={dragItem?.level === 'objective' ? async (e) => {
+          e.preventDefault(); e.stopPropagation(); setDragOverId(null)
+          if (dragItem && dragItem.id !== ms.id) await reparent(dragItem.id, ms.id)
+          setDragItem(null)
+        } : undefined}
+      >
+        {msVisible && (
+          <div
+            draggable
+            onDragStart={(e) => { e.stopPropagation(); setDragItem({ id: ms.id, level: 'milestone' }) }}
+            onDragEnd={() => { setDragItem(null); setDragOverId(null) }}
+            className="cursor-grab active:cursor-grabbing"
+            title="Drag to move to a different strategy"
+          >
+            <GoalCard
+              goal={ms} flat={flat} depth={orphaned ? 0 : 2}
+              onTrigger={onTrigger} onFlag={onFlag}
+              triggeredTaskId={triggeredTasks[ms.id]}
+              taskStatus={taskStatuses[ms.id]}
+              allTaskStatuses={taskStatuses}
+              onRefresh={onRefresh}
+            />
+          </div>
+        )}
+        {isDragTarget && <div className="mx-4 mb-1 h-0.5 bg-blue-500/40 rounded-full" />}
+        {objectives.length > 0 && (
+          <div className="ml-6 space-y-0">
+            {objectives.map(renderObjective)}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  function renderStrategy(strat: Goal, orphaned = false) {
+    const milestones = (byParent.get(strat.id) ?? []).filter(g => g.level === 'milestone')
+    const isCollapsed = collapsedIds.has(strat.id)
+    const isDragTarget = dragItem?.level === 'milestone' && dragOverId === strat.id
+
+    return (
+      <div
+        key={strat.id}
+        className={orphaned ? 'mb-4' : 'mb-4 ml-4'}
+        onDragOver={dragItem?.level === 'milestone' ? (e) => { e.preventDefault(); setDragOverId(strat.id) } : undefined}
+        onDragLeave={dragItem?.level === 'milestone' ? (e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOverId(null) } : undefined}
+        onDrop={dragItem?.level === 'milestone' ? async (e) => {
+          e.preventDefault(); e.stopPropagation(); setDragOverId(null)
+          if (dragItem && dragItem.id !== strat.id) await reparent(dragItem.id, strat.id)
+          setDragItem(null)
+        } : undefined}
+      >
+        <StrategyHeader
+          goal={strat}
+          flat={flat}
+          isCollapsed={isCollapsed}
+          onToggle={() => toggle(strat.id)}
+          milestoneCount={milestones.length}
+          isDragOver={isDragTarget}
+          onRefresh={onRefresh}
+        />
+        {!isCollapsed && (
+          <div className="ml-4 space-y-0">
+            {milestones.map(ms => renderMilestone(ms))}
+            {milestones.length === 0 && (
+              <div className={`py-3 text-center text-[11px] rounded-lg border border-dashed transition-colors ${isDragTarget ? 'border-indigo-600/50 text-indigo-500' : 'border-zinc-800/50 text-zinc-700'}`}>
+                {isDragTarget ? 'Drop milestone here' : 'No milestones — drag one here or add below'}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  function renderVision(vision: Goal) {
+    const children = byParent.get(vision.id) ?? []
+    const strategies = children.filter(g => g.level === 'strategy')
+    const directMilestones = children.filter(g => g.level === 'milestone')
+    const isCollapsed = collapsedIds.has(vision.id)
+
+    return (
+      <div key={vision.id}>
+        <VisionHeader
+          goal={vision}
+          flat={flat}
+          isCollapsed={isCollapsed}
+          onToggle={() => toggle(vision.id)}
+          strategyCount={strategies.length}
+          onRefresh={onRefresh}
+        />
+        {!isCollapsed && (
+          <div>
+            {strategies.map(s => renderStrategy(s))}
+            {directMilestones.map(ms => renderMilestone(ms))}
+            {strategies.length === 0 && directMilestones.length === 0 && (
+              <div className="ml-6 py-4 text-center text-xs text-zinc-700">
+                No strategies or milestones yet — add one using the + Add Goal button
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  const hasOrphans = orphanedStrategies.length > 0 || orphanedMilestones.length > 0
+
+  if (visions.length === 0 && orphanedStrategies.length === 0 && orphanedMilestones.length === 0) {
+    return <div className="text-zinc-600 text-sm text-center py-12">No goals match the current filters</div>
+  }
+
+  return (
+    <div>
+      {visions.map(renderVision)}
+      {hasOrphans && (
+        <div className={visions.length > 0 ? 'mt-6 pt-6 border-t border-zinc-800/40' : ''}>
+          {visions.length > 0 && <div className="text-[10px] font-semibold text-zinc-600 uppercase tracking-widest mb-4">Uncategorized</div>}
+          {orphanedStrategies.map(s => renderStrategy(s, true))}
+          {orphanedMilestones.map(ms => renderMilestone(ms, true))}
+        </div>
+      )}
+      {dragItem && (
+        <div className="fixed bottom-4 right-4 z-50 px-3 py-1.5 rounded-full bg-zinc-800 border border-zinc-700 text-[11px] text-zinc-400 shadow-lg">
+          Dragging {LEVEL_DISPLAY[dragItem.level] ?? dragItem.level} — drop on a {dragItem.level === 'milestone' ? 'goal' : 'milestone'}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── page ───────────────────────────────────────────────────────────────────────
 
 export default function GoalsPage() {
@@ -1704,21 +2614,142 @@ export default function GoalsPage() {
   const [goals, setGoals] = useState<Goal[]>([])
   const [loading, setLoading] = useState(true)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
-  const [showAddPanel, setShowAddPanel] = useState(false)
+  const [addPanelLevel, setAddPanelLevel] = useState<Goal['level'] | null>(null)
+  const [showNewDropdown, setShowNewDropdown] = useState(false)
   const [triggeredTasks, setTriggeredTasks] = useState<Record<string, string>>({})
   const [taskStatuses, setTaskStatuses] = useState<Record<string, TaskStatus>>({})
 
-  // filters — completed hidden by default
-  const [filterStatuses, setFilterStatuses] = useState<Set<string>>(
-    new Set(['active', 'planned', 'paused', 'blocked'])
-  )
+  // keyboard shortcuts
+  const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null)
+  const [showKeyboardHelp, setShowKeyboardHelp] = useState(false)
+  const keyboardHelpTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+
+  // filters — persisted in localStorage
+  const [filterStatuses, setFilterStatuses] = useState<Set<string>>(new Set(['active', 'planned', 'paused', 'blocked']))
   const [filterLevels, setFilterLevels] = useState<Set<string>>(new Set(ALL_LEVELS))
   const [sortBy, setSortBy] = useState<SortBy>('priority')
+
+  // restore persisted filter state after hydration
+  useEffect(() => {
+    try {
+      const savedStatuses = localStorage.getItem('goals_filterStatuses')
+      if (savedStatuses) setFilterStatuses(new Set(JSON.parse(savedStatuses)))
+      const savedLevels = localStorage.getItem('goals_filterLevels')
+      if (savedLevels) setFilterLevels(new Set(JSON.parse(savedLevels)))
+      const savedSort = localStorage.getItem('goals_sortBy') as SortBy
+      if (savedSort) setSortBy(savedSort)
+    } catch {}
+  }, [])
   const [searchText, setSearchText] = useState('')
 
   // section collapse state
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set())
   const hierarchyRef = useRef<HTMLDivElement>(null)
+
+  // keyboard handlers
+  const allVisibleGoals = goals.length > 0
+    ? sortGoals(goals.filter((g) => nodeMatchesFilter(g, filterStatuses, filterLevels, searchText)), sortBy)
+    : []
+
+  const handleKeyboardHelp = useCallback(() => {
+    setShowKeyboardHelp(true)
+    if (keyboardHelpTimeoutRef.current) clearTimeout(keyboardHelpTimeoutRef.current)
+    keyboardHelpTimeoutRef.current = setTimeout(() => setShowKeyboardHelp(false), 3000)
+  }, [])
+
+  const handleOpenNewGoal = useCallback(() => {
+    setShowNewDropdown(true)
+    handleKeyboardHelp()
+  }, [handleKeyboardHelp])
+
+  const handleEditSelected = useCallback(() => {
+    if (!selectedGoalId) {
+      handleKeyboardHelp()
+      return
+    }
+    const goal = flat.find((g) => g.id === selectedGoalId)
+    if (goal) {
+      const editBtn = document.querySelector(`[data-goal-id="${goal.id}"] [data-action="edit"]`) as HTMLButtonElement
+      if (editBtn) editBtn.click()
+      handleKeyboardHelp()
+    }
+  }, [selectedGoalId, flat, handleKeyboardHelp])
+
+  const handleToggleDetails = useCallback(() => {
+    if (!selectedGoalId) {
+      handleKeyboardHelp()
+      return
+    }
+    const goal = flat.find((g) => g.id === selectedGoalId)
+    if (goal) {
+      const toggleBtn = document.querySelector(`[data-goal-id="${goal.id}"] [data-action="toggle-details"]`) as HTMLButtonElement
+      if (toggleBtn) toggleBtn.click()
+      handleKeyboardHelp()
+    }
+  }, [selectedGoalId, flat, handleKeyboardHelp])
+
+  const handleNavigateGoals = useCallback((direction: 'up' | 'down') => {
+    if (allVisibleGoals.length === 0) {
+      handleKeyboardHelp()
+      return
+    }
+
+    setSelectedGoalId((currentId) => {
+      const currentIndex = currentId
+        ? allVisibleGoals.findIndex((g) => g.id === currentId)
+        : -1
+
+      let nextIndex: number
+      if (direction === 'down') {
+        nextIndex = currentIndex < allVisibleGoals.length - 1 ? currentIndex + 1 : 0
+      } else {
+        nextIndex = currentIndex > 0 ? currentIndex - 1 : allVisibleGoals.length - 1
+      }
+
+      const nextGoal = allVisibleGoals[nextIndex]
+      if (nextGoal) {
+        setTimeout(() => {
+          const elem = document.querySelector(`[data-goal-id="${nextGoal.id}"]`)
+          if (elem) {
+            elem.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+          }
+        }, 0)
+        return nextGoal.id
+      }
+      return currentId
+    })
+    handleKeyboardHelp()
+  }, [allVisibleGoals, handleKeyboardHelp])
+
+  useKeyboard({
+    shortcuts: [
+      {
+        key: 'n',
+        callback: handleOpenNewGoal,
+        description: 'Open new goal'
+      },
+      {
+        key: 'e',
+        callback: handleEditSelected,
+        description: 'Edit selected'
+      },
+      {
+        key: 'd',
+        callback: handleToggleDetails,
+        description: 'Toggle details'
+      },
+      {
+        key: 'ArrowDown',
+        callback: () => handleNavigateGoals('down'),
+        description: 'Next goal'
+      },
+      {
+        key: 'ArrowUp',
+        callback: () => handleNavigateGoals('up'),
+        description: 'Previous goal'
+      }
+    ]
+  })
 
   function toggleSection(s: string) {
     setCollapsedSections((prev) => {
@@ -1727,6 +2758,17 @@ export default function GoalsPage() {
       return next
     })
   }
+
+  // Persist filter state to localStorage
+  useEffect(() => {
+    try { localStorage.setItem('goals_filterStatuses', JSON.stringify([...filterStatuses])) } catch { /* ignore */ }
+  }, [filterStatuses])
+  useEffect(() => {
+    try { localStorage.setItem('goals_filterLevels', JSON.stringify([...filterLevels])) } catch { /* ignore */ }
+  }, [filterLevels])
+  useEffect(() => {
+    try { localStorage.setItem('goals_sortBy', sortBy) } catch { /* ignore */ }
+  }, [sortBy])
 
   function toggleStatus(s: string) {
     setFilterStatuses((prev) => {
@@ -1826,27 +2868,10 @@ export default function GoalsPage() {
         const data: { tasks: Record<string, TaskStatus> } = await res.json()
         setTaskStatuses(data.tasks ?? {})
 
-        // Auto-advance milestones where all tasks are completed
-        const candidates = flat.filter((g) =>
-          g.level === 'milestone' &&
-          g.status !== 'completed' &&
-          g.status !== 'archived' &&
-          (data.tasks[g.id]?.counts?.total ?? 0) > 0 &&
-          (data.tasks[g.id]?.counts?.active ?? 1) === 0 &&
-          (data.tasks[g.id]?.counts?.blocked ?? 1) === 0
-        )
-        for (const goal of candidates) {
-          fetch('/api/goals', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              id: goal.id,
-              status: 'completed',
-              progress: 100,
-              completed_at: new Date().toISOString(),
-            }),
-          }).catch(() => {/* non-fatal */})
-        }
+        // DB trigger (trg_goal_progress_on_task_complete) handles writing progress to goals.
+        // No frontend write-back needed — that would conflict with manual overrides.
+
+        // Goal status is NOT auto-changed here — Jeff sets status manually.
       } catch { /* silent */ }
     }
 
@@ -1859,7 +2884,7 @@ export default function GoalsPage() {
     const res = await fetch('/api/goals/trigger', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ goalId: goal.id, title: goal.title, description: goal.description }),
+      body: JSON.stringify({ goalId: goal.id, title: goal.title, description: goal.description, notes: goal.notes }),
     })
     if (!res.ok) throw new Error('Failed to trigger')
     const data = await res.json()
@@ -1890,13 +2915,12 @@ export default function GoalsPage() {
   }
 
   function handleGoalCreated() {
-    window.location.reload()
+    fetch('/api/goals').then(r => r.json()).then(d => {
+      // Use applyUpdate (merge into existing flat) rather than replacing,
+      // so the SSE flatMap and page state don't diverge and create duplicates
+      if (d.flat) applyUpdate(d.flat)
+    }).catch(() => {})
   }
-
-  const filteredGoals = goals.filter((g) =>
-    nodeMatchesFilter(g, filterStatuses, filterLevels, searchText)
-  )
-  const visibleGoals = sortGoals(filteredGoals, sortBy)
 
   const calendarCollapsed = collapsedSections.has('calendar')
   const summaryCollapsed = collapsedSections.has('summary')
@@ -1914,12 +2938,33 @@ export default function GoalsPage() {
           <p className="text-xs text-zinc-500">Track goals, trigger work, and schedule milestones</p>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => setShowAddPanel(true)}
-            className="text-xs px-3 py-1.5 rounded-full font-semibold bg-purple-900/30 border border-purple-700/50 text-purple-300 hover:bg-purple-900/50 hover:text-purple-200 transition-all"
-          >
-            + Add Goal
-          </button>
+          <div className="relative">
+            <button
+              onClick={() => setShowNewDropdown(v => !v)}
+              className="text-xs px-3 py-1.5 rounded-full font-semibold bg-purple-900/30 border border-purple-700/50 text-purple-300 hover:bg-purple-900/50 hover:text-purple-200 transition-all flex items-center gap-1.5"
+            >
+              + New <span className="text-purple-500 text-[10px]">▼</span>
+            </button>
+            {showNewDropdown && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setShowNewDropdown(false)} />
+                <div
+                  className="absolute right-0 top-full mt-1 rounded-xl border border-zinc-800 shadow-2xl z-50 overflow-hidden py-1 min-w-[140px]"
+                  style={{ background: 'rgba(14,14,16,0.98)' }}
+                >
+                  {(['vision', 'strategy', 'milestone', 'objective'] as Goal['level'][]).map(lv => (
+                    <button
+                      key={lv}
+                      onClick={() => { setAddPanelLevel(lv); setShowNewDropdown(false) }}
+                      className="w-full text-left px-4 py-2 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-white transition-colors"
+                    >
+                      {LEVEL_LABELS[lv]}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
           {loading && (
             <div className="w-3 h-3 border-2 border-zinc-700 border-t-blue-400 rounded-full animate-spin" />
           )}
@@ -1996,40 +3041,20 @@ export default function GoalsPage() {
               title="Goal Hierarchy"
               collapsed={hierarchyCollapsed}
               onToggle={() => toggleSection('hierarchy')}
-              count={visibleGoals.length !== goals.length ? visibleGoals.length : goals.length}
+              count={flat.filter(g => g.status !== 'archived').length}
             />
-            {visibleGoals.length !== goals.length && !hierarchyCollapsed && (
-              <p className="text-[10px] text-zinc-600 mb-3 -mt-2">
-                Showing {visibleGoals.length} of {goals.length} root goals
-              </p>
-            )}
             {!hierarchyCollapsed && (
-              visibleGoals.length === 0 ? (
-                <div className="text-zinc-600 text-sm text-center py-12">
-                  No goals match the current filters
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {visibleGoals.map((g) => (
-                    <GoalCard
-                      key={g.id}
-                      goal={g}
-                      depth={0}
-                      onTrigger={handleTrigger}
-                      onFlag={handleFlag}
-                      triggeredTaskId={triggeredTasks[g.id]}
-                      taskStatus={taskStatuses[g.id]}
-                      allTaskStatuses={taskStatuses}
-                      filterStatuses={filterStatuses}
-                      filterLevels={filterLevels}
-                      searchText={searchText}
-                      onArchive={handleGoalArchived}
-                      onRestore={handleGoalRestored}
-                      onRefresh={handleGoalRestored}
-                    />
-                  ))}
-                </div>
-              )
+              <HierarchyView
+                flat={flat}
+                onTrigger={handleTrigger}
+                onFlag={handleFlag}
+                triggeredTasks={triggeredTasks}
+                taskStatuses={taskStatuses}
+                filterStatuses={filterStatuses}
+                filterLevels={filterLevels}
+                searchText={searchText}
+                onRefresh={handleGoalRestored}
+              />
             )}
           </div>
         </>
@@ -2038,12 +3063,38 @@ export default function GoalsPage() {
       {/* Archived goals section */}
       <GoalsArchiveSection onRestore={handleGoalRestored} />
 
-      {showAddPanel && (
+      {addPanelLevel && (
         <AddGoalPanel
           flat={flat}
-          onClose={() => setShowAddPanel(false)}
+          onClose={() => setAddPanelLevel(null)}
           onCreated={handleGoalCreated}
+          initialLevel={addPanelLevel}
         />
+      )}
+
+      {/* Keyboard help tooltip */}
+      {showKeyboardHelp && (
+        <div className="fixed bottom-4 right-4 bg-zinc-900 border border-zinc-700 rounded-lg shadow-lg p-3 max-w-xs text-xs z-50 animate-in fade-in duration-200">
+          <div className="font-semibold text-zinc-300 mb-2">Keyboard Shortcuts</div>
+          <div className="space-y-1 text-zinc-400">
+            <div className="flex justify-between gap-2">
+              <kbd className="bg-zinc-800 px-1.5 py-0.5 rounded text-[10px] font-mono">N</kbd>
+              <span>Open new goal</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <kbd className="bg-zinc-800 px-1.5 py-0.5 rounded text-[10px] font-mono">E</kbd>
+              <span>Edit selected</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <kbd className="bg-zinc-800 px-1.5 py-0.5 rounded text-[10px] font-mono">D</kbd>
+              <span>Toggle details</span>
+            </div>
+            <div className="flex justify-between gap-2">
+              <kbd className="bg-zinc-800 px-1.5 py-0.5 rounded text-[10px] font-mono">↑↓</kbd>
+              <span>Navigate goals</span>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

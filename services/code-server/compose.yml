@@ -1,0 +1,24 @@
+services:
+  code-server:
+    image: lscr.io/linuxserver/code-server:latest
+    container_name: code-server
+    restart: unless-stopped
+    networks:
+      - proxy
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Phoenix
+      - DEFAULT_WORKSPACE=/workspace/azlab
+      - PROXY_DOMAIN=code.az-lab.dev
+    volumes:
+      - ./config:/config
+      - /home/almty1:/workspace/home
+      - /home/almty1/azlab:/workspace/azlab
+      - /home/almty1/dashboard:/workspace/dashboard
+      - /home/almty1/claude:/workspace/claude
+      - /home/almty1/.ssh:/config/.ssh:ro
+
+networks:
+  proxy:
+    external: true

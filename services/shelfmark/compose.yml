@@ -1,0 +1,31 @@
+services:
+  shelfmark:
+    image: ghcr.io/calibrain/shelfmark:latest
+    container_name: shelfmark
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Phoenix
+      - INGEST_DIR=/books
+    volumes:
+      - shelfmark-config:/config:Z
+      - /mnt/calibre/ingest:/books  # NFS on Proxmox nvme-fast-02
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.shelfmark.rule=Host(`shelfmark.az-lab.dev`)"
+      - "traefik.http.routers.shelfmark.entrypoints=websecure"
+      - "traefik.http.routers.shelfmark.tls=true"
+      - "traefik.http.routers.shelfmark.tls.certresolver=le"
+      - "traefik.http.routers.shelfmark.middlewares=lan-allow@file"
+      - "traefik.http.services.shelfmark.loadbalancer.server.port=8084"
+
+networks:
+  proxy:
+    external: true
+
+volumes:
+  shelfmark-config:
+    external: true

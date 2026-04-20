@@ -108,7 +108,14 @@ export function settingsRouter(store: NotificationStore): Router {
   router.post('/settings/fusion/enable', async (req, res) => {
     try {
       const settings = await store.getSettings();
-      const updated = { ...settings, fusionMode: true };
+      const updated = {
+        sounds: {},
+        thresholds: {},
+        enabledSources: {},
+        snoozeMinutes: 30,
+        ...settings,
+        fusionMode: true,
+      };
       await store.saveSettings(updated);
       res.json({ ok: true, fusionMode: true });
     } catch (err) {

@@ -1,0 +1,30 @@
+{
+  "name": "ms-smtp-relay",
+  "version": "1.0.0",
+  "description": "OAuth2 SMTP relay for Microsoft personal accounts via Graph API",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "auth": "tsx src/auth-setup.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^2.16.0",
+    "express": "^4.21.2",
+    "mailparser": "^3.7.2",
+    "smtp-server": "^3.13.6"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "@types/smtp-server": "^3.5.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

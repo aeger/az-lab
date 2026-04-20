@@ -1,0 +1,882 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="default">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AZ-Lab Dashboard — Design Preview</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* ── Design Token System ──────────────────────────────────────────── */
+    :root {
+      /* Base palette */
+      --bg-page:       #0a0a0a;
+      --bg-card:       rgba(24,24,27,0.6);
+      --bg-card-hover: rgba(30,30,35,0.8);
+      --border-base:   rgba(63,63,70,0.5);
+      --border-subtle: rgba(39,39,42,0.6);
+
+      /* Accent — default blue/purple */
+      --accent-h: 252;
+      --accent-s: 80%;
+      --accent-l: 65%;
+      --accent:        hsl(var(--accent-h), var(--accent-s), var(--accent-l));
+      --accent-dim:    hsl(var(--accent-h), 40%, 30%);
+      --accent-glow:   hsl(var(--accent-h), var(--accent-s), var(--accent-l), 0.12);
+
+      /* Attention levels */
+      --critical-border: #dc2626;
+      --critical-bg:     rgba(127,29,29,0.12);
+      --warning-border:  #d97706;
+      --warning-bg:      rgba(120,53,15,0.12);
+      --success-border:  #16a34a;
+      --success-bg:      rgba(20,83,45,0.08);
+
+      /* Typography scale */
+      --text-meta:    9px;
+      --text-caption: 10px;
+      --text-body:    12px;
+      --text-label:   13px;
+      --text-subhead: 15px;
+      --text-head:    20px;
+
+      /* Spacing */
+      --sp-xs: 4px;
+      --sp-sm: 8px;
+      --sp-md: 12px;
+      --sp-lg: 16px;
+      --sp-xl: 24px;
+
+      /* Holiday extras */
+      --holiday-particle: none;
+      --holiday-banner-bg: transparent;
+      --holiday-banner-text: transparent;
+    }
+
+    /* ── Theme: Halloween ─────────────────────────────────────────────── */
+    [data-theme="halloween"] {
+      --bg-page:       #0d0a00;
+      --bg-card:       rgba(25,15,0,0.7);
+      --border-base:   rgba(180,80,0,0.35);
+      --accent-h: 28;
+      --accent-s: 100%;
+      --accent-l: 55%;
+      --critical-border: #ea580c;
+      --critical-bg:     rgba(120,40,0,0.2);
+      --holiday-banner-bg: linear-gradient(135deg, #7c2d12, #1c0a00);
+      --holiday-banner-text: #fb923c;
+    }
+    [data-theme="halloween"] body { background: radial-gradient(ellipse at top, #1a0800 0%, #0d0500 100%); }
+    [data-theme="halloween"] .holiday-particles::before {
+      content: "🎃 👻 🕷️ 🦇";
+      position: fixed; top: 8px; right: 16px;
+      font-size: 18px; letter-spacing: 8px; opacity: 0.5;
+      animation: float 4s ease-in-out infinite;
+    }
+
+    /* ── Theme: Christmas ─────────────────────────────────────────────── */
+    [data-theme="christmas"] {
+      --bg-page:       #020b08;
+      --bg-card:       rgba(4,20,12,0.7);
+      --border-base:   rgba(22,101,52,0.5);
+      --accent-h: 142;
+      --accent-s: 70%;
+      --accent-l: 45%;
+      --critical-border: #dc2626;
+      --critical-bg:     rgba(60,0,0,0.2);
+      --holiday-banner-bg: linear-gradient(135deg, #14532d, #450a0a);
+      --holiday-banner-text: #86efac;
+    }
+    [data-theme="christmas"] body { background: radial-gradient(ellipse at top, #071a0f 0%, #020b08 100%); }
+    [data-theme="christmas"] .holiday-particles::before {
+      content: "🎄 ⭐ ❄️ 🎁";
+      position: fixed; top: 8px; right: 16px;
+      font-size: 18px; letter-spacing: 8px; opacity: 0.6;
+      animation: float 5s ease-in-out infinite;
+    }
+    [data-theme="christmas"] .snowflakes { display: block !important; }
+
+    /* ── Theme: Fourth of July ────────────────────────────────────────── */
+    [data-theme="july4"] {
+      --bg-page:       #020310;
+      --bg-card:       rgba(5,7,30,0.7);
+      --border-base:   rgba(30,58,138,0.5);
+      --accent-h: 220;
+      --accent-s: 80%;
+      --accent-l: 60%;
+      --critical-border: #dc2626;
+      --holiday-banner-bg: linear-gradient(135deg, #1e1b4b, #450a0a);
+      --holiday-banner-text: #fbbf24;
+    }
+    [data-theme="july4"] .holiday-particles::before {
+      content: "🎆 🇺🇸 🎇 ✨";
+      position: fixed; top: 8px; right: 16px;
+      font-size: 18px; letter-spacing: 8px; opacity: 0.6;
+      animation: sparkle 1.5s ease-in-out infinite alternate;
+    }
+
+    /* ── Theme: Valentine's ───────────────────────────────────────────── */
+    [data-theme="valentine"] {
+      --bg-page:       #100508;
+      --bg-card:       rgba(28,8,15,0.7);
+      --border-base:   rgba(159,18,57,0.35);
+      --accent-h: 340;
+      --accent-s: 75%;
+      --accent-l: 60%;
+      --holiday-banner-bg: linear-gradient(135deg, #4c0519, #1f0010);
+      --holiday-banner-text: #fda4af;
+    }
+    [data-theme="valentine"] .holiday-particles::before {
+      content: "💕 ❤️ 💝 🌹";
+      position: fixed; top: 8px; right: 16px;
+      font-size: 18px; letter-spacing: 8px; opacity: 0.6;
+      animation: float 3s ease-in-out infinite;
+    }
+
+    /* ── Theme: St. Patrick's ─────────────────────────────────────────── */
+    [data-theme="stpatricks"] {
+      --bg-page:       #020d04;
+      --bg-card:       rgba(5,22,8,0.7);
+      --border-base:   rgba(21,128,61,0.4);
+      --accent-h: 130;
+      --accent-s: 70%;
+      --accent-l: 45%;
+      --holiday-banner-bg: linear-gradient(135deg, #14532d, #052e16);
+      --holiday-banner-text: #86efac;
+    }
+    [data-theme="stpatricks"] .holiday-particles::before {
+      content: "☘️ 🍀 🌈 🪙";
+      position: fixed; top: 8px; right: 16px;
+      font-size: 18px; letter-spacing: 8px; opacity: 0.6;
+    }
+
+    /* ── Theme: New Year ──────────────────────────────────────────────── */
+    [data-theme="newyear"] {
+      --bg-page:       #050310;
+      --bg-card:       rgba(10,5,25,0.7);
+      --border-base:   rgba(124,58,237,0.4);
+      --accent-h: 270;
+      --accent-s: 80%;
+      --accent-l: 65%;
+      --holiday-banner-bg: linear-gradient(135deg, #1e1b4b, #0f0920);
+      --holiday-banner-text: #fde68a;
+    }
+    [data-theme="newyear"] .holiday-particles::before {
+      content: "✨ 🎆 🥂 🎊";
+      position: fixed; top: 8px; right: 16px;
+      font-size: 18px; letter-spacing: 8px; opacity: 0.8;
+      animation: sparkle 0.8s ease-in-out infinite alternate;
+    }
+
+    /* ── Base Styles ──────────────────────────────────────────────────── */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg-page);
+      color: #e4e4e7;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      min-height: 100vh;
+      transition: background 0.5s ease, color 0.3s ease;
+    }
+
+    /* Card system */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-base);
+      border-radius: 12px;
+      padding: var(--sp-lg);
+      transition: background 0.3s ease, border-color 0.3s ease;
+    }
+    .card:hover { background: var(--bg-card-hover); }
+    .card-title {
+      font-size: var(--text-label);
+      font-weight: 600;
+      color: #a1a1aa;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: var(--sp-sm);
+    }
+
+    /* Attention levels */
+    .card--critical {
+      border-left: 3px solid var(--critical-border);
+      background: var(--critical-bg);
+    }
+    .card--warning {
+      border-left: 3px solid var(--warning-border);
+      background: var(--warning-bg);
+    }
+    .card--success {
+      border-left: 3px solid var(--success-border);
+      background: var(--success-bg);
+    }
+    .card--accent {
+      border-left: 3px solid var(--accent);
+      background: var(--accent-glow);
+    }
+    .card--secondary {
+      border: 1px solid var(--border-subtle);
+      opacity: 0.85;
+    }
+
+    /* Accent elements */
+    .accent-dot { background: var(--accent); }
+    .accent-text { color: var(--accent); }
+    .accent-bar { background: var(--accent); }
+
+    /* Progress bars */
+    .progress-track {
+      height: 4px;
+      background: rgba(63,63,70,0.4);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: var(--accent);
+      transition: width 0.6s ease;
+    }
+    .progress-fill--success { background: #22c55e; }
+    .progress-fill--warning { background: #f59e0b; }
+    .progress-fill--danger  { background: #ef4444; }
+
+    /* Status badge */
+    .badge {
+      font-size: var(--text-meta);
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid currentColor;
+    }
+    .badge--active    { color: #60a5fa; border-color: rgba(96,165,250,0.3); background: rgba(30,64,175,0.2); }
+    .badge--completed { color: #4ade80; border-color: rgba(74,222,128,0.3); background: rgba(20,83,45,0.2); }
+    .badge--blocked   { color: #fbbf24; border-color: rgba(251,191,36,0.3); background: rgba(120,53,15,0.2); }
+    .badge--planned   { color: #a1a1aa; border-color: rgba(113,113,122,0.3); background: rgba(39,39,42,0.3); }
+
+    /* Quick link pill */
+    .quick-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: rgba(39,39,42,0.4);
+      border: 1px solid rgba(63,63,70,0.4);
+      color: #d4d4d8;
+      font-size: var(--text-body);
+      text-decoration: none;
+      transition: all 0.15s ease;
+      cursor: pointer;
+    }
+    .quick-link:hover {
+      background: rgba(63,63,70,0.6);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    /* Holiday banner */
+    .holiday-banner {
+      background: var(--holiday-banner-bg);
+      color: var(--holiday-banner-text);
+      padding: 6px 16px;
+      text-align: center;
+      font-size: var(--text-body);
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      display: none;
+    }
+    [data-theme]:not([data-theme="default"]) .holiday-banner { display: block; }
+
+    /* Snowflakes */
+    .snowflakes { display: none; pointer-events: none; }
+    .snowflake {
+      position: fixed; top: -20px; color: #93c5fd;
+      font-size: 14px; opacity: 0;
+      animation: snowfall linear infinite;
+    }
+    @keyframes snowfall {
+      0% { transform: translateY(-20px) rotate(0deg); opacity: 0.8; }
+      100% { transform: translateY(100vh) rotate(360deg); opacity: 0; }
+    }
+    @keyframes float {
+      0%, 100% { transform: translateY(0px); }
+      50% { transform: translateY(-4px); }
+    }
+    @keyframes sparkle {
+      0% { opacity: 0.4; transform: scale(1); }
+      100% { opacity: 1; transform: scale(1.05); }
+    }
+
+    /* Sidebar nav */
+    .sidebar {
+      position: fixed; left: 0; top: 0; bottom: 0;
+      width: 48px; background: rgba(10,10,10,0.9);
+      border-right: 1px solid var(--border-subtle);
+      display: flex; flex-direction: column;
+      align-items: center; padding-top: 60px; gap: 4px;
+      z-index: 10;
+    }
+    .sidebar-item {
+      width: 36px; height: 36px;
+      display: flex; align-items: center; justify-content: center;
+      border-radius: 8px; font-size: 16px;
+      cursor: pointer; transition: all 0.15s ease;
+      color: #71717a; text-decoration: none;
+    }
+    .sidebar-item:hover, .sidebar-item.active {
+      background: rgba(var(--accent-h), 60%, 50%, 0.15);
+      color: #e4e4e7;
+    }
+    .sidebar-item.active { color: var(--accent); }
+
+    /* Theme switcher */
+    .theme-switcher {
+      position: fixed; top: 16px; right: 16px;
+      display: flex; gap: 4px; z-index: 20;
+    }
+    .theme-btn {
+      padding: 4px 10px; border-radius: 6px;
+      font-size: 11px; font-weight: 600; cursor: pointer;
+      border: 1px solid rgba(63,63,70,0.6);
+      background: rgba(24,24,27,0.8); color: #a1a1aa;
+      transition: all 0.15s ease;
+    }
+    .theme-btn:hover { color: #fff; border-color: var(--accent); }
+    .theme-btn.active { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
+
+    /* Typography demo */
+    .type-scale-row { display: flex; align-items: baseline; gap: 16px; padding: 6px 0; border-bottom: 1px solid var(--border-subtle); }
+    .type-label { font-size: 10px; color: #52525b; width: 64px; flex-shrink: 0; }
+    .type-sample { color: #d4d4d8; }
+
+    /* Color swatch */
+    .swatch-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .swatch {
+      width: 48px; height: 48px; border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.1);
+      position: relative;
+    }
+    .swatch-label {
+      position: absolute; bottom: -18px; left: 0; right: 0;
+      text-align: center; font-size: 9px; color: #71717a;
+    }
+
+    /* Section label */
+    .section-label {
+      font-size: var(--text-caption);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: #52525b;
+      margin-bottom: 10px;
+    }
+
+    /* Mini metric */
+    .metric { display: flex; flex-direction: column; gap: 2px; }
+    .metric-value { font-size: 22px; font-weight: 700; color: #f4f4f5; line-height: 1; }
+    .metric-label { font-size: var(--text-caption); color: #71717a; }
+    .metric-delta { font-size: var(--text-caption); }
+    .metric-delta--up { color: #4ade80; }
+    .metric-delta--down { color: #f87171; }
+
+    /* Container row */
+    .container-row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 0; border-bottom: 1px solid var(--border-subtle);
+    }
+    .container-row:last-child { border-bottom: none; }
+    .status-dot {
+      width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+    }
+    .status-dot--green  { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+    .status-dot--red    { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+    .status-dot--yellow { background: #eab308; box-shadow: 0 0 6px #eab308; }
+    .container-name { font-size: var(--text-body); color: #d4d4d8; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .container-actions { display: flex; gap: 4px; flex-shrink: 0; }
+    .action-btn {
+      padding: 2px 8px; border-radius: 4px;
+      font-size: 10px; font-weight: 600; cursor: pointer;
+      border: 1px solid rgba(63,63,70,0.5);
+      background: rgba(39,39,42,0.4); color: #71717a;
+      transition: all 0.15s ease;
+    }
+    .action-btn:hover { color: #d4d4d8; border-color: rgba(113,113,122,0.8); }
+    .action-btn--danger:hover { color: #f87171; border-color: rgba(239,68,68,0.5); }
+
+    /* Main scroll area */
+    .main-content { margin-left: 48px; min-height: 100vh; }
+    .page-inner { max-width: 1280px; margin: 0 auto; padding: 16px 24px; }
+
+    /* Responsive */
+    @media (max-width: 768px) { .sidebar { display: none; } .main-content { margin-left: 0; } }
+  </style>
+</head>
+<body>
+
+<!-- Holiday particle layer -->
+<div class="holiday-particles"></div>
+
+<!-- Christmas snowflakes -->
+<div class="snowflakes" id="snowflakes"></div>
+
+<!-- Sidebar navigation -->
+<nav class="sidebar">
+  <a class="sidebar-item active" href="#health" title="Health">💓</a>
+  <a class="sidebar-item" href="#goals" title="Goals">🎯</a>
+  <a class="sidebar-item" href="#containers" title="Containers">🐋</a>
+  <a class="sidebar-item" href="#monitor" title="Monitor">📊</a>
+  <a class="sidebar-item" href="#security" title="Security">🛡️</a>
+  <a class="sidebar-item" href="#terminal" title="Terminal">⌨️</a>
+  <a class="sidebar-item" href="#links" title="Quick Links">🔗</a>
+</nav>
+
+<!-- Theme switcher -->
+<div class="theme-switcher">
+  <button class="theme-btn active" onclick="setTheme('default')">Default</button>
+  <button class="theme-btn" onclick="setTheme('halloween')">🎃 Halloween</button>
+  <button class="theme-btn" onclick="setTheme('christmas')">🎄 Christmas</button>
+  <button class="theme-btn" onclick="setTheme('july4')">🎆 July 4</button>
+  <button class="theme-btn" onclick="setTheme('valentine')">💕 Valentine</button>
+  <button class="theme-btn" onclick="setTheme('stpatricks')">☘️ St. Pat</button>
+  <button class="theme-btn" onclick="setTheme('newyear')">✨ New Year</button>
+</div>
+
+<!-- Holiday banner (shown on themed modes) -->
+<div class="holiday-banner" id="holidayBanner">
+  Happy Halloween from AZ-Lab! 🎃
+</div>
+
+<!-- Main content -->
+<div class="main-content">
+  <div class="page-inner">
+
+    <!-- Page header -->
+    <div style="padding: 20px 0 24px; border-bottom: 1px solid var(--border-subtle); margin-bottom: 24px;">
+      <div style="display:flex; align-items:center; justify-content:space-between;">
+        <div>
+          <h1 style="font-size: var(--text-head); font-weight: 700; color: #fafafa;">AZ-Lab</h1>
+          <p style="font-size: var(--text-body); color: #52525b; margin-top: 2px;">svc-podman-01 · 192.168.1.181</p>
+        </div>
+        <div style="display:flex; gap: 8px; align-items:center;">
+          <span class="badge badge--active">Live</span>
+          <span style="font-size: var(--text-caption); color: #52525b;" id="clock">--:--:--</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SECTION: Design System ──────────────────────────────────────── -->
+    <p class="section-label">Design System Preview</p>
+
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 32px;">
+
+      <!-- Color palette -->
+      <div class="card">
+        <p class="card-title">Color Tokens</p>
+        <div style="margin-bottom: 24px;">
+          <p style="font-size: 10px; color: #52525b; margin-bottom: 10px;">ACCENT (theme-adaptive)</p>
+          <div class="swatch-row">
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: var(--accent);"></div>
+              <span class="swatch-label">accent</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: var(--accent-dim);"></div>
+              <span class="swatch-label">dim</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: var(--accent-glow); border: 1px solid var(--accent);"></div>
+              <span class="swatch-label">glow</span>
+            </div>
+          </div>
+        </div>
+        <div style="margin-bottom: 20px;">
+          <p style="font-size: 10px; color: #52525b; margin-bottom: 10px;">ATTENTION LEVELS</p>
+          <div class="swatch-row">
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: var(--critical-bg); border-left: 3px solid var(--critical-border);"></div>
+              <span class="swatch-label">critical</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: var(--warning-bg); border-left: 3px solid var(--warning-border);"></div>
+              <span class="swatch-label">warning</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: var(--success-bg); border-left: 3px solid var(--success-border);"></div>
+              <span class="swatch-label">success</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: var(--accent-glow); border-left: 3px solid var(--accent);"></div>
+              <span class="swatch-label">accent</span>
+            </div>
+          </div>
+        </div>
+        <div>
+          <p style="font-size: 10px; color: #52525b; margin-bottom: 10px;">ZINC SCALE (base)</p>
+          <div class="swatch-row">
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: #09090b;"></div><span class="swatch-label">950</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: #18181b;"></div><span class="swatch-label">900</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: #27272a;"></div><span class="swatch-label">800</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: #3f3f46;"></div><span class="swatch-label">700</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: #52525b;"></div><span class="swatch-label">600</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: #71717a;"></div><span class="swatch-label">500</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: #a1a1aa;"></div><span class="swatch-label">400</span>
+            </div>
+            <div style="position:relative; margin-bottom: 20px;">
+              <div class="swatch" style="background: #e4e4e7;"></div><span class="swatch-label">200</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Typography scale -->
+      <div class="card">
+        <p class="card-title">Typography Scale</p>
+        <div>
+          <div class="type-scale-row">
+            <span class="type-label">9px / meta</span>
+            <span class="type-sample" style="font-size: 9px; color: #52525b;">TIMESTAMP · UNIT · STATUS LABEL</span>
+          </div>
+          <div class="type-scale-row">
+            <span class="type-label">10px / caption</span>
+            <span class="type-sample" style="font-size: 10px; color: #71717a;">Widget sub-header · Tag label · Progress %</span>
+          </div>
+          <div class="type-scale-row">
+            <span class="type-label">12px / body</span>
+            <span class="type-sample" style="font-size: 12px; color: #d4d4d8;">Container name · Goal title · Link text</span>
+          </div>
+          <div class="type-scale-row">
+            <span class="type-label">13px / label</span>
+            <span class="type-sample" style="font-size: 13px; font-weight: 600; color: #e4e4e7;">Widget title · Section name</span>
+          </div>
+          <div class="type-scale-row">
+            <span class="type-label">15px / subhead</span>
+            <span class="type-sample" style="font-size: 15px; font-weight: 600; color: #f4f4f5;">Page section heading</span>
+          </div>
+          <div class="type-scale-row">
+            <span class="type-label">20px / head</span>
+            <span class="type-sample" style="font-size: 20px; font-weight: 700; color: #fafafa;">AZ-Lab</span>
+          </div>
+        </div>
+        <div style="margin-top: 16px;">
+          <p style="font-size: 10px; color: #52525b; margin-bottom: 8px;">STATUS BADGES</p>
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <span class="badge badge--active">Active</span>
+            <span class="badge badge--completed">Completed</span>
+            <span class="badge badge--blocked">Blocked</span>
+            <span class="badge badge--planned">Planned</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SECTION: Health & Goals (Critical/Accent attention) ─────────── -->
+    <p class="section-label" id="health">Health &amp; Progress</p>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 32px;">
+
+      <!-- Agent health — critical card example -->
+      <div class="card card--success">
+        <p class="card-title" style="color: #4ade80;">Agent Health</p>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 12px; color: #d4d4d8;">Wren (Claude Code)</span>
+            <span class="badge badge--active">Running</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 12px; color: #d4d4d8;">Discord bot</span>
+            <span class="badge badge--active">Connected</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 12px; color: #d4d4d8;">Task queue poller</span>
+            <span class="badge badge--active">Active</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 12px; color: #d4d4d8;">Gmail MCP</span>
+            <span class="badge badge--blocked">Auth expired</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Goals card — accent attention -->
+      <div class="card card--accent" id="goals">
+        <p class="card-title" style="color: var(--accent);">Goals</p>
+        <!-- Strategy tabs -->
+        <div style="display: flex; gap: 4px; border-bottom: 1px solid var(--border-subtle); margin-bottom: 10px;">
+          <button style="padding: 4px 10px; font-size: 11px; font-weight: 600; color: var(--accent); border-bottom: 2px solid var(--accent); background: none; border-top: none; border-left: none; border-right: none; cursor: pointer; margin-bottom: -1px;">Memory Arch</button>
+          <button style="padding: 4px 10px; font-size: 11px; color: #52525b; background: none; border: none; cursor: pointer;">Harness</button>
+          <button style="padding: 4px 10px; font-size: 11px; color: #52525b; background: none; border: none; cursor: pointer;">Infra</button>
+        </div>
+        <!-- Milestone list (adaptive, no fixed height) -->
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px;">
+              <span style="font-size: 12px; color: #d4d4d8;">Hybrid BM25+vector retrieval</span>
+              <span style="font-size: 10px; color: #4ade80;">100%</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill progress-fill--success" style="width: 100%;"></div></div>
+          </div>
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px;">
+              <span style="font-size: 12px; color: #d4d4d8;">MAGMA Zettelkasten links</span>
+              <span style="font-size: 10px; color: #4ade80;">100%</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill progress-fill--success" style="width: 100%;"></div></div>
+          </div>
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px;">
+              <span style="font-size: 12px; color: #d4d4d8;">Supabase Realtime sync</span>
+              <span style="font-size: 10px; color: var(--accent);">80%</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill" style="width: 80%;"></div></div>
+          </div>
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px;">
+              <span style="font-size: 12px; color: #a1a1aa;">A-MAC decay scoring</span>
+              <span style="font-size: 10px; color: #52525b;">0%</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill" style="width: 0%;"></div></div>
+          </div>
+        </div>
+        <a href="/goals" style="display: block; text-align: right; margin-top: 10px; font-size: 10px; color: #52525b; text-decoration: none;">Big Picture →</a>
+      </div>
+    </div>
+
+    <!-- ── SECTION: Host Metrics ───────────────────────────────────────── -->
+    <p class="section-label" id="monitor">Host Metrics</p>
+    <div class="card" style="margin-bottom: 32px;">
+      <p class="card-title">svc-podman-01</p>
+      <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;">
+        <div class="metric">
+          <span class="metric-value">42<span style="font-size:14px;color:#71717a;">%</span></span>
+          <span class="metric-label">CPU</span>
+          <span class="metric-delta metric-delta--up">▲ 3% from avg</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value">6.2<span style="font-size:14px;color:#71717a;">GB</span></span>
+          <span class="metric-label">Memory</span>
+          <span class="metric-delta" style="color:#71717a;">8GB total · 78%</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value">340<span style="font-size:14px;color:#71717a;">MB</span></span>
+          <span class="metric-label">Disk I/O</span>
+          <span class="metric-delta metric-delta--up">▲ write heavy</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value">1.8<span style="font-size:14px;color:#71717a;">Gbps</span></span>
+          <span class="metric-label">Network</span>
+          <span class="metric-delta metric-delta--down">▼ normal</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SECTION: Containers ────────────────────────────────────────── -->
+    <p class="section-label" id="containers">Containers</p>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 32px;">
+      <div class="card">
+        <p class="card-title">Running (12)</p>
+        <div>
+          <div class="container-row">
+            <div class="status-dot status-dot--green"></div>
+            <span class="container-name">az-dashboard</span>
+            <span style="font-size:10px;color:#52525b;">home.az-lab.dev</span>
+            <div class="container-actions">
+              <button class="action-btn">↻</button>
+              <button class="action-btn action-btn--danger">■</button>
+            </div>
+          </div>
+          <div class="container-row">
+            <div class="status-dot status-dot--green"></div>
+            <span class="container-name">memory-mcp-server</span>
+            <span style="font-size:10px;color:#52525b;">memory-mcp.az-lab.dev</span>
+            <div class="container-actions">
+              <button class="action-btn">↻</button>
+              <button class="action-btn action-btn--danger">■</button>
+            </div>
+          </div>
+          <div class="container-row">
+            <div class="status-dot status-dot--yellow"></div>
+            <span class="container-name">az-gmail-mcp</span>
+            <span style="font-size:10px;color:#f59e0b;">auth expired</span>
+            <div class="container-actions">
+              <button class="action-btn">↻</button>
+            </div>
+          </div>
+          <div class="container-row">
+            <div class="status-dot status-dot--green"></div>
+            <span class="container-name">traefik</span>
+            <span style="font-size:10px;color:#52525b;">proxy</span>
+            <div class="container-actions">
+              <button class="action-btn">↻</button>
+              <button class="action-btn action-btn--danger">■</button>
+            </div>
+          </div>
+          <div class="container-row">
+            <div class="status-dot status-dot--red"></div>
+            <span class="container-name">calibre-web</span>
+            <span style="font-size:10px;color:#f87171;">crashed</span>
+            <div class="container-actions">
+              <button class="action-btn">↻</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card attention levels showcase -->
+      <div style="display: flex; flex-direction: column; gap: 10px;" id="security">
+        <div class="card card--critical">
+          <p class="card-title" style="color: #f87171; margin-bottom: 6px;">Critical — Security Alert</p>
+          <p style="font-size: 12px; color: #fca5a5;">Credential audit overdue — 1 plaintext secret found in .env</p>
+        </div>
+        <div class="card card--warning">
+          <p class="card-title" style="color: #fbbf24; margin-bottom: 6px;">Warning — Action Needed</p>
+          <p style="font-size: 12px; color: #fde68a;">Gmail OAuth token expired — re-auth required</p>
+        </div>
+        <div class="card card--success">
+          <p class="card-title" style="color: #4ade80; margin-bottom: 6px;">Success — All Clear</p>
+          <p style="font-size: 12px; color: #86efac;">Traefik routing: 14/14 services healthy</p>
+        </div>
+        <div class="card card--secondary">
+          <p class="card-title" style="margin-bottom: 6px;">Secondary — Informational</p>
+          <p style="font-size: 12px; color: #71717a;">Tech news: 3 unread items from r/homelab</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SECTION: Quick Links ───────────────────────────────────────── -->
+    <p class="section-label" id="links">Quick Links</p>
+    <div class="card card--secondary" style="margin-bottom: 32px;">
+      <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+        <span class="quick-link">🖥️ Proxmox</span>
+        <span class="quick-link">🐋 Portainer</span>
+        <span class="quick-link">📊 Grafana</span>
+        <span class="quick-link">🔀 Traefik</span>
+        <span class="quick-link">🛡️ AdGuard</span>
+        <span class="quick-link">💓 Uptime Kuma</span>
+        <span class="quick-link">📷 Immich</span>
+        <span class="quick-link">📚 Calibre</span>
+        <span class="quick-link">🎧 Audiobookshelf</span>
+        <span class="quick-link">👁️ Changedetection</span>
+        <span class="quick-link">🔖 Shelfmark</span>
+      </div>
+    </div>
+
+    <!-- ── SECTION: Terminal placeholder ─────────────────────────────── -->
+    <p class="section-label" id="terminal">Terminal</p>
+    <div class="card" style="margin-bottom: 32px; font-family: 'Courier New', monospace;">
+      <p class="card-title">SSH Terminal — svc-podman-01</p>
+      <div style="background: #09090b; border-radius: 8px; padding: 12px; min-height: 80px;">
+        <p style="font-size: 11px; color: #4ade80;">almty1@svc-podman-01:~$&nbsp;<span style="color:#a1a1aa;">systemctl --user status compose-stack@dashboard</span></p>
+        <p style="font-size: 11px; color: #52525b; margin-top: 4px;">● compose-stack@dashboard.service - Podman compose dashboard</p>
+        <p style="font-size: 11px; color: #4ade80; margin-top: 2px;">&nbsp;&nbsp;&nbsp;Active: <span style="color:#4ade80;">active (exited)</span> since Sun 2026-04-05...</p>
+      </div>
+    </div>
+
+    <div style="text-align: center; padding: 24px 0; color: #3f3f46; font-size: 10px;">
+      AZ-Lab Dashboard Design Preview · Switch themes using the buttons top-right · Sidebar anchors navigate sections
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ── Clock ──────────────────────────────────────────────────────────────────
+function updateClock() {
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString();
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ── Theme switcher ─────────────────────────────────────────────────────────
+const HOLIDAY_BANNERS = {
+  halloween:  '🎃  Happy Halloween from AZ-Lab!  👻',
+  christmas:  '🎄  Season\'s Greetings from AZ-Lab!  ❄️',
+  july4:      '🎆  Happy Independence Day!  🇺🇸',
+  valentine:  '💕  Happy Valentine\'s Day!  ❤️',
+  stpatricks: '☘️  Happy St. Patrick\'s Day!  🍀',
+  newyear:    '🎆  Happy New Year from AZ-Lab!  🥂',
+};
+
+function setTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  document.querySelectorAll('.theme-btn').forEach(b => {
+    b.classList.toggle('active', b.textContent.includes(
+      theme === 'default' ? 'Default' :
+      theme === 'halloween' ? 'Halloween' :
+      theme === 'christmas' ? 'Christmas' :
+      theme === 'july4' ? 'July' :
+      theme === 'valentine' ? 'Valentine' :
+      theme === 'stpatricks' ? 'Pat' :
+      theme === 'newyear' ? 'New Year' : ''
+    ));
+  });
+  const banner = document.getElementById('holidayBanner');
+  banner.textContent = HOLIDAY_BANNERS[theme] || '';
+
+  // Christmas snowflakes
+  const sf = document.getElementById('snowflakes');
+  sf.innerHTML = '';
+  if (theme === 'christmas') {
+    for (let i = 0; i < 15; i++) {
+      const flake = document.createElement('div');
+      flake.className = 'snowflake';
+      flake.textContent = ['❄️','❅','❆','*'][Math.floor(Math.random()*4)];
+      flake.style.left = `${Math.random() * 100}vw`;
+      flake.style.animationDuration = `${4 + Math.random() * 6}s`;
+      flake.style.animationDelay = `${Math.random() * 5}s`;
+      flake.style.fontSize = `${10 + Math.random() * 10}px`;
+      sf.appendChild(flake);
+    }
+  }
+}
+
+// ── Auto-detect holiday on load ─────────────────────────────────────────────
+function detectHoliday() {
+  const now = new Date();
+  const m = now.getMonth() + 1; // 1-12
+  const d = now.getDate();
+  if (m === 12 && d >= 1)  return 'christmas';
+  if (m === 1  && d === 1) return 'newyear';
+  if (m === 10 && d >= 25) return 'halloween';
+  if (m === 2  && d === 14) return 'valentine';
+  if (m === 3  && d === 17) return 'stpatricks';
+  if (m === 7  && d === 4)  return 'july4';
+  return null;
+}
+
+const autoTheme = detectHoliday();
+if (autoTheme) setTheme(autoTheme);
+
+// ── Sidebar active section highlight ───────────────────────────────────────
+const sidebarItems = document.querySelectorAll('.sidebar-item');
+const sections = ['health','goals','monitor','containers','security','terminal','links'];
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      const id = e.target.id;
+      sidebarItems.forEach(el => {
+        el.classList.toggle('active', el.getAttribute('href') === '#' + id);
+      });
+    }
+  });
+}, { threshold: 0.3 });
+
+sections.forEach(id => {
+  const el = document.getElementById(id);
+  if (el) observer.observe(el);
+});
+</script>
+</body>
+</html>

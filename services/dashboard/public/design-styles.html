@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AZ-Lab — Design Direction Comparison</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body { background: #111; color: #fff; font-family: Inter, sans-serif; }
+
+/* ─── Nav ─────────────────────────────────────────────────────────── */
+.nav {
+  position: sticky; top: 0; z-index: 100;
+  background: rgba(10,10,10,0.95);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  display: flex; gap: 0; padding: 0 32px;
+}
+.nav-btn {
+  padding: 14px 20px;
+  font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+  color: #555; cursor: pointer; border: none; background: none;
+  border-bottom: 2px solid transparent; transition: all 0.2s;
+  white-space: nowrap;
+}
+.nav-btn:hover { color: #aaa; }
+.nav-btn.active { color: #fff; border-bottom-color: #fff; }
+
+/* ─── Style sections ──────────────────────────────────────────────── */
+.style-section { display: none; min-height: 100vh; }
+.style-section.active { display: block; }
+
+/* ════════════════════════════════════════════════════════════════════
+   STYLE A — BENTO GRID
+   Asymmetric cards, Inter font, minimal borders, single neon accent
+   ════════════════════════════════════════════════════════════════════ */
+#bento {
+  background: #0c0c0c;
+  font-family: 'DM Sans', sans-serif;
+  min-height: 100vh;
+  padding: 28px;
+}
+.bento-header {
+  display: flex; justify-content: space-between; align-items: flex-end;
+  margin-bottom: 24px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid #1e1e1e;
+}
+.bento-logo { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; color: #fff; }
+.bento-logo span { color: #00e5ff; }
+.bento-meta { font-size: 11px; color: #444; }
+.bento-grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  grid-auto-rows: 80px;
+  gap: 10px;
+}
+.bento-card {
+  background: #141414;
+  border: 1px solid #222;
+  border-radius: 14px;
+  padding: 18px;
+  overflow: hidden;
+  position: relative;
+  transition: border-color 0.2s, background 0.2s;
+}
+.bento-card:hover { border-color: #333; background: #161616; }
+.bento-card.span-4 { grid-column: span 4; }
+.bento-card.span-3 { grid-column: span 3; }
+.bento-card.span-6 { grid-column: span 6; }
+.bento-card.span-8 { grid-column: span 8; }
+.bento-card.span-12 { grid-column: span 12; }
+.bento-card.rows-2 { grid-row: span 2; }
+.bento-card.rows-3 { grid-row: span 3; }
+.bento-card.rows-4 { grid-row: span 4; }
+.bento-card.accent { border-color: rgba(0,229,255,0.25); background: rgba(0,229,255,0.04); }
+.bento-card.accent:hover { border-color: rgba(0,229,255,0.4); }
+.b-label {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.1em;
+  text-transform: uppercase; color: #444; margin-bottom: 8px;
+}
+.b-label.accent { color: rgba(0,229,255,0.6); }
+.b-value { font-size: 32px; font-weight: 700; color: #fff; line-height: 1; letter-spacing: -1px; }
+.b-value.sm { font-size: 20px; letter-spacing: -0.5px; }
+.b-value.accent { color: #00e5ff; }
+.b-sub { font-size: 11px; color: #444; margin-top: 4px; }
+.b-list { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.b-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.b-list-name { font-size: 12px; color: #ccc; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.b-dot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
+.b-dot.green { background: #22c55e; box-shadow: 0 0 6px #22c55e80; }
+.b-dot.red { background: #ef4444; box-shadow: 0 0 6px #ef444480; }
+.b-dot.yellow { background: #eab308; box-shadow: 0 0 6px #eab30880; }
+.b-tag { font-size: 10px; color: #444; }
+.b-links { display: flex; flex-wrap: wrap; gap: 6px; }
+.b-link {
+  padding: 5px 10px; border-radius: 20px;
+  background: #1e1e1e; border: 1px solid #2a2a2a;
+  font-size: 11px; color: #888; cursor: pointer;
+  transition: all 0.15s;
+}
+.b-link:hover { background: #252525; color: #ccc; border-color: #333; }
+.b-bar-track { height: 3px; background: #222; border-radius: 99px; overflow: hidden; margin-top: 8px; }
+.b-bar-fill { height: 100%; border-radius: 99px; background: #00e5ff; }
+.b-bar-fill.green { background: #22c55e; }
+.b-bar-fill.yellow { background: #eab308; }
+.bento-section-tag {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.15em; text-transform: uppercase;
+  color: #2a2a2a; position: absolute; top: 12px; right: 14px;
+}
+/* Goals mini chart */
+.b-goal-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.b-goal-name { font-size: 11px; color: #888; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.b-goal-pct { font-size: 10px; color: #444; width: 28px; text-align: right; flex-shrink: 0; }
+.b-progress { flex: 2; height: 2px; background: #222; border-radius: 99px; overflow: hidden; }
+.b-progress-fill { height: 100%; border-radius: 99px; background: #00e5ff; }
+.b-progress-fill.done { background: #22c55e; }
+
+
+/* ════════════════════════════════════════════════════════════════════
+   STYLE B — GLASSMORPHISM
+   Frosted glass, gradient bg, depth, soft glows
+   ════════════════════════════════════════════════════════════════════ */
+#glass {
+  background: linear-gradient(135deg, #0a0e27 0%, #0f1635 30%, #1a0f3a 60%, #0d1f3c 100%);
+  min-height: 100vh;
+  font-family: Inter, sans-serif;
+  padding: 28px;
+  position: relative;
+  overflow: hidden;
+}
+#glass::before {
+  content: '';
+  position: absolute; inset: 0; pointer-events: none;
+  background:
+    radial-gradient(circle at 20% 30%, rgba(100,60,255,0.15) 0%, transparent 50%),
+    radial-gradient(circle at 80% 70%, rgba(0,200,255,0.1) 0%, transparent 50%),
+    radial-gradient(circle at 50% 10%, rgba(255,60,200,0.08) 0%, transparent 40%);
+}
+.glass-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 24px; position: relative;
+}
+.glass-logo { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
+.glass-logo em { font-style: normal; color: #a78bfa; }
+.glass-status { display: flex; align-items: center; gap: 6px; font-size: 11px; color: rgba(255,255,255,0.4); }
+.glass-pulse {
+  width: 6px; height: 6px; border-radius: 50%; background: #4ade80;
+  box-shadow: 0 0 8px #4ade8080;
+  animation: pulse 2s infinite;
+}
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+.glass-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  position: relative;
+}
+.gc {
+  background: rgba(255,255,255,0.06);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 18px;
+  padding: 20px;
+  transition: all 0.25s ease;
+  position: relative;
+  overflow: hidden;
+}
+.gc:hover {
+  background: rgba(255,255,255,0.09);
+  border-color: rgba(255,255,255,0.18);
+  transform: translateY(-2px);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.3);
+}
+.gc.span-2 { grid-column: span 2; }
+.gc.span-3 { grid-column: span 3; }
+.gc.glow-purple::before {
+  content: '';
+  position: absolute; top: -30px; right: -30px;
+  width: 120px; height: 120px;
+  background: radial-gradient(circle, rgba(167,139,250,0.2) 0%, transparent 70%);
+  pointer-events: none;
+}
+.gc.glow-cyan::before {
+  content: '';
+  position: absolute; bottom: -20px; left: -20px;
+  width: 100px; height: 100px;
+  background: radial-gradient(circle, rgba(34,211,238,0.15) 0%, transparent 70%);
+  pointer-events: none;
+}
+.g-title { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(255,255,255,0.35); margin-bottom: 14px; }
+.g-value { font-size: 36px; font-weight: 700; letter-spacing: -1.5px; }
+.g-value.purple { color: #c4b5fd; }
+.g-value.cyan { color: #67e8f9; }
+.g-value.green { color: #86efac; }
+.g-sub { font-size: 11px; color: rgba(255,255,255,0.3); margin-top: 4px; }
+.g-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+.g-row:last-child { border-bottom: none; }
+.g-row-name { font-size: 12px; color: rgba(255,255,255,0.75); flex: 1; }
+.g-badge {
+  font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 99px;
+  letter-spacing: 0.04em;
+}
+.g-badge.running { background: rgba(74,222,128,0.15); color: #86efac; border: 1px solid rgba(74,222,128,0.2); }
+.g-badge.warning { background: rgba(251,191,36,0.15); color: #fde68a; border: 1px solid rgba(251,191,36,0.2); }
+.g-badge.error { background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid rgba(239,68,68,0.2); }
+.g-progress { height: 4px; background: rgba(255,255,255,0.08); border-radius: 99px; overflow: hidden; margin-top: 8px; }
+.g-progress-fill { height: 100%; border-radius: 99px; }
+.g-progress-fill.purple { background: linear-gradient(90deg, #8b5cf6, #c4b5fd); }
+.g-progress-fill.cyan { background: linear-gradient(90deg, #0891b2, #67e8f9); }
+.g-progress-fill.green { background: linear-gradient(90deg, #16a34a, #86efac); }
+.g-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.g-link {
+  padding: 6px 14px; border-radius: 99px;
+  background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.1);
+  font-size: 11px; color: rgba(255,255,255,0.6); cursor: pointer;
+  transition: all 0.2s;
+}
+.g-link:hover { background: rgba(255,255,255,0.12); color: rgba(255,255,255,0.9); border-color: rgba(255,255,255,0.2); }
+.g-metric-row { display: flex; justify-content: space-between; align-items: center; }
+.g-metric { text-align: center; }
+.g-metric-val { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; color: #fff; }
+.g-metric-lbl { font-size: 10px; color: rgba(255,255,255,0.3); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.08em; }
+
+
+/* ════════════════════════════════════════════════════════════════════
+   STYLE C — TERMINAL / HACKER
+   Monospace, CRT, neon green, scanlines
+   ════════════════════════════════════════════════════════════════════ */
+#terminal-style {
+  background: #000;
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  min-height: 100vh;
+  padding: 20px;
+  position: relative;
+  overflow: hidden;
+}
+/* Scanline overlay */
+#terminal-style::after {
+  content: '';
+  position: fixed; inset: 0; pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px, transparent 2px,
+    rgba(0,0,0,0.15) 2px, rgba(0,0,0,0.15) 3px
+  );
+  z-index: 50;
+}
+/* Vignette */
+#terminal-style::before {
+  content: '';
+  position: fixed; inset: 0; pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 60%, rgba(0,0,0,0.5) 100%);
+  z-index: 49;
+}
+.t-header {
+  border: 1px solid #00ff00;
+  padding: 8px 14px;
+  margin-bottom: 16px;
+  display: flex; justify-content: space-between; align-items: center;
+  position: relative;
+}
+.t-logo { font-size: 13px; font-weight: 700; color: #00ff00; text-shadow: 0 0 10px #00ff0080; letter-spacing: 0.1em; }
+.t-header-meta { font-size: 11px; color: #00ff0066; }
+.t-cursor { display: inline-block; width: 8px; height: 13px; background: #00ff00; animation: blink 1s step-end infinite; vertical-align: text-bottom; margin-left: 3px; }
+@keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
+.t-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.t-card {
+  border: 1px solid #00ff0040;
+  padding: 14px;
+  position: relative;
+  background: rgba(0,255,0,0.02);
+  transition: border-color 0.15s;
+}
+.t-card:hover { border-color: #00ff0080; background: rgba(0,255,0,0.04); }
+.t-card.span-2 { grid-column: span 2; }
+.t-card.span-3 { grid-column: span 3; }
+.t-card-title {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.2em; text-transform: uppercase;
+  color: #00ff0060; border-bottom: 1px solid #00ff0020; padding-bottom: 8px; margin-bottom: 12px;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.t-card-num {
+  font-size: 9px; color: #00ff0030;
+}
+.t-value { font-size: 28px; font-weight: 700; color: #00ff00; text-shadow: 0 0 20px #00ff0060; letter-spacing: -0.5px; }
+.t-value.cyan { color: #00ffff; text-shadow: 0 0 20px #00ffff60; }
+.t-value.sm { font-size: 16px; }
+.t-sub { font-size: 10px; color: #00ff0050; margin-top: 4px; }
+.t-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px solid #00ff0010; font-size: 11px; }
+.t-row:last-child { border-bottom: none; }
+.t-row-name { flex: 1; color: #00ff0090; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.t-status { font-size: 10px; letter-spacing: 0.05em; }
+.t-status.ok { color: #00ff00; text-shadow: 0 0 6px #00ff0080; }
+.t-status.warn { color: #ffff00; text-shadow: 0 0 6px #ffff0080; }
+.t-status.err { color: #ff4444; text-shadow: 0 0 6px #ff444480; }
+.t-bar { height: 2px; background: #00ff0015; border-radius: 99px; overflow: hidden; margin-top: 6px; }
+.t-bar-fill { height: 100%; background: #00ff00; box-shadow: 0 0 6px #00ff00; }
+.t-bar-fill.cyan { background: #00ffff; box-shadow: 0 0 6px #00ffff; }
+.t-links { display: flex; flex-wrap: wrap; gap: 6px; }
+.t-link {
+  padding: 4px 10px; border: 1px solid #00ff0030;
+  font-size: 10px; color: #00ff0070; letter-spacing: 0.06em; cursor: pointer;
+  transition: all 0.1s;
+}
+.t-link:hover { border-color: #00ff00; color: #00ff00; background: rgba(0,255,0,0.05); }
+.t-prompt { color: #00ff0060; margin-right: 6px; }
+.t-cmd { color: #00ff00; }
+.t-output { color: #00ff0050; }
+.t-metrics { display: grid; grid-template-columns: repeat(4,1fr); gap: 8px; }
+.t-metric { border: 1px solid #00ff0020; padding: 8px; text-align: center; }
+.t-metric-val { font-size: 20px; font-weight: 700; color: #00ff00; text-shadow: 0 0 10px #00ff0060; }
+.t-metric-lbl { font-size: 9px; color: #00ff0040; letter-spacing: 0.15em; text-transform: uppercase; margin-top: 2px; }
+
+
+/* ════════════════════════════════════════════════════════════════════
+   STYLE D — ULTRA-MINIMAL / LINEAR
+   Syne font, no card backgrounds, dividers, maximum space
+   ════════════════════════════════════════════════════════════════════ */
+#minimal {
+  background: #0d0d0d;
+  font-family: 'Syne', Inter, sans-serif;
+  min-height: 100vh;
+  padding: 40px 48px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+.m-header {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  padding-bottom: 32px;
+  border-bottom: 1px solid #1c1c1c;
+  margin-bottom: 40px;
+}
+.m-logo { font-size: 28px; font-weight: 800; letter-spacing: -1px; color: #fff; }
+.m-logo span { color: #f97316; }
+.m-time { font-size: 11px; color: #333; font-family: 'JetBrains Mono', monospace; margin-top: 4px; }
+.m-nav { display: flex; gap: 4px; }
+.m-nav-item {
+  padding: 6px 12px; border-radius: 4px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  color: #444; cursor: pointer; transition: all 0.15s;
+  border: 1px solid transparent;
+}
+.m-nav-item:hover { color: #888; }
+.m-nav-item.active { color: #fff; border-color: #222; background: #161616; }
+.m-section { margin-bottom: 48px; }
+.m-section-head {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  color: #2a2a2a; margin-bottom: 20px;
+  display: flex; align-items: center; gap: 10px;
+}
+.m-section-head::after { content: ''; flex: 1; height: 1px; background: #1a1a1a; }
+/* Metrics strip */
+.m-metrics { display: grid; grid-template-columns: repeat(4,1fr); gap: 0; }
+.m-metric { padding: 0 0 24px; border-right: 1px solid #1a1a1a; padding-right: 24px; margin-right: 24px; }
+.m-metric:last-child { border-right: none; }
+.m-metric-val { font-size: 40px; font-weight: 800; letter-spacing: -2px; color: #fff; line-height: 1; }
+.m-metric-lbl { font-size: 11px; color: #333; margin-top: 6px; letter-spacing: 0.04em; }
+.m-metric-delta { font-size: 11px; color: #f97316; margin-top: 2px; }
+/* Container list */
+.m-list { display: flex; flex-direction: column; }
+.m-list-item {
+  display: flex; align-items: center; gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid #141414;
+  transition: background 0.1s;
+}
+.m-list-item:last-child { border-bottom: none; }
+.m-list-item:hover { background: #111; padding-left: 8px; }
+.m-indicator { width: 3px; height: 3px; border-radius: 50%; flex-shrink: 0; }
+.m-indicator.on { background: #f97316; }
+.m-indicator.off { background: #222; }
+.m-indicator.warn { background: #eab308; }
+.m-list-name { font-size: 13px; font-weight: 500; color: #ccc; flex: 1; }
+.m-list-meta { font-size: 11px; color: #333; }
+.m-list-action {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: #2a2a2a; cursor: pointer; transition: color 0.15s;
+}
+.m-list-action:hover { color: #f97316; }
+/* Goals */
+.m-goal { padding: 16px 0; border-bottom: 1px solid #141414; }
+.m-goal:last-child { border-bottom: none; }
+.m-goal-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.m-goal-name { font-size: 13px; font-weight: 600; color: #ccc; }
+.m-goal-pct { font-size: 11px; color: #333; font-family: 'JetBrains Mono', monospace; }
+.m-goal-bar { height: 1px; background: #1a1a1a; position: relative; }
+.m-goal-fill { position: absolute; left: 0; top: 0; bottom: 0; background: #f97316; }
+.m-goal-fill.done { background: #4ade80; }
+/* Quick links */
+.m-links { display: flex; gap: 2px; flex-wrap: wrap; }
+.m-link {
+  padding: 8px 14px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  color: #333; cursor: pointer; border-bottom: 2px solid transparent;
+  transition: all 0.15s;
+}
+.m-link:hover { color: #fff; border-bottom-color: #f97316; }
+/* Status pills — minimal */
+.m-pill { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #333; }
+.m-pill.active { color: #4ade80; }
+.m-pill.blocked { color: #f97316; }
+.m-pill.down { color: #ef4444; }
+
+/* Clock update */
+#glass-time, #bento-time, #term-time, #min-time { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <button class="nav-btn active" onclick="show('bento', this)">A — Bento Grid</button>
+  <button class="nav-btn" onclick="show('glass', this)">B — Glassmorphism</button>
+  <button class="nav-btn" onclick="show('terminal-style', this)">C — Terminal</button>
+  <button class="nav-btn" onclick="show('minimal', this)">D — Ultra-Minimal</button>
+</nav>
+
+<!-- ══════════════════════════════════════════════════════════════════
+     A — BENTO GRID
+     ══════════════════════════════════════════════════════════════════ -->
+<div id="bento" class="style-section active">
+  <div class="bento-header">
+    <div>
+      <div class="bento-logo">AZ<span>-Lab</span></div>
+      <div class="bento-meta">svc-podman-01 · 192.168.1.181</div>
+    </div>
+    <div class="bento-meta" id="bento-time">--:--:--</div>
+  </div>
+  <div class="bento-grid">
+
+    <!-- Big stat: uptime -->
+    <div class="bento-card span-3 rows-2 accent">
+      <div class="b-label accent">Uptime</div>
+      <div class="b-value accent">99<span style="font-size:18px;color:#00b0cc;">.8%</span></div>
+      <div class="b-sub">47 days, 3 hrs · all services</div>
+      <div class="bento-section-tag">HEALTH</div>
+    </div>
+
+    <!-- CPU -->
+    <div class="bento-card span-3 rows-2">
+      <div class="b-label">CPU</div>
+      <div class="b-value">42<span style="font-size:16px;color:#555;">%</span></div>
+      <div class="b-bar-track"><div class="b-bar-fill" style="width:42%;"></div></div>
+      <div class="b-sub" style="margin-top:6px;">4 cores · ~1.7GHz avg</div>
+    </div>
+
+    <!-- Memory -->
+    <div class="bento-card span-3 rows-2">
+      <div class="b-label">Memory</div>
+      <div class="b-value">6.2<span style="font-size:16px;color:#555;">GB</span></div>
+      <div class="b-bar-track"><div class="b-bar-fill yellow" style="width:78%;"></div></div>
+      <div class="b-sub" style="margin-top:6px;">8GB total · 78%</div>
+    </div>
+
+    <!-- Network -->
+    <div class="bento-card span-3 rows-2">
+      <div class="b-label">Network</div>
+      <div class="b-value sm">1.8<span style="font-size:12px;color:#555;"> Gbps</span></div>
+      <div class="b-sub">↑ 340MB/s · ↓ 82MB/s</div>
+    </div>
+
+    <!-- Containers -->
+    <div class="bento-card span-6 rows-4">
+      <div class="b-label">Containers</div>
+      <ul class="b-list">
+        <li><div class="b-dot green"></div><span class="b-list-name">az-dashboard</span><span class="b-tag">home.az-lab.dev</span></li>
+        <li><div class="b-dot green"></div><span class="b-list-name">memory-mcp-server</span><span class="b-tag">memory-mcp</span></li>
+        <li><div class="b-dot green"></div><span class="b-list-name">traefik</span><span class="b-tag">proxy</span></li>
+        <li><div class="b-dot green"></div><span class="b-list-name">calibre-web</span><span class="b-tag">calibre</span></li>
+        <li><div class="b-dot yellow"></div><span class="b-list-name">az-gmail-mcp</span><span class="b-tag">auth expired</span></li>
+        <li><div class="b-dot green"></div><span class="b-list-name">audiobookshelf</span><span class="b-tag">abs</span></li>
+        <li><div class="b-dot green"></div><span class="b-list-name">prometheus</span><span class="b-tag">monitoring</span></li>
+        <li><div class="b-dot green"></div><span class="b-list-name">grafana</span><span class="b-tag">grafana</span></li>
+      </ul>
+      <div class="bento-section-tag">CONTAINERS</div>
+    </div>
+
+    <!-- Goals -->
+    <div class="bento-card span-6 rows-4">
+      <div class="b-label">Goals — Memory Architecture</div>
+      <div class="b-goal-row"><div class="b-goal-name">Hybrid BM25+vector retrieval</div><div class="b-goal-pct">100%</div><div class="b-progress"><div class="b-progress-fill done" style="width:100%;"></div></div></div>
+      <div class="b-goal-row"><div class="b-goal-name">MAGMA Zettelkasten links</div><div class="b-goal-pct">100%</div><div class="b-progress"><div class="b-progress-fill done" style="width:100%;"></div></div></div>
+      <div class="b-goal-row"><div class="b-goal-name">Supabase Realtime sync</div><div class="b-goal-pct">80%</div><div class="b-progress"><div class="b-progress-fill" style="width:80%;"></div></div></div>
+      <div class="b-goal-row"><div class="b-goal-name">A-MAC decay scoring</div><div class="b-goal-pct">0%</div><div class="b-progress"><div class="b-progress-fill" style="width:0%;"></div></div></div>
+      <div class="b-goal-row"><div class="b-goal-name">Reddit RSS workaround</div><div class="b-goal-pct">0%</div><div class="b-progress"><div class="b-progress-fill" style="width:0%;"></div></div></div>
+      <div class="b-goal-row"><div class="b-goal-name">Gmail OAuth reauth</div><div class="b-goal-pct">30%</div><div class="b-progress"><div class="b-progress-fill" style="width:30%;"></div></div></div>
+      <div class="bento-section-tag">GOALS</div>
+    </div>
+
+    <!-- Quick links -->
+    <div class="bento-card span-12 rows-2">
+      <div class="b-label">Quick Links</div>
+      <div class="b-links">
+        <span class="b-link">🖥️ Proxmox</span>
+        <span class="b-link">🐋 Portainer</span>
+        <span class="b-link">📊 Grafana</span>
+        <span class="b-link">🔀 Traefik</span>
+        <span class="b-link">🛡️ AdGuard</span>
+        <span class="b-link">💓 Uptime Kuma</span>
+        <span class="b-link">📷 Immich</span>
+        <span class="b-link">📚 Calibre</span>
+        <span class="b-link">🎧 Audiobookshelf</span>
+        <span class="b-link">👁️ Changedetection</span>
+        <span class="b-link">🔖 Shelfmark</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════
+     B — GLASSMORPHISM
+     ══════════════════════════════════════════════════════════════════ -->
+<div id="glass" class="style-section">
+  <div class="glass-header">
+    <div>
+      <div class="glass-logo">AZ<em>-Lab</em></div>
+      <div style="font-size:11px;color:rgba(255,255,255,0.25);margin-top:3px;">svc-podman-01 · <span id="glass-time">--:--:--</span></div>
+    </div>
+    <div class="glass-status">
+      <div class="glass-pulse"></div>
+      <span>All systems nominal</span>
+    </div>
+  </div>
+
+  <div class="glass-grid">
+
+    <!-- Metrics row -->
+    <div class="gc glow-purple">
+      <div class="g-title">CPU Usage</div>
+      <div class="g-value purple">42<span style="font-size:20px;opacity:0.5;">%</span></div>
+      <div class="g-sub">4 cores · avg 1.7GHz</div>
+      <div class="g-progress" style="margin-top:12px;"><div class="g-progress-fill purple" style="width:42%;"></div></div>
+    </div>
+
+    <div class="gc glow-cyan">
+      <div class="g-title">Memory</div>
+      <div class="g-value cyan">6.2<span style="font-size:20px;opacity:0.5;">GB</span></div>
+      <div class="g-sub">8GB total · 78%</div>
+      <div class="g-progress" style="margin-top:12px;"><div class="g-progress-fill cyan" style="width:78%;"></div></div>
+    </div>
+
+    <div class="gc">
+      <div class="g-title">Services</div>
+      <div class="g-metric-row">
+        <div class="g-metric"><div class="g-metric-val" style="color:#86efac;">12</div><div class="g-metric-lbl">Running</div></div>
+        <div class="g-metric"><div class="g-metric-val" style="color:#fde68a;">1</div><div class="g-metric-lbl">Warning</div></div>
+        <div class="g-metric"><div class="g-metric-val" style="color:#fca5a5;">0</div><div class="g-metric-lbl">Down</div></div>
+      </div>
+    </div>
+
+    <!-- Containers -->
+    <div class="gc span-2">
+      <div class="g-title">Containers</div>
+      <div class="g-row"><span class="g-row-name">az-dashboard</span><span class="g-badge running">running</span></div>
+      <div class="g-row"><span class="g-row-name">memory-mcp-server</span><span class="g-badge running">running</span></div>
+      <div class="g-row"><span class="g-row-name">az-gmail-mcp</span><span class="g-badge warning">auth expired</span></div>
+      <div class="g-row"><span class="g-row-name">traefik</span><span class="g-badge running">running</span></div>
+      <div class="g-row"><span class="g-row-name">calibre-web</span><span class="g-badge running">running</span></div>
+    </div>
+
+    <!-- Goals -->
+    <div class="gc glow-purple">
+      <div class="g-title">Active Goals</div>
+      <div style="margin-bottom:10px;">
+        <div style="font-size:12px;color:rgba(255,255,255,0.6);margin-bottom:4px;">Supabase Realtime sync</div>
+        <div class="g-progress"><div class="g-progress-fill purple" style="width:80%;"></div></div>
+      </div>
+      <div style="margin-bottom:10px;">
+        <div style="font-size:12px;color:rgba(255,255,255,0.6);margin-bottom:4px;">Gmail OAuth reauth</div>
+        <div class="g-progress"><div class="g-progress-fill cyan" style="width:30%;"></div></div>
+      </div>
+      <div>
+        <div style="font-size:12px;color:rgba(255,255,255,0.6);margin-bottom:4px;">Reddit RSS workaround</div>
+        <div class="g-progress"><div class="g-progress-fill purple" style="width:0%;"></div></div>
+      </div>
+    </div>
+
+    <!-- Quick links -->
+    <div class="gc span-3">
+      <div class="g-title">Quick Links</div>
+      <div class="g-links">
+        <span class="g-link">🖥️ Proxmox</span>
+        <span class="g-link">🐋 Portainer</span>
+        <span class="g-link">📊 Grafana</span>
+        <span class="g-link">🔀 Traefik</span>
+        <span class="g-link">🛡️ AdGuard</span>
+        <span class="g-link">💓 Uptime Kuma</span>
+        <span class="g-link">📷 Immich</span>
+        <span class="g-link">📚 Calibre</span>
+        <span class="g-link">🎧 Audiobookshelf</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════
+     C — TERMINAL
+     ══════════════════════════════════════════════════════════════════ -->
+<div id="terminal-style" class="style-section">
+  <div class="t-header">
+    <div class="t-logo">AZ-LAB :: MONITORING CONSOLE<div class="t-cursor"></div></div>
+    <div class="t-header-meta"><span id="term-time">--:--:--</span> :: svc-podman-01 :: 192.168.1.181</div>
+  </div>
+
+  <div class="t-grid">
+
+    <div class="t-card">
+      <div class="t-card-title">HOST METRICS <span class="t-card-num">[01]</span></div>
+      <div class="t-metrics">
+        <div class="t-metric"><div class="t-metric-val">42%</div><div class="t-metric-lbl">CPU</div></div>
+        <div class="t-metric"><div class="t-metric-val cyan">78%</div><div class="t-metric-lbl">MEM</div></div>
+        <div class="t-metric"><div class="t-metric-val">1.8G</div><div class="t-metric-lbl">NET</div></div>
+        <div class="t-metric"><div class="t-metric-val">47d</div><div class="t-metric-lbl">UPTIME</div></div>
+      </div>
+    </div>
+
+    <div class="t-card">
+      <div class="t-card-title">AGENT STATUS <span class="t-card-num">[02]</span></div>
+      <div class="t-row"><span class="t-row-name">wren (claude-code)</span><span class="t-status ok">ACTIVE</span></div>
+      <div class="t-row"><span class="t-row-name">discord-bot</span><span class="t-status ok">CONN</span></div>
+      <div class="t-row"><span class="t-row-name">task-queue-poller</span><span class="t-status ok">RUN</span></div>
+      <div class="t-row"><span class="t-row-name">gmail-mcp</span><span class="t-status warn">AUTH_EXP</span></div>
+    </div>
+
+    <div class="t-card">
+      <div class="t-card-title">SECURITY <span class="t-card-num">[03]</span></div>
+      <div class="t-row"><span class="t-row-name">traefik routes</span><span class="t-status ok">14/14</span></div>
+      <div class="t-row"><span class="t-row-name">authelia</span><span class="t-status ok">OK</span></div>
+      <div class="t-row"><span class="t-row-name">credential audit</span><span class="t-status warn">PENDING</span></div>
+      <div class="t-row"><span class="t-row-name">last scan</span><span class="t-status ok">04:00Z</span></div>
+    </div>
+
+    <div class="t-card span-2">
+      <div class="t-card-title">CONTAINERS <span class="t-card-num">[04]</span></div>
+      <div class="t-row"><span class="t-row-name">az-dashboard</span><span class="t-status ok">UP</span></div>
+      <div class="t-row"><span class="t-row-name">memory-mcp-server</span><span class="t-status ok">UP</span></div>
+      <div class="t-row"><span class="t-row-name">az-gmail-mcp</span><span class="t-status warn">WARN</span></div>
+      <div class="t-row"><span class="t-row-name">traefik</span><span class="t-status ok">UP</span></div>
+      <div class="t-row"><span class="t-row-name">calibre-web</span><span class="t-status ok">UP</span></div>
+      <div class="t-row"><span class="t-row-name">audiobookshelf</span><span class="t-status ok">UP</span></div>
+      <div class="t-row"><span class="t-row-name">prometheus</span><span class="t-status ok">UP</span></div>
+      <div class="t-row"><span class="t-row-name">grafana</span><span class="t-status ok">UP</span></div>
+    </div>
+
+    <div class="t-card">
+      <div class="t-card-title">GOALS — STRATEGY 1 <span class="t-card-num">[05]</span></div>
+      <div class="t-row"><span class="t-row-name">BM25+vector retrieval</span><span class="t-status ok">100%</span></div>
+      <div class="t-bar"><div class="t-bar-fill" style="width:100%;"></div></div>
+      <div class="t-row" style="margin-top:6px;"><span class="t-row-name">Realtime sync</span><span class="t-status ok">80%</span></div>
+      <div class="t-bar"><div class="t-bar-fill cyan" style="width:80%;"></div></div>
+      <div class="t-row" style="margin-top:6px;"><span class="t-row-name">Gmail OAuth</span><span class="t-status warn">30%</span></div>
+      <div class="t-bar"><div class="t-bar-fill cyan" style="width:30%;"></div></div>
+    </div>
+
+    <div class="t-card span-3">
+      <div class="t-card-title">TERMINAL <span class="t-card-num">[06]</span></div>
+      <div style="line-height:1.7;">
+        <div><span class="t-prompt">almty1@svc-podman-01:~$</span><span class="t-cmd"> systemctl --user status compose-stack@dashboard</span></div>
+        <div class="t-output">&nbsp;&nbsp;Active: active (exited) since Sun 2026-04-05 00:31 UTC</div>
+        <div><span class="t-prompt">almty1@svc-podman-01:~$</span><span class="t-cmd"> podman ps --format "{{.Names}} {{.Status}}" | head -5</span></div>
+        <div class="t-output">&nbsp;&nbsp;az-dashboard Up 2 hours</div>
+        <div class="t-output">&nbsp;&nbsp;memory-mcp-server Up 2 hours</div>
+        <div class="t-output">&nbsp;&nbsp;traefik Up 47 days</div>
+        <div><span class="t-prompt">almty1@svc-podman-01:~$</span><span class="t-cursor"></span></div>
+      </div>
+    </div>
+
+    <div class="t-card span-3">
+      <div class="t-card-title">QUICK ACCESS <span class="t-card-num">[07]</span></div>
+      <div class="t-links">
+        <span class="t-link">PROXMOX</span>
+        <span class="t-link">PORTAINER</span>
+        <span class="t-link">GRAFANA</span>
+        <span class="t-link">TRAEFIK</span>
+        <span class="t-link">ADGUARD</span>
+        <span class="t-link">UPTIME-KUMA</span>
+        <span class="t-link">IMMICH</span>
+        <span class="t-link">CALIBRE</span>
+        <span class="t-link">ABS</span>
+        <span class="t-link">CHANGEDETECT</span>
+        <span class="t-link">SHELFMARK</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════
+     D — ULTRA-MINIMAL
+     ══════════════════════════════════════════════════════════════════ -->
+<div id="minimal" class="style-section">
+  <div class="m-header">
+    <div>
+      <div class="m-logo">AZ<span>-</span>Lab</div>
+      <div class="m-time" id="min-time">--:--:-- · svc-podman-01</div>
+    </div>
+    <nav class="m-nav">
+      <span class="m-nav-item active">Lab</span>
+      <span class="m-nav-item">Goals</span>
+      <span class="m-nav-item">Terminal</span>
+      <span class="m-nav-item">Network</span>
+    </nav>
+  </div>
+
+  <!-- Metrics -->
+  <div class="m-section">
+    <div class="m-section-head">Host Metrics</div>
+    <div class="m-metrics">
+      <div class="m-metric">
+        <div class="m-metric-val">42<span style="font-size:20px;color:#333;">%</span></div>
+        <div class="m-metric-lbl">CPU Usage</div>
+        <div class="m-metric-delta">↑ +3% from avg</div>
+      </div>
+      <div class="m-metric">
+        <div class="m-metric-val">6.2<span style="font-size:20px;color:#333;">G</span></div>
+        <div class="m-metric-lbl">Memory · 8GB total</div>
+      </div>
+      <div class="m-metric">
+        <div class="m-metric-val">47<span style="font-size:20px;color:#333;">d</span></div>
+        <div class="m-metric-lbl">Uptime</div>
+        <div class="m-metric-delta" style="color:#4ade80;">All clear</div>
+      </div>
+      <div class="m-metric">
+        <div class="m-metric-val">12<span style="font-size:20px;color:#333;">/13</span></div>
+        <div class="m-metric-lbl">Containers healthy</div>
+        <div class="m-metric-delta">1 warning</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Containers -->
+  <div class="m-section">
+    <div class="m-section-head">Containers</div>
+    <div class="m-list">
+      <div class="m-list-item"><div class="m-indicator on"></div><div class="m-list-name">az-dashboard</div><div class="m-list-meta">home.az-lab.dev</div><div class="m-list-action">→</div></div>
+      <div class="m-list-item"><div class="m-indicator on"></div><div class="m-list-name">memory-mcp-server</div><div class="m-list-meta">memory-mcp.az-lab.dev</div><div class="m-list-action">→</div></div>
+      <div class="m-list-item"><div class="m-indicator warn"></div><div class="m-list-name">az-gmail-mcp</div><div class="m-list-meta">auth token expired</div><div class="m-list-action">→</div></div>
+      <div class="m-list-item"><div class="m-indicator on"></div><div class="m-list-name">traefik</div><div class="m-list-meta">proxy · 14 routes</div><div class="m-list-action">→</div></div>
+      <div class="m-list-item"><div class="m-indicator on"></div><div class="m-list-name">calibre-web</div><div class="m-list-meta">calibre.az-lab.dev</div><div class="m-list-action">→</div></div>
+    </div>
+  </div>
+
+  <!-- Goals -->
+  <div class="m-section">
+    <div class="m-section-head">Active Milestones</div>
+    <div>
+      <div class="m-goal">
+        <div class="m-goal-head"><div class="m-goal-name">Supabase Realtime sync</div><div class="m-goal-pct">80%</div></div>
+        <div class="m-goal-bar"><div class="m-goal-fill" style="width:80%;"></div></div>
+      </div>
+      <div class="m-goal">
+        <div class="m-goal-head"><div class="m-goal-name">Gmail OAuth reauth</div><div class="m-goal-pct">30%</div></div>
+        <div class="m-goal-bar"><div class="m-goal-fill" style="width:30%;"></div></div>
+      </div>
+      <div class="m-goal">
+        <div class="m-goal-head"><div class="m-goal-name">Hybrid BM25+vector retrieval</div><div class="m-goal-pct">100%</div></div>
+        <div class="m-goal-bar"><div class="m-goal-fill done" style="width:100%;"></div></div>
+      </div>
+      <div class="m-goal">
+        <div class="m-goal-head"><div class="m-goal-name">Reddit RSS workaround</div><div class="m-goal-pct">0%</div></div>
+        <div class="m-goal-bar"><div class="m-goal-fill" style="width:0%;"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Quick links -->
+  <div class="m-section">
+    <div class="m-section-head">Quick Access</div>
+    <div class="m-links">
+      <span class="m-link">Proxmox</span>
+      <span class="m-link">Portainer</span>
+      <span class="m-link">Grafana</span>
+      <span class="m-link">Traefik</span>
+      <span class="m-link">AdGuard</span>
+      <span class="m-link">Uptime Kuma</span>
+      <span class="m-link">Immich</span>
+      <span class="m-link">Calibre</span>
+      <span class="m-link">Audiobookshelf</span>
+      <span class="m-link">Changedetection</span>
+      <span class="m-link">Shelfmark</span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+function show(id, btn) {
+  document.querySelectorAll('.style-section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+}
+function updateClocks() {
+  const t = new Date().toLocaleTimeString();
+  ['bento-time','glass-time','term-time','min-time'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = id === 'min-time' ? t + ' · svc-podman-01' : t;
+  });
+}
+setInterval(updateClocks, 1000);
+updateClocks();
+</script>
+</body>
+</html>

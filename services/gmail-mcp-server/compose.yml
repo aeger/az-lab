@@ -1,0 +1,36 @@
+name: az-lab-gmail-mcp
+
+services:
+  # ─── Gmail MCP Server ────────────────────────────────────────────────────────
+  gmail-mcp:
+    image: az-gmail-mcp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: az-gmail-mcp
+    restart: unless-stopped
+    environment:
+      - GMAIL_CLIENT_ID=${GMAIL_CLIENT_ID}
+      - GMAIL_CLIENT_SECRET=${GMAIL_CLIENT_SECRET}
+      - GMAIL_REFRESH_TOKEN=${GMAIL_REFRESH_TOKEN}
+      - GMAIL_SEND_ALLOWLIST=${GMAIL_SEND_ALLOWLIST:-daily-email-triage}
+      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID:-}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID:-}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY:-}
+      - R2_BUCKET_NAME=${R2_BUCKET_NAME:-az-lab-cdn}
+      - R2_PUBLIC_URL=${R2_PUBLIC_URL:-}
+      - PORT=3000
+      - SUPABASE_KEY=${SUPABASE_KEY:-}
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gmail-mcp.rule=Host(`gmail-mcp.az-lab.dev`)"
+      - "traefik.http.routers.gmail-mcp.entrypoints=websecure"
+      - "traefik.http.routers.gmail-mcp.tls=true"
+      - "traefik.http.routers.gmail-mcp.middlewares=lan-allow@file"
+      - "traefik.http.services.gmail-mcp.loadbalancer.server.port=3000"
+
+networks:
+  proxy:
+    external: true

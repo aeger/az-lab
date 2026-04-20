@@ -1,6 +1,6 @@
 # Stage 1: Builder (needs all deps including devDependencies for TypeScript)
 FROM node:20-alpine AS builder
-RUN apk add --no-cache libc6-compat
+RUN apk add --no-cache libc6-compat python3 make g++ sqlite-dev
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -25,6 +25,14 @@ RUN addgroup --system --gid 1001 nodejs && \
 COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+# Install native modules not traced by Next.js standalone
+RUN apk add --no-cache python3 make g++ sqlite-dev && \
+    npm install --prefix /app ws ssh2 better-sqlite3 --no-save && \
+    chown -R nextjs:nodejs /app/node_modules
+
+# Override the auto-generated standalone server.js with our custom WebSocket server
+COPY --chown=nextjs:nodejs server.js ./server.js
 
 # Config and data dirs will be mounted as volumes
 RUN mkdir -p /app/config /app/data && chown -R nextjs:nodejs /app/config /app/data
