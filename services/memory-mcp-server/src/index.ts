@@ -757,13 +757,33 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 022 skipped:", err.message);
   }
+
+  // Migration 023: recall_count + last_accessed columns — reinforce-on-access scoring
+  // Adds dedicated recall_count (incremented per hybrid_recall call) and last_accessed columns.
+  // hybrid_recall updated to +0.10 * log1p(recall_count) in A-MAC composite.
+  // Apply migrations/023_recall_count.sql via Supabase SQL editor if needed.
+  try {
+    const { data, error } = await supabase.rpc("apply_recall_count_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 023 RPC not yet registered — apply migrations/023_recall_count.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 023 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 023 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 023 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.2.0",
+    version: "5.3.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -2032,7 +2052,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 7; // +7: memory blocks (get/set) + add_memory_link + record_task_completion; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.1.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.3.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -2103,7 +2123,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v5.2.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v5.3.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
