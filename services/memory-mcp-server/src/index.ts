@@ -777,13 +777,51 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 023 skipped:", err.message);
   }
+
+  // Migration 025: discard_redundant_memories() — AgeMem selective discard
+  // Finds near-duplicate pairs (cosine similarity > threshold) and deletes the lower-quality one.
+  // Quality = importance_score*0.5 + recall_factor*0.3 + access_factor*0.2
+  try {
+    const { data, error } = await supabase.rpc("apply_discard_redundant_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 025 RPC not yet registered — apply migrations/025_discard_redundant.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 025 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 025 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 025 skipped:", err.message);
+  }
+
+  // Migration 026: confidence column + hybrid_recall updated with p_min_confidence filter
+  // Adds confidence FLOAT DEFAULT 0.8 to memories; agents tag speculative/uncertain memories low.
+  // hybrid_recall now returns confidence and accepts p_min_confidence (default 0.0 = no filter).
+  try {
+    const { data, error } = await supabase.rpc("apply_confidence_column_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 026 RPC not yet registered — apply migrations/026_confidence_column.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 026 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 026 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 026 skipped:", err.message);
+  }
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.3.0",
+    version: "5.4.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -803,8 +841,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       agent_id: z.string().optional().describe("Agent that owns this memory: wren, iris, atlas, forge, volt. Used with visibility=private for agent-scoped memories."),
       visibility: z.enum(["shared", "private"]).optional().describe("shared (default): visible to all agents. private: visible only to agent_id owner."),
       agent_scope: z.array(z.string()).optional().describe("Which agents can see this memory. Default ['shared'] = all agents. E.g. ['wren','iris'] = only Wren and Iris. Requires migration 012."),
+      confidence: z.number().min(0).max(1).optional().describe("Confidence 0-1 (default 0.8). Use < 0.5 for speculative or unverified facts. Memories below min_confidence threshold are excluded from recall when filtered."),
     },
-    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope }) => {
+    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence }) => {
       // Security gate — scan all text fields before touching the DB
       const scanTargets: Array<[string, string]> = [
         ["name", name], ["description", description], ["content", content],
@@ -823,7 +862,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       // Fetch existing same-name memory (with content for NOOP check + concurrent write detection)
       const { data: existing } = await supabase
         .from("memories")
-        .select("id, content, agent_id, updated_at")
+        .select("id, content, agent_id, updated_at, version")
         .eq("name", name)
         .maybeSingle();
 
@@ -865,11 +904,19 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const update: Record<string, unknown> = { type, description, content, tags: memTags, source: src };
         if (embedding) update.embedding = JSON.stringify(embedding);
         if (importance_score !== undefined) update.importance_score = importance_score;
+        if (confidence !== undefined) update.confidence = confidence;
         if (agent_id) update.agent_id = agent_id;
         if (visibility) update.visibility = visibility;
         if (agent_scope) update.agent_scope = agent_scope;
-        const { error } = await supabase.from("memories").update(update).eq("id", existing.id);
+        update.version = (existing.version ?? 1) + 1;
+        const { data: updatedRows, error } = await supabase
+          .from("memories")
+          .update(update)
+          .eq("id", existing.id)
+          .eq("version", existing.version ?? 1)
+          .select("id");
         if (error) return { content: [{ type: "text" as const, text: `Error updating memory: ${error.message}` }] };
+        if (!updatedRows?.length) return { content: [{ type: "text" as const, text: `Conflict: "${name}" was modified by another agent. Re-read and retry.` }] };
 
         // Re-link on update
         let linkNote = "";
@@ -932,6 +979,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
       if (embedding) insert.embedding = JSON.stringify(embedding);
       if (importance_score !== undefined) insert.importance_score = importance_score;
+      if (confidence !== undefined) insert.confidence = confidence;
       if (agent_id) insert.agent_id = agent_id;
       if (visibility) insert.visibility = visibility;
       if (agent_scope) insert.agent_scope = agent_scope;
@@ -977,8 +1025,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       semantic: z.boolean().optional().describe("Force semantic search (default: true when Ollama available)"),
       agent_id: z.string().optional().describe("Filter by agent ownership: returns shared memories + private memories owned by this agent_id. Omit to return all shared memories."),
       agent_scope: z.string().optional().describe("Filter by agent_scope array: pass agent name (e.g. 'wren') to see only memories scoped to 'shared' or this agent. Requires migration 012."),
+      min_confidence: z.number().min(0).max(1).optional().describe("Exclude memories with confidence below this threshold (default 0.0 = return all). Use 0.5 to hide speculative/unverified memories."),
     },
-    async ({ query, type, tags, limit, semantic, agent_id, agent_scope }) => {
+    async ({ query, type, tags, limit, semantic, agent_id, agent_scope, min_confidence }) => {
       const maxResults = limit || 10;
 
       // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled.
@@ -999,6 +1048,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         };
         if (agent_id) rpcParams.p_agent_id = agent_id;
         if (agent_scope) rpcParams.p_agent_scope = agent_scope;
+        if (min_confidence && min_confidence > 0) rpcParams.p_min_confidence = min_confidence;
         const { data, error } = await supabase.rpc("hybrid_recall", rpcParams);
 
         if (!error && data && data.length > 0) {
@@ -1112,9 +1162,10 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
               const scoreStr = m.hybrid_score ? ` (score ${(m.hybrid_score * 100).toFixed(0)}%)` : "";
               const importanceStr = m.importance_score !== undefined && m.importance_score !== 0.5 ? ` imp:${m.importance_score.toFixed(2)}` : "";
               const accessStr = m.access_count > 0 ? ` accessed:${m.access_count}x` : "";
+              const confidenceStr = m.confidence !== undefined && m.confidence < 0.8 ? ` conf:${m.confidence.toFixed(2)}` : "";
               const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
               const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
-              return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
+              return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${confidenceStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
             });
 
             // Append temporal/causal boosted extras not already in results
@@ -1805,7 +1856,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
     },
     async ({ primary_name, secondary_name, merged_content }) => {
       // Fetch both
-      const { data: primary } = await supabase.from("memories").select("id, type, description, content, tags, source").eq("name", primary_name).maybeSingle();
+      const { data: primary } = await supabase.from("memories").select("id, type, description, content, tags, source, version").eq("name", primary_name).maybeSingle();
       const { data: secondary } = await supabase.from("memories").select("id, tags, content").eq("name", secondary_name).maybeSingle();
 
       if (!primary) return { content: [{ type: "text" as const, text: `Primary memory "${primary_name}" not found.` }] };
@@ -1821,9 +1872,16 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const newEmbedding = await embed(embedInput(primary_name, primary.description, merged_content));
         if (newEmbedding) update.embedding = JSON.stringify(newEmbedding);
       }
+      update.version = (primary.version ?? 1) + 1;
 
-      const { error: updateError } = await supabase.from("memories").update(update).eq("id", primary.id);
+      const { data: mergeUpdated, error: updateError } = await supabase
+        .from("memories")
+        .update(update)
+        .eq("id", primary.id)
+        .eq("version", primary.version ?? 1)
+        .select("id");
       if (updateError) return { content: [{ type: "text" as const, text: `Error updating primary: ${updateError.message}` }] };
+      if (!mergeUpdated?.length) return { content: [{ type: "text" as const, text: `Conflict: "${primary_name}" was modified by another agent. Re-read and retry.` }] };
 
       // Merge via DB function (redirect links, delete secondary)
       const { error: mergeError } = await supabase.rpc("merge_memory_into", {
@@ -1837,6 +1895,35 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       console.log(`[aip] merge_memories "${secondary_name}"→"${primary_name}" by ${callerIdentity || "unverified"}`);
       return {
         content: [{ type: "text" as const, text: `Merged "${secondary_name}" into "${primary_name}".${contentNote}${tagNote} Secondary memory deleted, links redirected.` }],
+      };
+    }
+  );
+
+  // ── Tool: discard_redundant ──────────────────────────────────────────────────
+  server.tool(
+    "discard_redundant",
+    "Find near-duplicate memories (cosine similarity > threshold) and delete the lower-quality one from each pair. Quality = importance_score*0.5 + recall_factor*0.3 + access_factor*0.2. Use dry_run=true to preview without deleting. Implements AgeMem selective discard to prevent memory blindness.",
+    {
+      threshold: z.number().optional().describe("Cosine similarity threshold (default 0.92 — very high overlap). Lower = more aggressive pruning."),
+      max_discards: z.number().optional().describe("Max memories to discard in one call (default 10)"),
+      dry_run: z.boolean().optional().describe("Preview what would be discarded without deleting (default false)"),
+    },
+    async ({ threshold = 0.92, max_discards = 10, dry_run = false }) => {
+      const { data, error } = await supabase.rpc("discard_redundant_memories", {
+        p_similarity_threshold: threshold,
+        p_max_discards: max_discards,
+        p_dry_run: dry_run,
+      });
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      if (!data?.length) return { content: [{ type: "text" as const, text: `No redundant memories found at similarity threshold ${threshold}.` }] };
+
+      const action = dry_run ? "Would discard" : "Discarded";
+      const lines = (data as any[]).map((row) =>
+        `- **${row.discarded_name}** → kept **${row.kept_name}** (${(row.similarity * 100).toFixed(1)}% similar, score ${row.discarded_score.toFixed(3)} vs ${row.kept_score.toFixed(3)})`
+      );
+      console.log(`[aip] discard_redundant: ${data.length} pair(s) processed (dry_run=${dry_run}) by ${callerIdentity || "unverified"}`);
+      return {
+        content: [{ type: "text" as const, text: `${action} ${data.length} redundant memor${data.length === 1 ? "y" : "ies"} (threshold ${threshold}):\n\n${lines.join("\n")}` }],
       };
     }
   );
@@ -2051,8 +2138,8 @@ app.use((req: Request, res: Response, next: () => void) => {
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 7; // +7: memory blocks (get/set) + add_memory_link + record_task_completion; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.3.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 8; // +8: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant; r2: remember_file, recall_file, forget_file, store_file, get_file
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.4.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -2123,7 +2210,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v5.3.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v5.4.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
