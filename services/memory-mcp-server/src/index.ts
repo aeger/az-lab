@@ -815,13 +815,48 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 026 skipped:", err.message);
   }
+
+  // Migration 027: staleness_candidate column + flag_stale_memories() + hybrid_recall returns staleness_candidate
+  // Detects hot-to-cold staleness: memories with high historical access that went quiet for 21+ days.
+  // hybrid_recall now returns staleness_candidate so agents can trigger re-verification.
+  try {
+    const { data, error } = await supabase.rpc("apply_staleness_candidate_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 027 RPC not yet registered — apply migrations/027_staleness_candidate.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 027 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 027 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 027 skipped:", err.message);
+  }
+}
+
+// ── Staleness maintenance job (runs once at startup, then every 24h) ─────────
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function startStalenessJob(supabase: any): void {
+  const run = async () => {
+    try {
+      const { data, error } = await supabase.rpc("flag_stale_memories");
+      if (error) console.warn("[staleness] flag_stale_memories error:", error.message);
+      else if ((data as number) > 0) console.log(`[staleness] Flagged ${data} stale memories`);
+    } catch (err: any) {
+      console.warn("[staleness] job error:", err.message);
+    }
+  };
+  run();
+  setInterval(run, 24 * 60 * 60 * 1000);
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.4.0",
+    version: "5.5.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -1165,7 +1200,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
               const confidenceStr = m.confidence !== undefined && m.confidence < 0.8 ? ` conf:${m.confidence.toFixed(2)}` : "";
               const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
               const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
-              return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${confidenceStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
+              const staleFlag = m.staleness_candidate ? " [stale?]" : "";
+              return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${confidenceStr}${trust}${conflictFlag}${staleFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
             });
 
             // Append temporal/causal boosted extras not already in results
@@ -2210,10 +2246,11 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v5.4.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v5.5.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
+  startStalenessJob(supabase);
 });
 
 // ── Cross-agent memory sync (Supabase Realtime) ──────────────────────────────
