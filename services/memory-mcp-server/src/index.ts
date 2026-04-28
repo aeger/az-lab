@@ -111,7 +111,7 @@ async function detectConflicts(
   embedding: number[] | null
 ): Promise<string | null> {
   // Find candidates: same type, overlapping tags, high similarity
-  let candidates: Array<{ id: string; name: string; content: string }> = [];
+  let candidates: Array<{ id: string; name: string; content: string; similarity: number }> = [];
 
   if (embedding) {
     const { data } = await supabase.rpc("match_memories", {
@@ -122,32 +122,46 @@ async function detectConflicts(
     if (data) {
       candidates = (data as any[])
         .filter((m) => m.id !== newMemoryId && m.type === type)
-        .map((m) => ({ id: m.id, name: m.name, content: m.content }));
+        .map((m) => ({ id: m.id, name: m.name, content: m.content, similarity: m.similarity ?? 0 }));
     }
   }
 
   const conflictNames: string[] = [];
   for (const candidate of candidates) {
+    const sim = candidate.similarity;
     if (mightContradict(newContent, candidate.content)) {
-      // Record contradiction conflict
+      // Contradiction: negation words detected in semantically related memories
       await supabase.from("memory_conflicts").upsert({
         memory_a_id: newMemoryId,
         memory_b_id: candidate.id,
         conflict_type: "contradiction",
         description: `New memory may contradict "${candidate.name}"`,
         resolved: false,
+        detected_by: "negation_heuristic",
       }, { onConflict: "memory_a_id,memory_b_id" });
-      // Also record stale conflict against the older memory (new supersedes old)
       await supabase.from("memory_conflicts").upsert({
         memory_a_id: candidate.id,
         memory_b_id: newMemoryId,
         conflict_type: "stale",
         description: `May be superseded by newer memory "${newContent.slice(0, 80)}..."`,
         resolved: false,
+        detected_by: "negation_heuristic",
       }, { onConflict: "memory_a_id,memory_b_id" });
-      // Flag both memories
       await supabase.from("memories").update({ conflict_flagged: true }).in("id", [newMemoryId, candidate.id]);
       conflictNames.push(candidate.name);
+    } else if (sim >= 0.85 && textSimilarity(newContent, candidate.content) < 0.65) {
+      // Near-duplicate (Mem0g-style): high embedding similarity but divergent text content.
+      // Catches cases like same service at different port — same topic, different facts.
+      await supabase.from("memory_conflicts").upsert({
+        memory_a_id: newMemoryId,
+        memory_b_id: candidate.id,
+        conflict_type: "near_duplicate",
+        description: `High semantic similarity (${(sim * 100).toFixed(0)}%) but divergent content — possible stale data in "${candidate.name}"`,
+        resolved: false,
+        detected_by: "sim_threshold_0.85",
+      }, { onConflict: "memory_a_id,memory_b_id" });
+      await supabase.from("memories").update({ conflict_flagged: true }).in("id", [newMemoryId, candidate.id]);
+      conflictNames.push(`${candidate.name} (near-dup)`);
     }
   }
 
@@ -778,6 +792,23 @@ async function applyStartupMigrations(): Promise<void> {
     console.warn("Migration 023 skipped:", err.message);
   }
 
+  // Migration 029: agent_episodes table + expanded memory_conflicts conflict_type
+  try {
+    const { data, error } = await supabase.rpc("apply_agent_episodes_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 029 RPC not yet registered — apply migrations/029_agent_episodes.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 029 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 029 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 029 skipped:", err.message);
+  }
+
   // Migration 025: discard_redundant_memories() — AgeMem selective discard
   // Finds near-duplicate pairs (cosine similarity > threshold) and deletes the lower-quality one.
   // Quality = importance_score*0.5 + recall_factor*0.3 + access_factor*0.2
@@ -834,6 +865,25 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 027 skipped:", err.message);
   }
+
+  // Migration 028: memory_class column (episodic/semantic/procedural/working)
+  // Adds structured memory class alongside the type field. Backfills existing rows to 'semantic' or 'episodic'.
+  // hybrid_recall gains p_memory_class filter; remember/recall tools expose memory_class param.
+  try {
+    const { data, error } = await supabase.rpc("apply_memory_class_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 028 RPC not yet registered — apply migrations/028_memory_class.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 028 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 028 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 028 skipped:", err.message);
+  }
 }
 
 // ── Staleness maintenance job (runs once at startup, then every 24h) ─────────
@@ -856,7 +906,7 @@ function startStalenessJob(supabase: any): void {
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.5.0",
+    version: "5.6.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -877,8 +927,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       visibility: z.enum(["shared", "private"]).optional().describe("shared (default): visible to all agents. private: visible only to agent_id owner."),
       agent_scope: z.array(z.string()).optional().describe("Which agents can see this memory. Default ['shared'] = all agents. E.g. ['wren','iris'] = only Wren and Iris. Requires migration 012."),
       confidence: z.number().min(0).max(1).optional().describe("Confidence 0-1 (default 0.8). Use < 0.5 for speculative or unverified facts. Memories below min_confidence threshold are excluded from recall when filtered."),
+      memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Memory class: semantic (durable facts/prefs, default), episodic (event log), procedural (how-to/skill), working (short-term context). Defaults to 'semantic' for all existing types."),
     },
-    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence }) => {
+    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence, memory_class }) => {
       // Security gate — scan all text fields before touching the DB
       const scanTargets: Array<[string, string]> = [
         ["name", name], ["description", description], ["content", content],
@@ -943,6 +994,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (agent_id) update.agent_id = agent_id;
         if (visibility) update.visibility = visibility;
         if (agent_scope) update.agent_scope = agent_scope;
+        if (memory_class) update.memory_class = memory_class;
         update.version = (existing.version ?? 1) + 1;
         const { data: updatedRows, error } = await supabase
           .from("memories")
@@ -1018,6 +1070,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (agent_id) insert.agent_id = agent_id;
       if (visibility) insert.visibility = visibility;
       if (agent_scope) insert.agent_scope = agent_scope;
+      if (memory_class) insert.memory_class = memory_class;
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
@@ -1061,8 +1114,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       agent_id: z.string().optional().describe("Filter by agent ownership: returns shared memories + private memories owned by this agent_id. Omit to return all shared memories."),
       agent_scope: z.string().optional().describe("Filter by agent_scope array: pass agent name (e.g. 'wren') to see only memories scoped to 'shared' or this agent. Requires migration 012."),
       min_confidence: z.number().min(0).max(1).optional().describe("Exclude memories with confidence below this threshold (default 0.0 = return all). Use 0.5 to hide speculative/unverified memories."),
+      memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Filter by memory class. episodic=event log, semantic=durable facts (default for most), procedural=skills/how-to, working=short-term context."),
     },
-    async ({ query, type, tags, limit, semantic, agent_id, agent_scope, min_confidence }) => {
+    async ({ query, type, tags, limit, semantic, agent_id, agent_scope, min_confidence, memory_class }) => {
       const maxResults = limit || 10;
 
       // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled.
@@ -1084,6 +1138,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (agent_id) rpcParams.p_agent_id = agent_id;
         if (agent_scope) rpcParams.p_agent_scope = agent_scope;
         if (min_confidence && min_confidence > 0) rpcParams.p_min_confidence = min_confidence;
+        if (memory_class) rpcParams.p_memory_class = memory_class;
         const { data, error } = await supabase.rpc("hybrid_recall", rpcParams);
 
         if (!error && data && data.length > 0) {
@@ -1233,6 +1288,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (type) q = q.eq("type", type);
       if (tags && tags.length > 0) q = q.overlaps("tags", tags);
       if (query) q = q.or(`name.ilike.%${query}%,description.ilike.%${query}%,content.ilike.%${query}%`);
+      if (memory_class) q = q.eq("memory_class", memory_class);
       // Agent visibility filter: when agent_id set, return shared + own private; else return shared only (or all if visibility column not yet added)
       if (agent_id) q = q.or(`visibility.eq.shared,and(visibility.eq.private,agent_id.eq.${agent_id})`);
 
@@ -2149,6 +2205,98 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
     );
   }
 
+  // ── Tool: record_episode ───────────────────────────────────────────────────
+  server.tool(
+    "record_episode",
+    "Record or update an agent episode (task execution log). Captures input, actions, outcome, and learnings for episodic self-improvement (MemRL/CoALA pattern).",
+    {
+      agent: z.string().describe("Agent name: wren, iris, atlas, forge, volt"),
+      task_id: z.string().uuid().optional().describe("task_queue UUID this episode corresponds to"),
+      status: z.enum(["in_progress", "completed", "failed", "partial"]).optional().describe("Episode status (default: in_progress)"),
+      summary: z.string().optional().describe("1-2 sentence summary of what was done"),
+      input_summary: z.string().optional().describe("What task/request was given"),
+      actions: z.array(z.any()).optional().describe("Array of actions taken (tool calls, decisions)"),
+      outcome: z.string().optional().describe("What resulted — success, error message, partial"),
+      learnings: z.string().optional().describe("Key takeaways for future runs — what to do differently"),
+      memories_consulted: z.array(z.string().uuid()).optional().describe("UUIDs of memories recalled during this episode"),
+      episode_id: z.string().uuid().optional().describe("Existing episode ID to update (omit to create new)"),
+    },
+    async ({ agent, task_id, status, summary, input_summary, actions, outcome, learnings, memories_consulted, episode_id }) => {
+      if (episode_id) {
+        // Update existing episode
+        const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+        if (status) updates.status = status;
+        if (summary) updates.summary = summary;
+        if (input_summary) updates.input_summary = input_summary;
+        if (actions) updates.actions = actions;
+        if (outcome) updates.outcome = outcome;
+        if (learnings) updates.learnings = learnings;
+        if (memories_consulted) updates.memories_consulted = memories_consulted;
+        if (status && status !== "in_progress") updates.ended_at = new Date().toISOString();
+        const { error } = await supabase.from("agent_episodes").update(updates).eq("id", episode_id);
+        if (error) return { content: [{ type: "text" as const, text: `Failed to update episode: ${error.message}` }] };
+        return { content: [{ type: "text" as const, text: `Episode ${episode_id} updated (status: ${status || "unchanged"})` }] };
+      }
+      // Create new episode
+      const row: Record<string, unknown> = {
+        agent,
+        status: status || "in_progress",
+        started_at: new Date().toISOString(),
+      };
+      if (task_id) row.task_id = task_id;
+      if (summary) row.summary = summary;
+      if (input_summary) row.input_summary = input_summary;
+      if (actions) row.actions = actions;
+      if (outcome) row.outcome = outcome;
+      if (learnings) row.learnings = learnings;
+      if (memories_consulted) row.memories_consulted = memories_consulted;
+      if (status && status !== "in_progress") row.ended_at = new Date().toISOString();
+      const { data, error } = await supabase.from("agent_episodes").insert(row).select("id").single();
+      if (error) return { content: [{ type: "text" as const, text: `Failed to record episode: ${error.message}` }] };
+      return { content: [{ type: "text" as const, text: `Episode recorded: ${data.id} (agent: ${agent}, status: ${row.status})` }] };
+    }
+  );
+
+  // ── Tool: recall_episodes ──────────────────────────────────────────────────
+  server.tool(
+    "recall_episodes",
+    "Recall recent agent episodes to learn from past task outcomes. Surfaces prior runs matching agent or status filters.",
+    {
+      agent: z.string().optional().describe("Filter by agent name"),
+      status: z.enum(["in_progress", "completed", "failed", "partial"]).optional().describe("Filter by status"),
+      limit: z.number().optional().describe("Max episodes to return (default 5)"),
+      with_learnings_only: z.boolean().optional().describe("Only return episodes that have learnings captured"),
+    },
+    async ({ agent, status, limit, with_learnings_only }) => {
+      let q = supabase
+        .from("agent_episodes")
+        .select("id, agent, task_id, started_at, ended_at, status, summary, input_summary, outcome, learnings, memories_consulted")
+        .order("created_at", { ascending: false })
+        .limit(limit || 5);
+      if (agent) q = q.eq("agent", agent);
+      if (status) q = q.eq("status", status);
+      if (with_learnings_only) q = q.not("learnings", "is", null);
+      const { data, error } = await q;
+      if (error) return { content: [{ type: "text" as const, text: `Episode recall failed: ${error.message}` }] };
+      if (!data?.length) return { content: [{ type: "text" as const, text: "No episodes found matching criteria." }] };
+      const lines = data.map((ep) => {
+        const dur = ep.ended_at && ep.started_at
+          ? ` (${Math.round((new Date(ep.ended_at).getTime() - new Date(ep.started_at).getTime()) / 1000)}s)`
+          : "";
+        const taskRef = ep.task_id ? ` task:${ep.task_id.slice(0, 8)}` : "";
+        const memCount = ep.memories_consulted?.length ? ` mems:${ep.memories_consulted.length}` : "";
+        return [
+          `## ${ep.agent} — ${ep.status}${dur}${taskRef}${memCount}`,
+          ep.input_summary ? `**Input:** ${ep.input_summary}` : null,
+          ep.summary ? `**Summary:** ${ep.summary}` : null,
+          ep.outcome ? `**Outcome:** ${ep.outcome}` : null,
+          ep.learnings ? `**Learnings:** ${ep.learnings}` : null,
+        ].filter(Boolean).join("\n");
+      });
+      return { content: [{ type: "text" as const, text: `${data.length} episode(s):\n\n${lines.join("\n\n---\n\n")}` }] };
+    }
+  );
+
   return server;
 }
 
@@ -2175,7 +2323,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 8; // +8: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.4.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.6.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -2246,7 +2394,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v5.5.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v5.6.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
