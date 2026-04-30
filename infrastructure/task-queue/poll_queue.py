@@ -270,6 +270,33 @@ def api_request(method, path, data=None, params=None):
         raise
 
 
+def verify_supabase_auth() -> None:
+    """Sanity-check Supabase auth at service startup. Raises RuntimeError on failure.
+
+    Long-running services that hold the Supabase key in memory (sage, argus)
+    silently fail with HTTP 401 when keys are rotated/disabled — the loop
+    catches the exception and keeps polling. Call this at startup so systemd
+    can flag the service as failed and the user gets paged instead of running
+    blind.
+    """
+    if not SUPABASE_KEY:
+        raise RuntimeError(
+            "SUPABASE_KEY not loaded — check ~/azlab/services/memory-mcp-server/.env "
+            "for SUPABASE_SECRET_KEY, or set the env var directly."
+        )
+    try:
+        api_request("GET", "agent_heartbeat", params={"select": "agent", "limit": "1"})
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise RuntimeError(
+                "Supabase 401 Unauthorized at startup. The in-memory key is "
+                "invalid or has been rotated. If a key rotation just happened, "
+                "this service was started before the rotation and needs a "
+                "systemctl --user restart to pick up the new key from .env."
+            ) from e
+        raise RuntimeError(f"Supabase startup probe failed: HTTP {e.code}") from e
+
+
 def claim_next_task():
     """Fetch the highest-priority pending or delegated task and claim it atomically."""
     # Pick up 'ready'/'pending' (new/legacy) and 'delegated' tasks targeting claude-code or wren
