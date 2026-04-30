@@ -24,12 +24,12 @@ def _load_supabase_key():
     try:
         with open(env_path) as f:
             for line in f:
-                if line.startswith("SUPABASE_SERVICE_KEY="):
+                if line.startswith("SUPABASE_SECRET_KEY="):
                     return line.split("=", 1)[1].strip()
     except Exception:
         pass
     # Fall back to env var (no hardcoded key)
-    return os.environ.get("SUPABASE_KEY")
+    return os.environ.get("SUPABASE_SECRET_KEY")
 
 SUPABASE_KEY = _load_supabase_key()
 CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
@@ -473,8 +473,12 @@ IRIS_EVAL_GUIDANCE = """
 """
 
 
-def mark_pending_eval(task_id, result, goal_id=None):
-    """Route CRIT/HIGH completed tasks to Iris for evaluation before marking done."""
+def mark_pending_eval(task_id, result, goal_id=None, original_task=None):
+    """Route CRIT/HIGH completed tasks to Iris for evaluation before marking done.
+
+    When original_task carries a recurring_schedule, requeue the next occurrence
+    immediately so the chain never breaks — even if Jeff/Iris hasn't approved yet.
+    """
     stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
     if result and len(result) > _RESULT_MAX_CHARS:
         stored_result += f"\n... [truncated from {len(result)} chars]"
@@ -486,13 +490,15 @@ def mark_pending_eval(task_id, result, goal_id=None):
         data={"status": "pending_eval", "result": stored_result, "target": "cowork"},
     )
     log_activity("status", "Pending Iris eval", task_id=task_id)
+    if original_task:
+        requeue_recurring(original_task)
     if goal_id:
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         summary = result.splitlines()[0][:200] if result else "pending"
         update_goal_notes(goal_id, f"Pending eval {date_str}: {summary}")
 
 
-def mark_failed(task_id, error, goal_id=None):
+def mark_failed(task_id, error, goal_id=None, original_task=None):
     # Fetch current attempt_count so we can increment it
     try:
         rows = api_request("GET", "task_queue", params={"id": f"eq.{task_id}", "select": "attempt_count"})
@@ -509,6 +515,10 @@ def mark_failed(task_id, error, goal_id=None):
             "attempt_count": current_attempts + 1,
         },
     )
+    # Recurring tasks keep recurring even after a failed run — otherwise one
+    # bad day kills the whole schedule until a human notices.
+    if original_task:
+        requeue_recurring(original_task)
     if goal_id:
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         update_goal_notes(goal_id, f"Failed {date_str}: {error[:100]}")
@@ -953,6 +963,12 @@ def auto_queue_from_goals():
     """Find the highest-priority active milestone with an implementation_prompt and queue it."""
     _promote_planned_milestones()
 
+    # Honor goal target_date: queue any goal that's reached its scheduled date and has no pending task.
+    # This is the bridge between the goals page "Schedule" button and actual execution.
+    queued_due = auto_queue_due_goals()
+    if queued_due:
+        return queued_due
+
     if _in_morning_window():
         print("In morning review window — skipping auto-queue.")
         return None
@@ -1013,6 +1029,84 @@ def auto_queue_from_goals():
             return task_id
         except Exception as e:
             print(f"auto_queue_from_goals: failed to queue {goal_id}: {e}", file=sys.stderr)
+
+    return None
+
+
+def auto_queue_due_goals():
+    """Queue goals whose target_date has arrived and that have no pending task.
+
+    Bridges the dashboard "Schedule" action (sets target_date + status=planned)
+    with the executor. Without this, scheduled goals drift past their date with
+    no automatic action.
+    """
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        goals = api_request(
+            "GET",
+            "goals",
+            params={
+                "target_date": f"lte.{now_iso}",
+                "status": "in.(planned,active)",
+                "select": "id,title,description,implementation_prompt,priority,target_date,last_queued_at",
+                "order": "priority.asc,target_date.asc",
+                "limit": "10",
+            },
+        )
+    except Exception as e:
+        print(f"auto_queue_due_goals: fetch failed: {e}", file=sys.stderr)
+        return None
+
+    for g in goals or []:
+        goal_id = g["id"]
+        title = g.get("title", goal_id[:8])
+
+        # Cooldown: don't requeue same goal within 6h
+        if g.get("last_queued_at"):
+            try:
+                last = datetime.fromisoformat(g["last_queued_at"].replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - last).total_seconds() / 3600 < 6:
+                    continue
+            except Exception:
+                pass
+
+        # Skip if a task already exists in any non-terminal state for this goal
+        if _has_recent_pending_task(goal_id):
+            continue
+
+        prompt = g.get("implementation_prompt") or g.get("description") or title
+        priority = g.get("priority", 2)
+        target_date = g.get("target_date") or "?"
+
+        task_data = {
+            "title": f"[Scheduled] {title}",
+            "description": prompt,
+            "status": "pending",
+            "target": "claude-code",
+            "source": "wren-scheduler",
+            "priority": priority,
+            "goal_id": goal_id,
+            "tags": ["auto-queued", "scheduled", "due-date"],
+            "context": {"scheduled_for": target_date},
+        }
+        try:
+            res = api_request("POST", "task_queue", data=task_data)
+            task_id = res[0]["id"] if isinstance(res, list) else res.get("id")
+            api_request(
+                "PATCH",
+                f"goals?id=eq.{goal_id}",
+                data={
+                    "last_queued_at": datetime.now(timezone.utc).isoformat(),
+                    # Promote planned→active so progress reflects work in flight
+                    "status": "active",
+                },
+            )
+            print(f"Auto-queued scheduled goal: {title} (target_date={target_date}, task {task_id})")
+            log_activity("status", f"Scheduled goal fired: {title}", task_id=task_id)
+            discord_notify(f"📅 Scheduled task fired: {title} — target was {target_date[:10]}")
+            return task_id
+        except Exception as e:
+            print(f"auto_queue_due_goals: failed for {goal_id}: {e}", file=sys.stderr)
 
     return None
 
@@ -1269,7 +1363,7 @@ def main():
         # CRIT (0) and HIGH (1) tasks go to Iris for evaluation before completion
         task_priority = task.get("priority", 2)
         if task_priority <= 1:
-            mark_pending_eval(task_id, result, goal_id=goal_id)
+            mark_pending_eval(task_id, result, goal_id=goal_id, original_task=task)
             discord_notify(f"🔍 Pending eval: {title} — {summary}")
             print(f"Task {task_id} pending evaluation by Iris.")
         else:
@@ -1280,7 +1374,7 @@ def main():
     except Exception as e:
         error_msg = str(e)
         print(f"Task {task_id} failed: {error_msg}", file=sys.stderr)
-        mark_failed(task_id, error_msg, goal_id=task.get("goal_id"))
+        mark_failed(task_id, error_msg, goal_id=task.get("goal_id"), original_task=task)
         log_activity("error", error_msg[:200], task_id=task_id)
         discord_notify(f"❌ Failed: {title} — {error_msg[:120]}")
         sys.exit(1)

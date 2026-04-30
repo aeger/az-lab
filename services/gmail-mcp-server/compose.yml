@@ -20,7 +20,11 @@ services:
       - R2_BUCKET_NAME=${R2_BUCKET_NAME:-az-lab-cdn}
       - R2_PUBLIC_URL=${R2_PUBLIC_URL:-}
       - PORT=3000
-      - SUPABASE_KEY=${SUPABASE_KEY:-}
+      - SUPABASE_SECRET_KEY=${SUPABASE_SECRET_KEY:-}
+      - GMAIL_AUTH_BASE=https://gmail-mcp.az-lab.dev
+      - GMAIL_ENV_PATH=/app/gmail-mcp.env
+    volumes:
+      - /home/almty1/azlab/services/gmail-mcp-server/.env:/app/gmail-mcp.env:rw
     networks:
       - proxy
     labels:
@@ -28,6 +32,7 @@ services:
       - "traefik.http.routers.gmail-mcp.rule=Host(`gmail-mcp.az-lab.dev`)"
       - "traefik.http.routers.gmail-mcp.entrypoints=websecure"
       - "traefik.http.routers.gmail-mcp.tls=true"
+      - "traefik.http.routers.gmail-mcp.tls.certresolver=le"
       - "traefik.http.routers.gmail-mcp.middlewares=lan-allow@file"
       - "traefik.http.services.gmail-mcp.loadbalancer.server.port=3000"
 

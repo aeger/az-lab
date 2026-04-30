@@ -4,8 +4,8 @@ export const config = {
 
   supabase: {
     url: process.env.SUPABASE_URL || '',
-    anonKey: process.env.SUPABASE_ANON_KEY || '',
-    serviceKey: process.env.SUPABASE_SERVICE_KEY || '',
+    anonKey: process.env.SUPABASE_PUBLISHABLE_KEY || '',
+    serviceKey: process.env.SUPABASE_SECRET_KEY || '',
     pollInterval: parseInt(process.env.POLL_SUPABASE || '30000', 10),
   },
 

@@ -12,7 +12,7 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 SUPABASE_URL="${SUPABASE_URL:-}"
-SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
+SERVICE_KEY="${SUPABASE_SECRET_KEY:-}"
 
 if [[ -z "$SUPABASE_URL" || -z "$SERVICE_KEY" ]]; then
   exit 0

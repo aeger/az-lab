@@ -63,7 +63,7 @@ R2_ACCOUNT_ID = env.get("R2_ACCOUNT_ID") or os.environ.get("CF_R2_ACCOUNT_ID", "
 R2_ACCESS_KEY_ID = env.get("R2_ACCESS_KEY_ID") or os.environ.get("CF_R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = env.get("R2_SECRET_ACCESS_KEY") or os.environ.get("CF_R2_SECRET_ACCESS_KEY", "")
 SUPABASE_URL = env.get("SUPABASE_URL", "")
-SUPABASE_KEY = env.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_KEY = env.get("SUPABASE_SECRET_KEY", "")
 
 if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
     log.error("Missing R2 credentials — check ~/azlab/services/memory-mcp-server/.env")

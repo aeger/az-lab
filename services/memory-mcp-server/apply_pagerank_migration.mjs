@@ -5,8 +5,8 @@ import { createClient } from "@supabase/supabase-js";
 import { readFileSync } from "fs";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://ogqjjlbupqnvlcyrfnxi.supabase.co";
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || readFileSync("/home/almty1/azlab/services/memory-mcp-server/.env", "utf8")
-  .split("\n").find(l => l.startsWith("SUPABASE_SERVICE_KEY="))?.split("=").slice(1).join("=") || "";
+const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || readFileSync("/home/almty1/azlab/services/memory-mcp-server/.env", "utf8")
+  .split("\n").find(l => l.startsWith("SUPABASE_SECRET_KEY="))?.split("=").slice(1).join("=") || "";
 
 console.log("Supabase URL:", SUPABASE_URL);
 console.log("Service key length:", SUPABASE_KEY.length);

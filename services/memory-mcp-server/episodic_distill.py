@@ -32,7 +32,7 @@ from datetime import datetime, timezone, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SUPABASE_URL  = os.environ.get("SUPABASE_URL", "https://ogqjjlbupqnvlcyrfnxi.supabase.co")
-SUPABASE_KEY  = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_KEY  = os.environ.get("SUPABASE_SECRET_KEY", "")
 MEMORY_MCP_URL = os.environ.get("MEMORY_MCP_URL", "http://localhost:3100")
 NEMOCLAW_URL  = os.environ.get("NEMOCLAW_URL", "http://192.168.1.183:8000")
 NEMOCLAW_KEY  = os.environ.get("NVIDIA_API_KEY", "")
@@ -47,6 +47,7 @@ MAX_CLUSTERS = int(os.environ.get("MAX_CLUSTERS", "20"))
 CONSOLIDATED_TAG = "consolidated"
 PROJECT_AGE_MIN_DAYS = int(os.environ.get("PROJECT_AGE_MIN_DAYS", "7"))
 PROJECT_AGE_MAX_DAYS = int(os.environ.get("PROJECT_AGE_MAX_DAYS", "14"))
+WEEKLY_LOOKBACK_DAYS = int(os.environ.get("WEEKLY_LOOKBACK_DAYS", "30"))
 DISCORD_CHANNEL = "1012721652049657896"
 AGENT_BUS_URL = "http://localhost:8765"
 
@@ -486,7 +487,7 @@ def main():
 
     # Re-read env after loading .env
     global SUPABASE_KEY, NEMOCLAW_KEY, ANTHROPIC_API_KEY
-    SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", SUPABASE_KEY)
+    SUPABASE_KEY = os.environ.get("SUPABASE_SECRET_KEY", SUPABASE_KEY)
     NEMOCLAW_KEY = os.environ.get("NVIDIA_API_KEY", "")
     if not NEMOCLAW_KEY:
         try:
@@ -712,5 +713,165 @@ def main():
         )
 
 
+# ── Phase 3: Weekly 30-day project consolidation → reference/consolidation ────
+def fetch_project_30day_memories() -> list:
+    """Fetch project memories from the last 30 days, not yet auto-consolidated."""
+    now = datetime.now(timezone.utc)
+    date_cutoff = (now - timedelta(days=WEEKLY_LOOKBACK_DAYS)).isoformat()
+    try:
+        mems = supa_get("memories", {
+            "type": "eq.project",
+            "tags": f"not.cs.{{auto-consolidated}}",
+            "updated_at": f"gte.{date_cutoff}",
+            "select": "id,name,description,content,tags,access_count,embedding,updated_at",
+            "order": "access_count.desc",
+            "limit": "200",
+        })
+        return mems
+    except Exception as e:
+        log.error(f"[Phase 3] Failed to fetch 30-day project memories: {e}")
+        return []
+
+
+def write_consolidation_memory(name: str, description: str, content: str, tags: list) -> str | None:
+    """Write a reference memory with source='consolidation' via Supabase."""
+    try:
+        r = httpx.post(
+            f"{MEMORY_MCP_URL}/tools/remember",
+            json={
+                "type": "reference",
+                "name": name,
+                "description": description,
+                "content": content,
+                "tags": tags,
+                "source": "consolidation",
+                "importance_score": 0.80,
+            },
+            timeout=30,
+        )
+        if r.status_code == 200:
+            return r.json().get("id") or "ok"
+    except Exception as e:
+        log.warning(f"[Phase 3] MCP write failed, falling back to Supabase: {e}")
+
+    try:
+        result = supa_post("memories", {
+            "type": "reference",
+            "name": name,
+            "description": description,
+            "content": content,
+            "tags": tags,
+            "source": "consolidation",
+            "importance_score": 0.80,
+        })
+        if isinstance(result, list) and result:
+            return result[0].get("id")
+    except Exception as e:
+        log.error(f"[Phase 3] Direct Supabase write failed: {e}")
+    return None
+
+
+def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, int]:
+    """Phase 3: weekly sweep of 30-day project memories → reference with source=consolidation."""
+    memories = fetch_project_30day_memories()
+    log.info(f"[Phase 3] Found {len(memories)} project memories in last {WEEKLY_LOOKBACK_DAYS} days")
+    if not memories:
+        return 0, 0
+
+    for m in memories:
+        emb = m.get("embedding")
+        if isinstance(emb, str):
+            try:
+                m["embedding"] = json.loads(emb)
+            except Exception:
+                m["embedding"] = None
+
+    clusters = cluster_memories(memories)
+    log.info(f"[Phase 3] {len(clusters)} semantic clusters found")
+
+    created = 0
+    processed = 0
+
+    for cluster_idxs in clusters[:MAX_CLUSTERS]:
+        cluster_mems = [memories[i] for i in cluster_idxs]
+        cluster_names = [m["name"] for m in cluster_mems]
+        log.info(f"[Phase 3] Consolidating {len(cluster_mems)}: {cluster_names[:3]}...")
+
+        content = summarize_project_cluster(cluster_mems) if use_nemoclaw else None
+        if not content and use_haiku:
+            content = summarize_project_cluster_haiku(cluster_mems)
+        if not content:
+            content = summarize_cluster_heuristic(cluster_mems)
+
+        top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
+        ref_name = f"weekly-ref:{top_mem['name']}"
+        description = f"Weekly consolidation of {len(cluster_mems)} project memories (30-day window)"
+        tags = ["auto-consolidated", "weekly-consolidated"] + [
+            t for m in cluster_mems for t in (m.get("tags") or [])
+            if t not in (CONSOLIDATED_TAG, "auto-consolidated", "weekly-consolidated")
+        ][:8]
+
+        ref_id = write_consolidation_memory(ref_name, description, content, tags)
+        if not ref_id:
+            log.error(f"[Phase 3] Failed to create reference for {cluster_names}")
+            continue
+
+        if ref_id == "ok":
+            result = supa_get("memories", {"name": f"eq.{ref_name}", "select": "id"})
+            ref_id = result[0]["id"] if result else None
+
+        if ref_id:
+            for m in cluster_mems:
+                create_link(ref_id, m["id"], "weekly_consolidated_from", "semantic")
+            for m in cluster_mems:
+                mark_consolidated(m["id"], m.get("tags") or [])
+            created += 1
+            log.info(f"[Phase 3]   ✓ Created reference memory '{ref_name}'")
+        else:
+            log.warning(f"[Phase 3]   ✗ Could not retrieve ID for '{ref_name}'")
+        processed += 1
+
+    return created, processed
+
+
+def main_weekly():
+    """Entry point for --weekly mode: Phase 3 only."""
+    load_env()
+
+    global SUPABASE_KEY, NEMOCLAW_KEY, ANTHROPIC_API_KEY
+    SUPABASE_KEY = os.environ.get("SUPABASE_SECRET_KEY", SUPABASE_KEY)
+    NEMOCLAW_KEY = os.environ.get("NVIDIA_API_KEY", "")
+    if not NEMOCLAW_KEY:
+        try:
+            key_path = os.path.expanduser("~/.nvidia_api_key")
+            if os.path.exists(key_path):
+                NEMOCLAW_KEY = open(key_path).read().strip()
+        except Exception:
+            pass
+    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
+
+    log.info("=== Weekly 30-day project consolidation started ===")
+    start = datetime.now(timezone.utc)
+
+    use_nemoclaw = bool(NEMOCLAW_KEY)
+    use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
+    llm_status = "NemoClaw" if use_nemoclaw else ("claude-haiku-4-5" if use_haiku else "heuristic")
+    log.info(f"Summarization mode: {llm_status}")
+
+    created, processed = run_weekly_consolidation(use_nemoclaw, use_haiku)
+    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+
+    log.info(f"=== Weekly Phase 3 complete: {created}/{processed} clusters → reference memories ({elapsed:.1f}s) ===")
+
+    if created > 0:
+        send_discord(
+            f"🧠 Weekly memory consolidation: {created} reference memories from {processed} project clusters "
+            f"(30-day window, {llm_status}, {elapsed:.0f}s)"
+        )
+
+
 if __name__ == "__main__":
-    main()
+    if "--weekly" in sys.argv:
+        main_weekly()
+    else:
+        main()

@@ -21,7 +21,7 @@ CRITICAL_PCT  = 85   # alert to Discord after cleanup
 DISCORD_CHANNEL = "1012721652049657896"
 
 SUPABASE_URL     = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+SUPABASE_PUBLISHABLE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "")
 AGENT_BUS_URL    = "http://localhost:8765"
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ def send_discord(msg):
 
 
 def log_supabase(content, metadata=None):
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
         return
     try:
         body = json.dumps({
@@ -65,8 +65,8 @@ def log_supabase(content, metadata=None):
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "apikey": SUPABASE_ANON_KEY,
-                "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                "apikey": SUPABASE_PUBLISHABLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_PUBLISHABLE_KEY}",
                 "Prefer": "return=minimal",
             },
             method="POST",

@@ -11,8 +11,8 @@ import { z } from "zod";
 // ── Config ──────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || "3100", 10);
 const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || SUPABASE_KEY;
+const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY!;
+const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY || SUPABASE_KEY;
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://ollama:11434";
 const EMBED_MODEL = process.env.EMBED_MODEL || "nomic-embed-text";
 
@@ -50,7 +50,7 @@ function verifyAipJwt(token: string): { sub: string } | null {
 }
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY");
+  console.error("Missing SUPABASE_URL or SUPABASE_SECRET_KEY");
   process.exit(1);
 }
 
@@ -2406,7 +2406,7 @@ app.listen(PORT, "0.0.0.0", async () => {
 // Phoenix v1.0.0 WebSocket — supabase-js hardcodes vsn=2.0.0 which this
 // project's Realtime server doesn't support.
 function startMemorySyncListener() {
-  const RT_URL = `${SUPABASE_URL.replace("https://", "wss://")}/realtime/v1/websocket?apikey=${SUPABASE_ANON_KEY}&vsn=1.0.0`;
+  const RT_URL = `${SUPABASE_URL.replace("https://", "wss://")}/realtime/v1/websocket?apikey=${SUPABASE_PUBLISHABLE_KEY}&vsn=1.0.0`;
 
   let ws: any = null;
   let heartbeat: NodeJS.Timeout | null = null;

@@ -20,6 +20,8 @@ import { OAuth2Client } from 'google-auth-library'
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 import { z } from 'zod'
 import express from 'express'
+import { randomBytes, createHash } from 'crypto'
+import { readFileSync, writeFileSync } from 'fs'
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -97,6 +99,28 @@ interface MessageSummary {
   date: string
   snippet: string
   labels: string[]
+}
+
+// ── PKCE Auth State ────────────────────────────────────────────────────────────
+
+const pendingPkce = new Map<string, { verifier: string; expires: number }>()
+setInterval(() => {
+  const now = Date.now()
+  for (const [k, v] of pendingPkce.entries()) {
+    if (v.expires < now) pendingPkce.delete(k)
+  }
+}, 15 * 60 * 1000)
+
+const ENV_PATH = process.env.GMAIL_ENV_PATH ?? ''
+const AUTH_BASE = process.env.GMAIL_AUTH_BASE ?? 'https://gmail-mcp.az-lab.dev'
+
+function persistRefreshToken(token: string): void {
+  if (!ENV_PATH) return
+  try {
+    const content = readFileSync(ENV_PATH, 'utf-8')
+    const updated = content.replace(/^GMAIL_REFRESH_TOKEN=.*$/m, `GMAIL_REFRESH_TOKEN=${token}`)
+    writeFileSync(ENV_PATH, updated, 'utf-8')
+  } catch { /* best-effort */ }
 }
 
 // ── OAuth2 Auth ────────────────────────────────────────────────────────────────
@@ -994,7 +1018,84 @@ async function main(): Promise<void> {
 
   // Health check
   app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', service: 'gmail-mcp-server', version: '1.2.0' })
+    res.json({ status: 'ok', service: 'gmail-mcp-server', version: '1.3.0' })
+  })
+
+  // ── Gmail OAuth reauth flow ───────────────────────────────────────────────────
+
+  // GET /auth — initiates PKCE OAuth, redirects browser to Google consent screen
+  app.get('/auth', (_req, res) => {
+    const clientId = process.env.GMAIL_CLIENT_ID!
+    const state = randomBytes(16).toString('hex')
+    const verifier = randomBytes(64).toString('base64url')
+    const challenge = createHash('sha256').update(verifier).digest('base64url')
+    pendingPkce.set(state, { verifier, expires: Date.now() + 10 * 60 * 1000 })
+
+    const params = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: `${AUTH_BASE}/auth/callback`,
+      response_type: 'code',
+      scope: 'https://mail.google.com/ https://www.googleapis.com/auth/gmail.settings.sharing',
+      access_type: 'offline',
+      prompt: 'consent',
+      state,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+    })
+    res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`)
+  })
+
+  // GET /auth/callback — exchanges code for tokens, updates in-memory client + env file
+  app.get('/auth/callback', async (req, res) => {
+    const { code, state, error } = req.query as Record<string, string>
+
+    if (error) {
+      res.status(400).send(`<html><body style="font-family:sans-serif;max-width:400px;margin:80px auto;text-align:center"><h2 style="color:#ef4444">Authorization failed</h2><p>${error}</p><p>Close this tab and try again.</p></body></html>`)
+      return
+    }
+
+    const pkce = state ? pendingPkce.get(state) : undefined
+    if (!pkce || pkce.expires < Date.now()) {
+      res.status(400).send('<html><body style="font-family:sans-serif;max-width:400px;margin:80px auto;text-align:center"><h2 style="color:#ef4444">Session expired</h2><p>Click the banner again to restart the auth flow.</p></body></html>')
+      return
+    }
+    pendingPkce.delete(state)
+
+    try {
+      const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          code,
+          client_id: process.env.GMAIL_CLIENT_ID!,
+          client_secret: process.env.GMAIL_CLIENT_SECRET!,
+          redirect_uri: `${AUTH_BASE}/auth/callback`,
+          grant_type: 'authorization_code',
+          code_verifier: pkce.verifier,
+        }).toString(),
+      })
+
+      if (!tokenRes.ok) {
+        const err = await tokenRes.text()
+        throw new Error(`Token exchange failed: ${err}`)
+      }
+
+      const tokens = await tokenRes.json() as { refresh_token?: string }
+      const refreshToken = tokens.refresh_token
+
+      if (!refreshToken) {
+        res.status(400).send('<html><body style="font-family:sans-serif;max-width:400px;margin:80px auto;text-align:center"><h2 style="color:#f59e0b">No refresh token</h2><p>Revoke app access at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a> then click the banner again.</p></body></html>')
+        return
+      }
+
+      process.env.GMAIL_REFRESH_TOKEN = refreshToken
+      _oauthClient = null
+      persistRefreshToken(refreshToken)
+
+      res.send('<html><body style="font-family:sans-serif;max-width:400px;margin:80px auto;text-align:center"><h2 style="color:#22c55e">✓ Gmail MCP Re-authorized</h2><p>Token updated. Email triage will resume normally.</p><p style="color:#888;font-size:12px">You can close this tab.</p></body></html>')
+    } catch (e) {
+      res.status(500).send(`<html><body style="font-family:sans-serif;max-width:400px;margin:80px auto;text-align:center"><h2 style="color:#ef4444">Error</h2><p>${e instanceof Error ? e.message : String(e)}</p></body></html>`)
+    }
   })
 
   // MCP endpoint — new transport per request (stateless)
@@ -1017,8 +1118,8 @@ async function main(): Promise<void> {
 
   // Heartbeat reporter — upserts to agent_heartbeat every 60s
   const SUPABASE_URL = 'https://ogqjjlbupqnvlcyrfnxi.supabase.co'
-  const SUPABASE_KEY = process.env.SUPABASE_KEY ?? ''
-  if (SUPABASE_KEY) {
+  const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY ?? ''
+  if (SUPABASE_SECRET_KEY) {
     const sendHeartbeat = async () => {
       let gmailAuthExpired = false
       try {
@@ -1030,8 +1131,8 @@ async function main(): Promise<void> {
         await fetch(`${SUPABASE_URL}/rest/v1/agent_heartbeat?on_conflict=agent`, {
           method: 'POST',
           headers: {
-            'apikey': SUPABASE_KEY,
-            'Authorization': `Bearer ${SUPABASE_KEY}`,
+            'apikey': SUPABASE_SECRET_KEY,
+            'Authorization': `Bearer ${SUPABASE_SECRET_KEY}`,
             'Content-Type': 'application/json',
             'Prefer': 'resolution=merge-duplicates',
           },

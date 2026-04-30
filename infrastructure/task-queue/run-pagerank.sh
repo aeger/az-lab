@@ -12,18 +12,18 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 SUPABASE_URL="${SUPABASE_URL:-}"
-SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
+SUPABASE_SECRET_KEY="${SUPABASE_SECRET_KEY:-}"
 
-if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
-  echo "ERROR: Missing SUPABASE_URL or SUPABASE_SERVICE_KEY" >&2
+if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SECRET_KEY" ]; then
+  echo "ERROR: Missing SUPABASE_URL or SUPABASE_SECRET_KEY" >&2
   exit 1
 fi
 
 echo "[$(date -u)] Running PageRank computation..."
 RESULT=$(curl -s -X POST \
   "${SUPABASE_URL}/rest/v1/rpc/compute_pagerank" \
-  -H "apikey: ${SUPABASE_SERVICE_KEY}" \
-  -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+  -H "apikey: ${SUPABASE_SECRET_KEY}" \
+  -H "Authorization: Bearer ${SUPABASE_SECRET_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"damping": 0.85, "iterations": 20}')
 echo "[$(date -u)] PageRank complete. Updated rows: $RESULT"
