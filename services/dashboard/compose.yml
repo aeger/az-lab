@@ -56,89 +56,11 @@ services:
       - "traefik.http.routers.dashboard.middlewares=lan-allow@file"
       - "traefik.http.services.dashboard.loadbalancer.server.port=3000"
 
-  # ─── Uptime Kuma ─────────────────────────────────────────────────────────────
-  uptime-kuma:
-    image: louislam/uptime-kuma:1
-    container_name: uptime-kuma
-    restart: unless-stopped
-    volumes:
-      - uptime-kuma-data:/app/data
-    networks:
-      - proxy
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.uptime-kuma.rule=Host(`uptime.az-lab.dev`)"
-      - "traefik.http.routers.uptime-kuma.entrypoints=websecure"
-      - "traefik.http.routers.uptime-kuma.tls=true"
-      - "traefik.http.routers.uptime-kuma.middlewares=lan-allow@file"
-      - "traefik.http.services.uptime-kuma.loadbalancer.server.port=3001"
-
-  # ─── Immich ──────────────────────────────────────────────────────────────────
-  immich-server:
-    image: ghcr.io/immich-app/immich-server:release
-    container_name: immich-server
-    restart: unless-stopped
-    environment:
-      - DB_HOSTNAME=immich-postgres
-      - DB_USERNAME=${IMMICH_DB_USERNAME:-postgres}
-      - DB_PASSWORD=${IMMICH_DB_PASSWORD:-postgres}
-      - DB_DATABASE_NAME=${IMMICH_DB_NAME:-immich}
-      - REDIS_HOSTNAME=immich-redis
-      - UPLOAD_LOCATION=/usr/src/app/upload
-    volumes:
-      - immich-upload:/usr/src/app/upload
-    depends_on:
-      - immich-redis
-      - immich-postgres
-    networks:
-      - proxy
-      - immich-internal
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.immich.rule=Host(`photos.az-lab.dev`)"
-      - "traefik.http.routers.immich.entrypoints=websecure"
-      - "traefik.http.routers.immich.tls=true"
-      - "traefik.http.routers.immich.middlewares=lan-allow@file"
-      - "traefik.http.services.immich.loadbalancer.server.port=2283"
-      - "traefik.docker.network=proxy"
-
-  immich-machine-learning:
-    image: ghcr.io/immich-app/immich-machine-learning:release
-    container_name: immich-machine-learning
-    restart: unless-stopped
-    volumes:
-      - immich-model-cache:/cache
-    networks:
-      - immich-internal
-
-  immich-redis:
-    image: redis:6.2-alpine
-    container_name: immich-redis
-    restart: unless-stopped
-    networks:
-      - immich-internal
-
-  immich-postgres:
-    image: tensorchord/pgvecto-rs:pg14-v0.2.0
-    container_name: immich-postgres
-    restart: unless-stopped
-    environment:
-      - POSTGRES_USER=${IMMICH_DB_USERNAME:-postgres}
-      - POSTGRES_PASSWORD=${IMMICH_DB_PASSWORD:-postgres}
-      - POSTGRES_DB=${IMMICH_DB_NAME:-immich}
-    volumes:
-      - immich-postgres:/var/lib/postgresql/data
-    networks:
-      - immich-internal
-
-volumes:
-  uptime-kuma-data:
-  immich-upload:
-  immich-model-cache:
-  immich-postgres:
+  # NOTE 2026-04-30: uptime-kuma and immich (4 containers) extracted to
+  # their own compose stacks at services/uptime-kuma/ and services/immich/
+  # so dashboard rebuilds no longer take them down. Volumes are reused
+  # in-place via `external: true` references in the new compose files.
 
 networks:
   proxy:
     external: true
-  immich-internal:
-    internal: true
