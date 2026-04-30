@@ -438,16 +438,39 @@ def requeue_recurring(task: dict) -> bool:
         return False
 
 
-def mark_completed(task_id, result, goal_id=None):
+def mark_completed(task_id, result, goal_id=None, recurring=False):
     # Truncate result — long results cause context bloat on next reads
     stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
     if result and len(result) > _RESULT_MAX_CHARS:
         stored_result += f"\n... [truncated from {len(result)} chars]"
-    api_request(
-        "PATCH",
-        f"task_queue?id=eq.{task_id}",
-        data={"status": "completed", "result": stored_result},
-    )
+    if recurring:
+        # Recurring task — atomically write result into runs[<last>] via RPC
+        # so concurrent fires from cowork can't clobber history.
+        try:
+            api_request(
+                "POST",
+                "rpc/record_recurring_run_result",
+                data={
+                    "p_task_id": task_id,
+                    "p_result":  stored_result,
+                    "p_status":  "completed",
+                },
+            )
+        except Exception as e:
+            # If the RPC isn't deployed yet (migration 031 not applied), fall
+            # back to the legacy PATCH so completion still records.
+            print(f"record_recurring_run_result RPC unavailable ({e}) — using legacy PATCH path", file=sys.stderr)
+            api_request(
+                "PATCH",
+                f"task_queue?id=eq.{task_id}",
+                data={"status": "completed", "result": stored_result},
+            )
+    else:
+        api_request(
+            "PATCH",
+            f"task_queue?id=eq.{task_id}",
+            data={"status": "completed", "result": stored_result},
+        )
     summary = result.splitlines()[0][:200] if result else "done"
     log_activity("result", f"Completed: {summary}", task_id=task_id)
     if goal_id:
@@ -1367,8 +1390,12 @@ def main():
             discord_notify(f"🔍 Pending eval: {title} — {summary}")
             print(f"Task {task_id} pending evaluation by Iris.")
         else:
-            mark_completed(task_id, result, goal_id=goal_id)
-            requeue_recurring(task)
+            is_recurring = bool(task.get("recurring"))
+            mark_completed(task_id, result, goal_id=goal_id, recurring=is_recurring)
+            # Skip the legacy requeue_recurring path for canonical recurring rows —
+            # the upstream UPSERT (cowork CCR) will reset status=ready on next fire.
+            if not is_recurring:
+                requeue_recurring(task)
             discord_notify(f"✅ Done: {title} — {summary}")
             print(f"Task {task_id} completed.")
     except Exception as e:
