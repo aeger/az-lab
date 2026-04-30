@@ -1,0 +1,18 @@
+http:
+  routers:
+    grocy:
+      rule: "Host(`grocy.az-lab.dev`)"
+      entryPoints:
+        - websecure
+      service: grocy
+      tls:
+        certResolver: le
+      middlewares:
+        - lan-allow@file
+
+  services:
+    grocy:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.140:80"
+        passHostHeader: true

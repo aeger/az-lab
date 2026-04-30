@@ -142,7 +142,7 @@ def main():
 
     bot_token = discord_env.get("DISCORD_BOT_TOKEN", "")
     supabase_url = supabase_env.get("SUPABASE_URL", "")
-    service_key = supabase_env.get("SUPABASE_SERVICE_KEY", "")
+    service_key = supabase_env.get("SUPABASE_SECRET_KEY", "")
 
     if not bot_token or not supabase_url or not service_key:
         log.error("Missing required credentials — exiting")

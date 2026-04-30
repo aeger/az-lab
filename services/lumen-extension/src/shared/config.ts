@@ -9,7 +9,7 @@ export const DEFAULT_CONFIG = {
   memoryMcpUrl: 'https://memory-mcp.az-lab.dev/mcp',
   memoryHealthUrl: 'https://memory-mcp.az-lab.dev/health',
   supabaseUrl: 'https://ogqjjlbupqnvlcyrfnxi.supabase.co',
-  supabaseAnonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ncWpqbGJ1cHFudmxjeXJmbnhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQwNDU1NzYsImV4cCI6MjA4OTYyMTU3Nn0.VVvHOmcR04gnVHa6k8_lHhdCt6zNhpHYbj4c68LkScc',
+  supabaseAnonKey: 'sb_publishable_pzwSOgQhptxFg6AuBXvBqw_aGxCBeT3',
   agentBusUrl: 'http://192.168.1.181:8765',
   sentinelApiUrl: 'https://sentinel-api.az-lab.dev',
   sentinelApiKey: 'sentinel-c81bbb17bb17df0f46787983da69bcb40c7779a9e1292376',

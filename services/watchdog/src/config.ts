@@ -82,10 +82,10 @@ export async function loadConfig(): Promise<WatchdogConfig> {
     'SUPABASE_URL',
     'https://ogqjjlbupqnvlcyrfnxi.supabase.co'
   );
-  const supabaseServiceKey = get(
-    'SUPABASE_SERVICE_KEY',
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ncWpqbGJ1cHFudmxjeXJmbnhpIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDA0NTU3NiwiZXhwIjoyMDg5NjIxNTc2fQ.nxAesbiMgcogKp4rOS0VodJLI127mmMbSFMHcvRKNa0'
-  );
+  const supabaseServiceKey = get('SUPABASE_SECRET_KEY', '');
+  if (!supabaseServiceKey) {
+    throw new Error('SUPABASE_SECRET_KEY is required');
+  }
   const tmuxSession = get('TMUX_SESSION', 'claude-discord');
   const pollIntervalSec = parseInt(get('POLL_INTERVAL_SEC', '60'), 10);
 

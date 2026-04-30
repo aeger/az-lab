@@ -23,14 +23,14 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://ogqjjlbupqnvlcyrfnxi.supa
 SUPABASE_KEY_FILE = os.path.expanduser("~/azlab/services/memory-mcp-server/.env")
 
 def load_service_key():
-    """Load SUPABASE_SERVICE_KEY from .env file."""
+    """Load SUPABASE_SECRET_KEY from .env file."""
     if os.path.exists(SUPABASE_KEY_FILE):
         with open(SUPABASE_KEY_FILE) as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("SUPABASE_SERVICE_KEY="):
+                if line.startswith("SUPABASE_SECRET_KEY="):
                     return line.split("=", 1)[1].strip()
-    return os.environ.get("SUPABASE_SERVICE_KEY", "")
+    return os.environ.get("SUPABASE_SECRET_KEY", "")
 
 def call_rpc(service_key: str, function_name: str, params: dict) -> dict:
     """Call a Supabase RPC function."""
@@ -59,7 +59,7 @@ def main():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     service_key = load_service_key()
     if not service_key:
-        print(f"[{ts}] ERROR: SUPABASE_SERVICE_KEY not found in {SUPABASE_KEY_FILE}", flush=True)
+        print(f"[{ts}] ERROR: SUPABASE_SECRET_KEY not found in {SUPABASE_KEY_FILE}", flush=True)
         sys.exit(1)
 
     # Call the prune_decayed_memories() SECURITY DEFINER function

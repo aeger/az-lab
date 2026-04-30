@@ -1,0 +1,24 @@
+http:
+  routers:
+    homebridge:
+      rule: "Host(`homebridge.az-lab.dev`)"
+      entryPoints:
+        - websecure
+      service: homebridge
+      tls:
+        certResolver: le
+      middlewares:
+        - lan-allow@file
+        - homebridge-csp@file
+
+  middlewares:
+    homebridge-csp:
+      headers:
+        customResponseHeaders:
+          Content-Security-Policy: "default-src 'self';script-src 'self' 'unsafe-inline' 'unsafe-eval';style-src 'self' 'unsafe-inline';img-src 'self' data: https://raw.githubusercontent.com https://user-images.githubusercontent.com;connect-src 'self' https://openweathermap.org https://api.openweathermap.org wss://homebridge.az-lab.dev ws://homebridge.az-lab.dev;frame-src 'self' data: https://developers.homebridge.io;worker-src 'self' blob:;font-src 'self' data:"
+
+  services:
+    homebridge:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.159:8581"

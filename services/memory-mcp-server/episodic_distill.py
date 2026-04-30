@@ -14,10 +14,19 @@ operational knowledge).
 Based on ElephantBroker 3-session promotion threshold and CraniMem
 scheduled consolidation replay pattern.
 
-LLM priority: NemoClaw (Nemotron 120B, on-prem) > claude-haiku-4-5 (Anthropic API) > heuristic
+LLM priority: NemoClaw (on-prem) > claude-haiku-4-5 (Anthropic API) > heuristic
 - NemoClaw: preferred when NVIDIA_API_KEY set (on-prem, no token cost)
 - Haiku: fallback when ANTHROPIC_API_KEY set (low-cost cloud, ~$0.25/MTok input)
 - Heuristic: always available, no LLM needed
+
+NemoClaw model selection:
+- TRIAGE_MODEL (default google/gemma-4-31b-it): triage/summarization callsites.
+  Per benchmarks/triage_bench_2026-04-30, Gemma-4 31B IT is 1.3-2.2x faster
+  wall-clock than Nemotron 120B on these workloads with no quality regression
+  at adequate token budgets, and avoids Nemotron's "thinking preamble" leak
+  at low max_tokens.
+- NEMOCLAW_MODEL (default Nemotron 120B): reserved for future hard-reasoning
+  callsites (multi-step planning, code generation, complex inference).
 
 Systemd timer: episodic-distill.timer (nightly at 03:00 UTC)
 """
@@ -32,11 +41,15 @@ from datetime import datetime, timezone, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SUPABASE_URL  = os.environ.get("SUPABASE_URL", "https://ogqjjlbupqnvlcyrfnxi.supabase.co")
-SUPABASE_KEY  = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_KEY  = os.environ.get("SUPABASE_SECRET_KEY", "")
 MEMORY_MCP_URL = os.environ.get("MEMORY_MCP_URL", "http://localhost:3100")
 NEMOCLAW_URL  = os.environ.get("NEMOCLAW_URL", "http://192.168.1.183:8000")
 NEMOCLAW_KEY  = os.environ.get("NVIDIA_API_KEY", "")
 NEMOCLAW_MODEL = os.environ.get("NEMOCLAW_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+TRIAGE_MODEL  = os.environ.get("TRIAGE_MODEL", "google/gemma-4-31b-it")
+# Floor max_tokens at 128 for any Nemotron callsite — lower budgets crowd out
+# Nemotron's chain-of-thought preamble and produce truncated/garbage output.
+NEMOTRON_MIN_MAX_TOKENS = 128
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 HAIKU_MODEL   = os.environ.get("HAIKU_MODEL", "claude-haiku-4-5")
 
@@ -47,6 +60,7 @@ MAX_CLUSTERS = int(os.environ.get("MAX_CLUSTERS", "20"))
 CONSOLIDATED_TAG = "consolidated"
 PROJECT_AGE_MIN_DAYS = int(os.environ.get("PROJECT_AGE_MIN_DAYS", "7"))
 PROJECT_AGE_MAX_DAYS = int(os.environ.get("PROJECT_AGE_MAX_DAYS", "14"))
+WEEKLY_LOOKBACK_DAYS = int(os.environ.get("WEEKLY_LOOKBACK_DAYS", "30"))
 DISCORD_CHANNEL = "1012721652049657896"
 AGENT_BUS_URL = "http://localhost:8765"
 
@@ -134,7 +148,7 @@ def cluster_memories(memories: list) -> list[list]:
 
 # ── LLM summarization ─────────────────────────────────────────────────────────
 def summarize_cluster_llm(memories: list) -> str | None:
-    """Try to summarize a cluster of episodic memories via NemoClaw."""
+    """Summarize a cluster of episodic memories via NemoClaw using TRIAGE_MODEL (gemma-4-31b-it)."""
     if not NEMOCLAW_KEY:
         return None
 
@@ -159,9 +173,9 @@ def summarize_cluster_llm(memories: list) -> str | None:
                 "Content-Type": "application/json",
             },
             json={
-                "model": NEMOCLAW_MODEL,
+                "model": TRIAGE_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 256,
+                "max_tokens": max(256, NEMOTRON_MIN_MAX_TOKENS),
                 "temperature": 0.3,
             },
             timeout=45,
@@ -338,7 +352,7 @@ def fetch_stale_project_memories() -> list:
 
 
 def summarize_project_cluster(memories: list) -> str | None:
-    """Distill a cluster of related project memories into a permanent reference fact."""
+    """Distill a cluster of related project memories into a permanent reference fact via TRIAGE_MODEL."""
     if not NEMOCLAW_KEY:
         return None
 
@@ -364,9 +378,9 @@ def summarize_project_cluster(memories: list) -> str | None:
                 "Content-Type": "application/json",
             },
             json={
-                "model": NEMOCLAW_MODEL,
+                "model": TRIAGE_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 300,
+                "max_tokens": max(300, NEMOTRON_MIN_MAX_TOKENS),
                 "temperature": 0.3,
             },
             timeout=45,
@@ -486,7 +500,7 @@ def main():
 
     # Re-read env after loading .env
     global SUPABASE_KEY, NEMOCLAW_KEY, ANTHROPIC_API_KEY
-    SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", SUPABASE_KEY)
+    SUPABASE_KEY = os.environ.get("SUPABASE_SECRET_KEY", SUPABASE_KEY)
     NEMOCLAW_KEY = os.environ.get("NVIDIA_API_KEY", "")
     if not NEMOCLAW_KEY:
         try:
@@ -501,7 +515,24 @@ def main():
     start = datetime.now(timezone.utc)
 
     # 1. Fetch high-access memories eligible for consolidation
-    # Target project/feedback/reference — az-lab does not use 'episodic' type
+    # Phase 0: pure episodic type memories (any access count, older than 6h)
+    episodic_cutoff = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    try:
+        episodic_memories = supa_get("memories", {
+            "type": "eq.episodic",
+            "tags": f"not.cs.{{{CONSOLIDATED_TAG}}}",
+            "created_at": f"lt.{episodic_cutoff}",
+            "select": "id,name,description,content,tags,access_count,embedding",
+            "order": "created_at.asc",
+            "limit": "200",
+        })
+    except Exception as e:
+        log.warning(f"Failed to fetch episodic type memories: {e}")
+        episodic_memories = []
+
+    # Phase 1: high-access project/feedback/reference memories
+    # Target project/feedback/reference — these are used as the primary az-lab types.
+    # Episodic type memories are handled in Phase 0 above.
     try:
         memories = supa_get("memories", {
             "type": "in.(project,feedback,reference)",
@@ -515,18 +546,91 @@ def main():
         log.error(f"Failed to fetch memories for consolidation: {e}")
         sys.exit(1)
 
-    log.info(f"Found {len(memories)} eligible memories for consolidation (access_count>={MIN_ACCESS_COUNT})")
+    log.info(f"Found {len(episodic_memories)} pure episodic type memories, {len(memories)} high-access memories for consolidation (access_count>={MIN_ACCESS_COUNT})")
 
     use_nemoclaw = bool(NEMOCLAW_KEY)
     use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
     use_llm = use_nemoclaw or use_haiku
     if use_nemoclaw:
-        llm_status = "NemoClaw"
+        llm_status = f"NemoClaw[{TRIAGE_MODEL}]"
     elif use_haiku:
         llm_status = f"claude-haiku-4-5"
     else:
         llm_status = "heuristic"
     log.info(f"Summarization mode: {llm_status}")
+
+    # ── Phase 0: Consolidate pure episodic type memories → semantic ──────────
+    p0_created = 0
+    if episodic_memories:
+        log.info(f"=== Phase 0: Pure episodic type consolidation ({len(episodic_memories)} memories) ===")
+        for m in episodic_memories:
+            emb = m.get("embedding")
+            if isinstance(emb, str):
+                try:
+                    m["embedding"] = json.loads(emb)
+                except Exception:
+                    m["embedding"] = None
+
+        ep_clusters = cluster_memories(episodic_memories)
+        # If no clusters (no embeddings), treat all as one batch
+        if not ep_clusters and episodic_memories:
+            log.info(f"[Phase 0] No embedding-based clusters — batch consolidating {len(episodic_memories)} episodic memories")
+            # Process in batches of 10
+            for i in range(0, len(episodic_memories), 10):
+                batch = episodic_memories[i:i+10]
+                content = None
+                if use_nemoclaw:
+                    content = summarize_cluster_llm(batch)
+                if not content and use_haiku:
+                    content = summarize_cluster_haiku(batch)
+                if not content:
+                    content = summarize_cluster_heuristic(batch)
+                top_mem = max(batch, key=lambda m: m.get("access_count", 0))
+                sem_name = f"semantic:{top_mem['name']}"
+                sem_id = write_semantic_memory(sem_name,
+                    f"Distilled from {len(batch)} episodic memories ({llm_status})",
+                    content, ["distilled", "episodic-origin"])
+                if sem_id:
+                    if sem_id == "ok":
+                        result = supa_get("memories", {"name": f"eq.{sem_name}", "select": "id"})
+                        sem_id = result[0]["id"] if result else None
+                    if sem_id:
+                        for ep in batch:
+                            create_link(sem_id, ep["id"], "distilled_from", "semantic")
+                        for ep in batch:
+                            mark_consolidated(ep["id"], ep.get("tags") or [])
+                        p0_created += 1
+                        log.info(f"[Phase 0] Created '{sem_name}' from {len(batch)} episodic memories")
+        else:
+            log.info(f"[Phase 0] {len(ep_clusters)} clusters found")
+            for cluster_idxs in ep_clusters[:MAX_CLUSTERS]:
+                cluster_mems = [episodic_memories[i] for i in cluster_idxs]
+                content = None
+                if use_nemoclaw:
+                    content = summarize_cluster_llm(cluster_mems)
+                if not content and use_haiku:
+                    content = summarize_cluster_haiku(cluster_mems)
+                if not content:
+                    content = summarize_cluster_heuristic(cluster_mems)
+                top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
+                sem_name = f"semantic:{top_mem['name']}"
+                sem_id = write_semantic_memory(sem_name,
+                    f"Distilled from {len(cluster_mems)} episodic memories ({llm_status})",
+                    content, ["distilled", "episodic-origin"])
+                if sem_id:
+                    if sem_id == "ok":
+                        result = supa_get("memories", {"name": f"eq.{sem_name}", "select": "id"})
+                        sem_id = result[0]["id"] if result else None
+                    if sem_id:
+                        for ep in cluster_mems:
+                            create_link(sem_id, ep["id"], "distilled_from", "semantic")
+                        for ep in cluster_mems:
+                            mark_consolidated(ep["id"], ep.get("tags") or [])
+                        p0_created += 1
+                        log.info(f"[Phase 0] Created '{sem_name}' from {len(cluster_mems)} episodic memories")
+        log.info(f"=== Phase 0 complete: {p0_created} semantic memories created from episodic ===")
+    else:
+        log.info("[Phase 0] No pure episodic type memories to process.")
 
     if not memories:
         log.info("[Phase 1] Nothing to distill.")
@@ -608,18 +712,179 @@ def main():
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     log.info(f"=== Phase 2 complete: {p2_created}/{p2_processed} clusters → reference memories ({elapsed2:.1f}s) ===")
-    log.info(f"=== Total: {created_semantic + p2_created} new memories created in {elapsed:.1f}s ===")
+    log.info(f"=== Total: {p0_created + created_semantic + p2_created} new memories created in {elapsed:.1f}s ===")
 
-    total_created = created_semantic + p2_created
+    total_created = p0_created + created_semantic + p2_created
     if total_created > 0:
-        ep_note = f"{created_semantic} semantic from episodic" if created_semantic > 0 else ""
+        p0_note = f"{p0_created} semantic from episodic-type" if p0_created > 0 else ""
+        ep_note = f"{created_semantic} semantic from high-access" if created_semantic > 0 else ""
         pr_note = f"{p2_created} reference from project" if p2_created > 0 else ""
-        parts = [p for p in [ep_note, pr_note] if p]
+        parts = [p for p in [p0_note, ep_note, pr_note] if p]
         send_discord(
             f"🧠 Memory consolidation: {', '.join(parts)} "
             f"({llm_status}, {elapsed:.0f}s)"
         )
 
 
+# ── Phase 3: Weekly 30-day project consolidation → reference/consolidation ────
+def fetch_project_30day_memories() -> list:
+    """Fetch project memories from the last 30 days, not yet auto-consolidated."""
+    now = datetime.now(timezone.utc)
+    date_cutoff = (now - timedelta(days=WEEKLY_LOOKBACK_DAYS)).isoformat()
+    try:
+        mems = supa_get("memories", {
+            "type": "eq.project",
+            "tags": f"not.cs.{{auto-consolidated}}",
+            "updated_at": f"gte.{date_cutoff}",
+            "select": "id,name,description,content,tags,access_count,embedding,updated_at",
+            "order": "access_count.desc",
+            "limit": "200",
+        })
+        return mems
+    except Exception as e:
+        log.error(f"[Phase 3] Failed to fetch 30-day project memories: {e}")
+        return []
+
+
+def write_consolidation_memory(name: str, description: str, content: str, tags: list) -> str | None:
+    """Write a reference memory with source='consolidation' via Supabase."""
+    try:
+        r = httpx.post(
+            f"{MEMORY_MCP_URL}/tools/remember",
+            json={
+                "type": "reference",
+                "name": name,
+                "description": description,
+                "content": content,
+                "tags": tags,
+                "source": "consolidation",
+                "importance_score": 0.80,
+            },
+            timeout=30,
+        )
+        if r.status_code == 200:
+            return r.json().get("id") or "ok"
+    except Exception as e:
+        log.warning(f"[Phase 3] MCP write failed, falling back to Supabase: {e}")
+
+    try:
+        result = supa_post("memories", {
+            "type": "reference",
+            "name": name,
+            "description": description,
+            "content": content,
+            "tags": tags,
+            "source": "consolidation",
+            "importance_score": 0.80,
+        })
+        if isinstance(result, list) and result:
+            return result[0].get("id")
+    except Exception as e:
+        log.error(f"[Phase 3] Direct Supabase write failed: {e}")
+    return None
+
+
+def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, int]:
+    """Phase 3: weekly sweep of 30-day project memories → reference with source=consolidation."""
+    memories = fetch_project_30day_memories()
+    log.info(f"[Phase 3] Found {len(memories)} project memories in last {WEEKLY_LOOKBACK_DAYS} days")
+    if not memories:
+        return 0, 0
+
+    for m in memories:
+        emb = m.get("embedding")
+        if isinstance(emb, str):
+            try:
+                m["embedding"] = json.loads(emb)
+            except Exception:
+                m["embedding"] = None
+
+    clusters = cluster_memories(memories)
+    log.info(f"[Phase 3] {len(clusters)} semantic clusters found")
+
+    created = 0
+    processed = 0
+
+    for cluster_idxs in clusters[:MAX_CLUSTERS]:
+        cluster_mems = [memories[i] for i in cluster_idxs]
+        cluster_names = [m["name"] for m in cluster_mems]
+        log.info(f"[Phase 3] Consolidating {len(cluster_mems)}: {cluster_names[:3]}...")
+
+        content = summarize_project_cluster(cluster_mems) if use_nemoclaw else None
+        if not content and use_haiku:
+            content = summarize_project_cluster_haiku(cluster_mems)
+        if not content:
+            content = summarize_cluster_heuristic(cluster_mems)
+
+        top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
+        ref_name = f"weekly-ref:{top_mem['name']}"
+        description = f"Weekly consolidation of {len(cluster_mems)} project memories (30-day window)"
+        tags = ["auto-consolidated", "weekly-consolidated"] + [
+            t for m in cluster_mems for t in (m.get("tags") or [])
+            if t not in (CONSOLIDATED_TAG, "auto-consolidated", "weekly-consolidated")
+        ][:8]
+
+        ref_id = write_consolidation_memory(ref_name, description, content, tags)
+        if not ref_id:
+            log.error(f"[Phase 3] Failed to create reference for {cluster_names}")
+            continue
+
+        if ref_id == "ok":
+            result = supa_get("memories", {"name": f"eq.{ref_name}", "select": "id"})
+            ref_id = result[0]["id"] if result else None
+
+        if ref_id:
+            for m in cluster_mems:
+                create_link(ref_id, m["id"], "weekly_consolidated_from", "semantic")
+            for m in cluster_mems:
+                mark_consolidated(m["id"], m.get("tags") or [])
+            created += 1
+            log.info(f"[Phase 3]   ✓ Created reference memory '{ref_name}'")
+        else:
+            log.warning(f"[Phase 3]   ✗ Could not retrieve ID for '{ref_name}'")
+        processed += 1
+
+    return created, processed
+
+
+def main_weekly():
+    """Entry point for --weekly mode: Phase 3 only."""
+    load_env()
+
+    global SUPABASE_KEY, NEMOCLAW_KEY, ANTHROPIC_API_KEY
+    SUPABASE_KEY = os.environ.get("SUPABASE_SECRET_KEY", SUPABASE_KEY)
+    NEMOCLAW_KEY = os.environ.get("NVIDIA_API_KEY", "")
+    if not NEMOCLAW_KEY:
+        try:
+            key_path = os.path.expanduser("~/.nvidia_api_key")
+            if os.path.exists(key_path):
+                NEMOCLAW_KEY = open(key_path).read().strip()
+        except Exception:
+            pass
+    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
+
+    log.info("=== Weekly 30-day project consolidation started ===")
+    start = datetime.now(timezone.utc)
+
+    use_nemoclaw = bool(NEMOCLAW_KEY)
+    use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
+    llm_status = f"NemoClaw[{TRIAGE_MODEL}]" if use_nemoclaw else ("claude-haiku-4-5" if use_haiku else "heuristic")
+    log.info(f"Summarization mode: {llm_status}")
+
+    created, processed = run_weekly_consolidation(use_nemoclaw, use_haiku)
+    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+
+    log.info(f"=== Weekly Phase 3 complete: {created}/{processed} clusters → reference memories ({elapsed:.1f}s) ===")
+
+    if created > 0:
+        send_discord(
+            f"🧠 Weekly memory consolidation: {created} reference memories from {processed} project clusters "
+            f"(30-day window, {llm_status}, {elapsed:.0f}s)"
+        )
+
+
 if __name__ == "__main__":
-    main()
+    if "--weekly" in sys.argv:
+        main_weekly()
+    else:
+        main()

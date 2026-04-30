@@ -1,0 +1,49 @@
+name: az-lab-ms-smtp-relay
+
+services:
+  ms-smtp-relay:
+    image: az-ms-smtp-relay:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: az-ms-smtp-relay
+    restart: unless-stopped
+    ports:
+      - "587:2587"        # SMTP relay — direct LAN access (raw TCP, no Traefik)
+    environment:
+      # Azure App Registration (Microsoft Graph OAuth2)
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID:-consumers}
+      # SMTP relay auth (Gmail send-as uses these)
+      - RELAY_USERNAME=${RELAY_USERNAME:-relay}
+      - RELAY_PASSWORD=${RELAY_PASSWORD}
+      # Microsoft account
+      - MSN_EMAIL=${MSN_EMAIL:-almty1@msn.com}
+      # Gmail API (for inbox sync — MSN → Gmail import)
+      - GMAIL_CLIENT_ID=${GMAIL_CLIENT_ID:-}
+      - GMAIL_CLIENT_SECRET=${GMAIL_CLIENT_SECRET:-}
+      - GMAIL_REFRESH_TOKEN=${GMAIL_REFRESH_TOKEN:-}
+      # Tuning
+      - SYNC_INTERVAL_MS=${SYNC_INTERVAL_MS:-300000}
+      - MS_REFRESH_TOKEN=
+      - SMTP_PORT=2587
+      - HEALTH_PORT=3001
+      - TOKEN_CACHE_PATH=/app/data/token-cache.json
+      - SYNC_STATE_PATH=/app/data/sync-state.json
+    volumes:
+      - ./data:/app/data    # Persistent: token cache + sync state
+    networks:
+      - proxy
+    labels:
+      # Traefik only handles the health check HTTP endpoint
+      - "traefik.enable=true"
+      - "traefik.http.routers.ms-smtp-relay.rule=Host(`smtp-relay.az-lab.dev`)"
+      - "traefik.http.routers.ms-smtp-relay.entrypoints=websecure"
+      - "traefik.http.routers.ms-smtp-relay.tls=true"
+      - "traefik.http.routers.ms-smtp-relay.middlewares=lan-allow@file"
+      - "traefik.http.services.ms-smtp-relay.loadbalancer.server.port=3001"
+
+networks:
+  proxy:
+    external: true

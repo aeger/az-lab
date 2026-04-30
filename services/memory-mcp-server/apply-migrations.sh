@@ -10,7 +10,7 @@ set -euo pipefail
 
 SUPABASE_REF="ogqjjlbupqnvlcyrfnxi"
 SUPABASE_URL="https://ogqjjlbupqnvlcyrfnxi.supabase.co"
-SUPABASE_KEY="${SUPABASE_SERVICE_KEY:-$(grep SUPABASE_SERVICE_KEY .env | cut -d= -f2)}"
+SUPABASE_KEY="${SUPABASE_SECRET_KEY:-$(grep SUPABASE_SECRET_KEY .env | cut -d= -f2)}"
 
 DB_HOST="${DB_HOST:-db.${SUPABASE_REF}.supabase.co}"
 DB_PORT="${DB_PORT:-5432}"

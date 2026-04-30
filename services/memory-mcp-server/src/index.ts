@@ -11,8 +11,8 @@ import { z } from "zod";
 // ── Config ──────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || "3100", 10);
 const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY!;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || SUPABASE_KEY;
+const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY!;
+const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY || SUPABASE_KEY;
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://ollama:11434";
 const EMBED_MODEL = process.env.EMBED_MODEL || "nomic-embed-text";
 
@@ -50,7 +50,7 @@ function verifyAipJwt(token: string): { sub: string } | null {
 }
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY");
+  console.error("Missing SUPABASE_URL or SUPABASE_SECRET_KEY");
   process.exit(1);
 }
 
@@ -111,7 +111,7 @@ async function detectConflicts(
   embedding: number[] | null
 ): Promise<string | null> {
   // Find candidates: same type, overlapping tags, high similarity
-  let candidates: Array<{ id: string; name: string; content: string }> = [];
+  let candidates: Array<{ id: string; name: string; content: string; similarity: number }> = [];
 
   if (embedding) {
     const { data } = await supabase.rpc("match_memories", {
@@ -122,32 +122,46 @@ async function detectConflicts(
     if (data) {
       candidates = (data as any[])
         .filter((m) => m.id !== newMemoryId && m.type === type)
-        .map((m) => ({ id: m.id, name: m.name, content: m.content }));
+        .map((m) => ({ id: m.id, name: m.name, content: m.content, similarity: m.similarity ?? 0 }));
     }
   }
 
   const conflictNames: string[] = [];
   for (const candidate of candidates) {
+    const sim = candidate.similarity;
     if (mightContradict(newContent, candidate.content)) {
-      // Record contradiction conflict
+      // Contradiction: negation words detected in semantically related memories
       await supabase.from("memory_conflicts").upsert({
         memory_a_id: newMemoryId,
         memory_b_id: candidate.id,
         conflict_type: "contradiction",
         description: `New memory may contradict "${candidate.name}"`,
         resolved: false,
+        detected_by: "negation_heuristic",
       }, { onConflict: "memory_a_id,memory_b_id" });
-      // Also record stale conflict against the older memory (new supersedes old)
       await supabase.from("memory_conflicts").upsert({
         memory_a_id: candidate.id,
         memory_b_id: newMemoryId,
         conflict_type: "stale",
         description: `May be superseded by newer memory "${newContent.slice(0, 80)}..."`,
         resolved: false,
+        detected_by: "negation_heuristic",
       }, { onConflict: "memory_a_id,memory_b_id" });
-      // Flag both memories
       await supabase.from("memories").update({ conflict_flagged: true }).in("id", [newMemoryId, candidate.id]);
       conflictNames.push(candidate.name);
+    } else if (sim >= 0.85 && textSimilarity(newContent, candidate.content) < 0.65) {
+      // Near-duplicate (Mem0g-style): high embedding similarity but divergent text content.
+      // Catches cases like same service at different port — same topic, different facts.
+      await supabase.from("memory_conflicts").upsert({
+        memory_a_id: newMemoryId,
+        memory_b_id: candidate.id,
+        conflict_type: "near_duplicate",
+        description: `High semantic similarity (${(sim * 100).toFixed(0)}%) but divergent content — possible stale data in "${candidate.name}"`,
+        resolved: false,
+        detected_by: "sim_threshold_0.85",
+      }, { onConflict: "memory_a_id,memory_b_id" });
+      await supabase.from("memories").update({ conflict_flagged: true }).in("id", [newMemoryId, candidate.id]);
+      conflictNames.push(`${candidate.name} (near-dup)`);
     }
   }
 
@@ -523,6 +537,23 @@ async function applyStartupMigrations(): Promise<void> {
     console.warn("Migration 005 skipped:", err.message);
   }
 
+  // Migration 006: episodic + semantic types in memories.type check constraint
+  try {
+    const { data, error } = await supabase.rpc("apply_episodic_semantic_types_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 006 RPC not yet registered — apply migrations/006_episodic_semantic_types.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 006 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 006 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 006 skipped:", err.message);
+  }
+
   // Migration 007: BM25 search_vector GENERATED ALWAYS + updated hybrid_recall
   try {
     const { data, error } = await supabase.rpc("apply_bm25_migration_if_missing");
@@ -685,13 +716,197 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 018 skipped:", err.message);
   }
+
+  // Migration 020: Fix oid-ambiguous sentinel + add concurrent_write conflict type
+  // Also extends memory_conflicts constraint to allow 'concurrent_write' type.
+  // Apply migrations/020_fixes_and_concurrent_write.sql via Supabase SQL editor if needed.
+  try {
+    const { data, error } = await supabase.rpc("apply_migration_020_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 020 RPC not yet registered — apply migrations/020_fixes_and_concurrent_write.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 020 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 020 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 020 skipped:", err.message);
+  }
+
+  // Migration 021: Skills decay scoring — last_used, success_rate, updated match_skills RPC
+  // Apply migrations/021_skills_decay_scoring.sql via Supabase SQL editor if needed.
+  try {
+    const { data, error } = await supabase.rpc("apply_skills_decay_scoring_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 021 RPC not yet registered — apply migrations/021_skills_decay_scoring.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 021 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 021 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 021 skipped:", err.message);
+  }
+
+  // Migration 022: Skill-memory auto-linking — skill_memory_links table + link_memories_to_skills()
+  // Apply migrations/022_skill_memory_links.sql via Supabase SQL editor if needed.
+  try {
+    const { data, error } = await supabase.rpc("apply_skill_memory_links_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 022 RPC not yet registered — apply migrations/022_skill_memory_links.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 022 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 022 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 022 skipped:", err.message);
+  }
+
+  // Migration 023: recall_count + last_accessed columns — reinforce-on-access scoring
+  // Adds dedicated recall_count (incremented per hybrid_recall call) and last_accessed columns.
+  // hybrid_recall updated to +0.10 * log1p(recall_count) in A-MAC composite.
+  // Apply migrations/023_recall_count.sql via Supabase SQL editor if needed.
+  try {
+    const { data, error } = await supabase.rpc("apply_recall_count_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 023 RPC not yet registered — apply migrations/023_recall_count.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 023 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 023 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 023 skipped:", err.message);
+  }
+
+  // Migration 029: agent_episodes table + expanded memory_conflicts conflict_type
+  try {
+    const { data, error } = await supabase.rpc("apply_agent_episodes_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 029 RPC not yet registered — apply migrations/029_agent_episodes.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 029 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 029 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 029 skipped:", err.message);
+  }
+
+  // Migration 025: discard_redundant_memories() — AgeMem selective discard
+  // Finds near-duplicate pairs (cosine similarity > threshold) and deletes the lower-quality one.
+  // Quality = importance_score*0.5 + recall_factor*0.3 + access_factor*0.2
+  try {
+    const { data, error } = await supabase.rpc("apply_discard_redundant_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 025 RPC not yet registered — apply migrations/025_discard_redundant.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 025 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 025 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 025 skipped:", err.message);
+  }
+
+  // Migration 026: confidence column + hybrid_recall updated with p_min_confidence filter
+  // Adds confidence FLOAT DEFAULT 0.8 to memories; agents tag speculative/uncertain memories low.
+  // hybrid_recall now returns confidence and accepts p_min_confidence (default 0.0 = no filter).
+  try {
+    const { data, error } = await supabase.rpc("apply_confidence_column_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 026 RPC not yet registered — apply migrations/026_confidence_column.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 026 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 026 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 026 skipped:", err.message);
+  }
+
+  // Migration 027: staleness_candidate column + flag_stale_memories() + hybrid_recall returns staleness_candidate
+  // Detects hot-to-cold staleness: memories with high historical access that went quiet for 21+ days.
+  // hybrid_recall now returns staleness_candidate so agents can trigger re-verification.
+  try {
+    const { data, error } = await supabase.rpc("apply_staleness_candidate_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 027 RPC not yet registered — apply migrations/027_staleness_candidate.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 027 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 027 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 027 skipped:", err.message);
+  }
+
+  // Migration 028: memory_class column (episodic/semantic/procedural/working)
+  // Adds structured memory class alongside the type field. Backfills existing rows to 'semantic' or 'episodic'.
+  // hybrid_recall gains p_memory_class filter; remember/recall tools expose memory_class param.
+  try {
+    const { data, error } = await supabase.rpc("apply_memory_class_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 028 RPC not yet registered — apply migrations/028_memory_class.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 028 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 028 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 028 skipped:", err.message);
+  }
+}
+
+// ── Staleness maintenance job (runs once at startup, then every 24h) ─────────
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function startStalenessJob(supabase: any): void {
+  const run = async () => {
+    try {
+      const { data, error } = await supabase.rpc("flag_stale_memories");
+      if (error) console.warn("[staleness] flag_stale_memories error:", error.message);
+      else if ((data as number) > 0) console.log(`[staleness] Flagged ${data} stale memories`);
+    } catch (err: any) {
+      console.warn("[staleness] job error:", err.message);
+    }
+  };
+  run();
+  setInterval(run, 24 * 60 * 60 * 1000);
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "4.9.0",
+    version: "5.6.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -711,8 +926,10 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       agent_id: z.string().optional().describe("Agent that owns this memory: wren, iris, atlas, forge, volt. Used with visibility=private for agent-scoped memories."),
       visibility: z.enum(["shared", "private"]).optional().describe("shared (default): visible to all agents. private: visible only to agent_id owner."),
       agent_scope: z.array(z.string()).optional().describe("Which agents can see this memory. Default ['shared'] = all agents. E.g. ['wren','iris'] = only Wren and Iris. Requires migration 012."),
+      confidence: z.number().min(0).max(1).optional().describe("Confidence 0-1 (default 0.8). Use < 0.5 for speculative or unverified facts. Memories below min_confidence threshold are excluded from recall when filtered."),
+      memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Memory class: semantic (durable facts/prefs, default), episodic (event log), procedural (how-to/skill), working (short-term context). Defaults to 'semantic' for all existing types."),
     },
-    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope }) => {
+    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence, memory_class }) => {
       // Security gate — scan all text fields before touching the DB
       const scanTargets: Array<[string, string]> = [
         ["name", name], ["description", description], ["content", content],
@@ -728,10 +945,10 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       const src = callerIdentity || source || "claude-code";
       const memTags = tags || [];
 
-      // Fetch existing same-name memory (with content for NOOP check)
+      // Fetch existing same-name memory (with content for NOOP check + concurrent write detection)
       const { data: existing } = await supabase
         .from("memories")
-        .select("id, content")
+        .select("id, content, agent_id, updated_at, version")
         .eq("name", name)
         .maybeSingle();
 
@@ -745,14 +962,48 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
           return { content: [{ type: "text" as const, text: `NOOP: Memory "${name}" content is unchanged (Jaccard ≥ 85%). No write needed.` }] };
         }
 
+        // ── Rec 3: Concurrent write detection (last-write-wins with conflict logging) ──
+        // If a different agent wrote this memory within the last 30 minutes, log the conflict.
+        // We still apply the write (last-write-wins) but record it for audit purposes.
+        if (agent_id && existing.agent_id && existing.agent_id !== agent_id && existing.updated_at) {
+          const minutesSinceLastWrite = (Date.now() - new Date(existing.updated_at).getTime()) / 60000;
+          if (minutesSinceLastWrite < 30) {
+            // Log to agent_activity as a status event (memory_log has action constraint)
+            await supabase.from("agent_activity").insert({
+              agent: agent_id,
+              activity_type: "status",
+              content: `[concurrent_write] "${name}" overwritten by ${agent_id} ${Math.round(minutesSinceLastWrite)}m after ${existing.agent_id} wrote it — last-write-wins applied`,
+              metadata: {
+                memory_name: name,
+                prior_agent: existing.agent_id,
+                overwriting_agent: agent_id,
+                minutes_since_prior_write: Math.round(minutesSinceLastWrite),
+                last_write_wins: true,
+              },
+            });
+            // Also flag the memory for review
+            await supabase.from("memories").update({ conflict_flagged: true }).eq("id", existing.id);
+            console.log(`[concurrent_write] "${name}": ${agent_id} overwrote ${existing.agent_id}'s write from ${Math.round(minutesSinceLastWrite)}m ago`);
+          }
+        }
+
         const update: Record<string, unknown> = { type, description, content, tags: memTags, source: src };
         if (embedding) update.embedding = JSON.stringify(embedding);
         if (importance_score !== undefined) update.importance_score = importance_score;
+        if (confidence !== undefined) update.confidence = confidence;
         if (agent_id) update.agent_id = agent_id;
         if (visibility) update.visibility = visibility;
         if (agent_scope) update.agent_scope = agent_scope;
-        const { error } = await supabase.from("memories").update(update).eq("id", existing.id);
+        if (memory_class) update.memory_class = memory_class;
+        update.version = (existing.version ?? 1) + 1;
+        const { data: updatedRows, error } = await supabase
+          .from("memories")
+          .update(update)
+          .eq("id", existing.id)
+          .eq("version", existing.version ?? 1)
+          .select("id");
         if (error) return { content: [{ type: "text" as const, text: `Error updating memory: ${error.message}` }] };
+        if (!updatedRows?.length) return { content: [{ type: "text" as const, text: `Conflict: "${name}" was modified by another agent. Re-read and retry.` }] };
 
         // Re-link on update
         let linkNote = "";
@@ -815,9 +1066,11 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
       if (embedding) insert.embedding = JSON.stringify(embedding);
       if (importance_score !== undefined) insert.importance_score = importance_score;
+      if (confidence !== undefined) insert.confidence = confidence;
       if (agent_id) insert.agent_id = agent_id;
       if (visibility) insert.visibility = visibility;
       if (agent_scope) insert.agent_scope = agent_scope;
+      if (memory_class) insert.memory_class = memory_class;
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
@@ -860,8 +1113,10 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       semantic: z.boolean().optional().describe("Force semantic search (default: true when Ollama available)"),
       agent_id: z.string().optional().describe("Filter by agent ownership: returns shared memories + private memories owned by this agent_id. Omit to return all shared memories."),
       agent_scope: z.string().optional().describe("Filter by agent_scope array: pass agent name (e.g. 'wren') to see only memories scoped to 'shared' or this agent. Requires migration 012."),
+      min_confidence: z.number().min(0).max(1).optional().describe("Exclude memories with confidence below this threshold (default 0.0 = return all). Use 0.5 to hide speculative/unverified memories."),
+      memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Filter by memory class. episodic=event log, semantic=durable facts (default for most), procedural=skills/how-to, working=short-term context."),
     },
-    async ({ query, type, tags, limit, semantic, agent_id, agent_scope }) => {
+    async ({ query, type, tags, limit, semantic, agent_id, agent_scope, min_confidence, memory_class }) => {
       const maxResults = limit || 10;
 
       // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled.
@@ -882,6 +1137,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         };
         if (agent_id) rpcParams.p_agent_id = agent_id;
         if (agent_scope) rpcParams.p_agent_scope = agent_scope;
+        if (min_confidence && min_confidence > 0) rpcParams.p_min_confidence = min_confidence;
+        if (memory_class) rpcParams.p_memory_class = memory_class;
         const { data, error } = await supabase.rpc("hybrid_recall", rpcParams);
 
         if (!error && data && data.length > 0) {
@@ -909,6 +1166,15 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
 
           if (filtered.length > 0) {
             await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
+
+            // Skill-memory auto-linking: fire-and-forget, threshold 0.75 cosine
+            // Upserts skill_memory_links rows for skills semantically close to recalled memories.
+            void Promise.resolve(supabase.rpc("link_memories_to_skills", {
+              p_memory_ids: filtered.map((m: any) => m.id),
+              p_similarity_threshold: 0.75,
+            })).then(({ data: linkCount }) => {
+              if ((linkCount as number) > 0) console.log(`[skill-link] ${linkCount} new skill-memory link(s) from recall`);
+            }).catch(() => {});
 
             // Fetch temporal/causal linked memories for all top results and apply score boost
             const filteredIds = new Set(filtered.map((m: any) => m.id));
@@ -986,9 +1252,11 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
               const scoreStr = m.hybrid_score ? ` (score ${(m.hybrid_score * 100).toFixed(0)}%)` : "";
               const importanceStr = m.importance_score !== undefined && m.importance_score !== 0.5 ? ` imp:${m.importance_score.toFixed(2)}` : "";
               const accessStr = m.access_count > 0 ? ` accessed:${m.access_count}x` : "";
+              const confidenceStr = m.confidence !== undefined && m.confidence < 0.8 ? ` conf:${m.confidence.toFixed(2)}` : "";
               const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
               const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
-              return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${trust}${conflictFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
+              const staleFlag = m.staleness_candidate ? " [stale?]" : "";
+              return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${confidenceStr}${trust}${conflictFlag}${staleFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
             });
 
             // Append temporal/causal boosted extras not already in results
@@ -1020,6 +1288,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (type) q = q.eq("type", type);
       if (tags && tags.length > 0) q = q.overlaps("tags", tags);
       if (query) q = q.or(`name.ilike.%${query}%,description.ilike.%${query}%,content.ilike.%${query}%`);
+      if (memory_class) q = q.eq("memory_class", memory_class);
       // Agent visibility filter: when agent_id set, return shared + own private; else return shared only (or all if visibility column not yet added)
       if (agent_id) q = q.or(`visibility.eq.shared,and(visibility.eq.private,agent_id.eq.${agent_id})`);
 
@@ -1437,6 +1706,107 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
     }
   );
 
+  // ── Tool: record_task_completion ─────────────────────────────────────────────
+  // Rec 2: Post-task skill auto-capture hook. Call at the end of any multi-step task.
+  // If tool_count >= 5, auto-generates a skill draft and saves it to the skills table.
+  server.tool(
+    "record_task_completion",
+    "Record a completed task for procedural memory capture. If tool_count >= 5, automatically extracts and saves a reusable skill to the skills table. Call this at the end of any complex multi-step task.",
+    {
+      task_summary: z.string().describe("Brief description of what was accomplished"),
+      tool_count: z.number().int().min(0).describe("Number of tool calls made during this task"),
+      steps: z.array(z.string()).optional().describe("Key steps taken (ordered) — used to generate skill content"),
+      agent_id: z.string().optional().describe("Agent completing the task (e.g. 'wren', 'iris')"),
+      skill_name: z.string().optional().describe("Override auto-generated skill name slug (kebab-case)"),
+      success: z.boolean().optional().describe("Whether the task succeeded (true) or failed (false). Updates success_rate on the named skill if provided."),
+    },
+    async ({ task_summary, tool_count, steps, agent_id, skill_name, success }) => {
+      const src = callerIdentity || agent_id || "claude-code";
+
+      // Log task completion to agent_activity regardless of tool_count
+      await supabase.from("agent_activity").insert({
+        agent: src,
+        activity_type: "status",
+        content: `[task_complete] ${task_summary} (${tool_count} tool calls)`,
+        metadata: { tool_count, skill_captured: tool_count >= 5, success },
+      });
+
+      // ── Update skill success_rate if skill_name + success provided ──────────
+      if (skill_name !== undefined && success !== undefined) {
+        const { data: existingSkill } = await supabase.from("skills").select("id, use_count, success_rate").eq("name", skill_name).maybeSingle();
+        if (existingSkill) {
+          const n = Math.max((existingSkill.use_count || 1), 1);
+          const oldRate = existingSkill.success_rate ?? 0.5;
+          // Bayesian incremental mean: new_rate = old_rate + (outcome - old_rate) / n
+          const newRate = Math.max(0, Math.min(1, oldRate + ((success ? 1.0 : 0.0) - oldRate) / n));
+          await supabase.from("skills").update({ success_rate: newRate }).eq("id", existingSkill.id);
+        }
+      }
+
+      if (tool_count < 5) {
+        return { content: [{ type: "text" as const, text: `Task logged (${tool_count} tool calls — below 5 threshold, no skill auto-captured).` }] };
+      }
+
+      // ── Auto-generate skill name from task summary ──────────────────────────
+      const stopwords = new Set(["the","and","for","with","from","this","that","into","via","using","when","then","also","after","before"]);
+      const autoWords = task_summary.toLowerCase().match(/\b[a-z]{3,}\b/g)?.filter((w) => !stopwords.has(w)).slice(0, 5) || [];
+      const autoName = skill_name || (autoWords.length >= 2 ? autoWords.join("-") : `auto-skill-${Date.now()}`);
+
+      // ── Build skill content from steps or summary ───────────────────────────
+      const stepsContent = steps?.length
+        ? `## Steps\n${steps.map((s, i) => `${i + 1}. ${s}`).join("\n")}`
+        : `## Task Summary\n${task_summary}`;
+
+      let skillContent = `${stepsContent}\n\n## Notes\n- Auto-captured from ${tool_count}-tool-call session by ${src} on ${new Date().toISOString().slice(0, 10)}`;
+
+      // ── LLM enhancement (optional — uses NemoClaw NIM API if configured) ───
+      if (LLM_URL && steps?.length) {
+        try {
+          const llmResp = await fetch(`${LLM_URL}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...(NVIDIA_API_KEY ? { Authorization: `Bearer ${NVIDIA_API_KEY}` } : {}) },
+            body: JSON.stringify({
+              model: LLM_MODEL,
+              messages: [{
+                role: "user",
+                content: `Convert this task completion record into a concise, reusable skill guide in markdown (max 400 words). Focus on steps that can be reused in future sessions.\n\nTask: ${task_summary}\nTool calls: ${tool_count}\nKey steps:\n${steps.join("\n")}`,
+              }],
+              max_tokens: 600,
+            }),
+            signal: AbortSignal.timeout(15000),
+          });
+          if (llmResp.ok) {
+            const llmJson = await llmResp.json() as any;
+            const llmContent = llmJson.choices?.[0]?.message?.content;
+            if (llmContent) skillContent = llmContent + `\n\n_Auto-captured from ${tool_count}-tool-call session by ${src}_`;
+          }
+        } catch { /* fall through to heuristic content */ }
+      }
+
+      // ── Check if skill already exists ───────────────────────────────────────
+      const { data: existingSkill } = await supabase.from("skills").select("id").eq("name", autoName).maybeSingle();
+      const skillEmbedding = await embed(embedInput(autoName, task_summary, skillContent));
+
+      if (existingSkill) {
+        const upd: Record<string, unknown> = { description: task_summary, content: skillContent, source: src };
+        if (skillEmbedding) upd.embedding = JSON.stringify(skillEmbedding);
+        const { error } = await supabase.from("skills").update(upd).eq("id", existingSkill.id);
+        if (error) return { content: [{ type: "text" as const, text: `Auto-capture failed (update): ${error.message}` }] };
+        return { content: [{ type: "text" as const, text: `Auto-updated skill "${autoName}" (${tool_count} tool calls, ${src}). Review with list_skills.` }] };
+      }
+
+      const ins: Record<string, unknown> = {
+        name: autoName, title: task_summary, description: task_summary,
+        content: skillContent, source: src, triggers: [], platforms: [],
+      };
+      if (skillEmbedding) ins.embedding = JSON.stringify(skillEmbedding);
+
+      const { error } = await supabase.from("skills").insert(ins);
+      if (error) return { content: [{ type: "text" as const, text: `Auto-capture failed (insert): ${error.message}` }] };
+      return { content: [{ type: "text" as const, text: `Auto-captured skill "${autoName}" from ${tool_count}-tool-call task. Review and refine with list_skills / save_skill.` }] };
+    }
+  );
+
   // ── Tool: recall_skill ───────────────────────────────────────────────────────
   server.tool(
     "recall_skill",
@@ -1452,7 +1822,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (name) {
         const { data, error } = await supabase.from("skills").select("*").eq("name", name).maybeSingle();
         if (error || !data) return { content: [{ type: "text" as const, text: `Skill "${name}" not found.` }] };
-        await supabase.from("skills").update({ use_count: (data.use_count || 0) + 1 }).eq("id", data.id);
+        await supabase.from("skills").update({ use_count: (data.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", data.id);
         return { content: [{ type: "text" as const, text: `# ${data.title}\n_${data.description}_\n\n${data.content}` }] };
       }
 
@@ -1461,7 +1831,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (queryEmbedding) {
           const { data, error } = await supabase.rpc("match_skills", { query_embedding: JSON.stringify(queryEmbedding), match_count: maxResults });
           if (!error && data?.length > 0) {
-            for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1 }).eq("id", s.id);
+            for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", s.id);
             const results = data.map((s: any) => `# ${s.title} (${(s.similarity * 100).toFixed(0)}% match)\n_${s.description}_\n\n${s.content}`);
             return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
           }
@@ -1470,7 +1840,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const { data, error } = await supabase.from("skills").select("*")
           .or(`name.ilike.%${query}%,title.ilike.%${query}%,description.ilike.%${query}%`).limit(maxResults);
         if (error || !data?.length) return { content: [{ type: "text" as const, text: "No matching skills found." }] };
-        const results = data.map((s) => `# ${s.title}\n_${s.description}_\n\n${s.content}`);
+        for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", s.id);
+        const results = data.map((s: any) => `# ${s.title}\n_${s.description}_\n\n${s.content}`);
         return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
       }
 
@@ -1577,7 +1948,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
     },
     async ({ primary_name, secondary_name, merged_content }) => {
       // Fetch both
-      const { data: primary } = await supabase.from("memories").select("id, type, description, content, tags, source").eq("name", primary_name).maybeSingle();
+      const { data: primary } = await supabase.from("memories").select("id, type, description, content, tags, source, version").eq("name", primary_name).maybeSingle();
       const { data: secondary } = await supabase.from("memories").select("id, tags, content").eq("name", secondary_name).maybeSingle();
 
       if (!primary) return { content: [{ type: "text" as const, text: `Primary memory "${primary_name}" not found.` }] };
@@ -1593,9 +1964,16 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const newEmbedding = await embed(embedInput(primary_name, primary.description, merged_content));
         if (newEmbedding) update.embedding = JSON.stringify(newEmbedding);
       }
+      update.version = (primary.version ?? 1) + 1;
 
-      const { error: updateError } = await supabase.from("memories").update(update).eq("id", primary.id);
+      const { data: mergeUpdated, error: updateError } = await supabase
+        .from("memories")
+        .update(update)
+        .eq("id", primary.id)
+        .eq("version", primary.version ?? 1)
+        .select("id");
       if (updateError) return { content: [{ type: "text" as const, text: `Error updating primary: ${updateError.message}` }] };
+      if (!mergeUpdated?.length) return { content: [{ type: "text" as const, text: `Conflict: "${primary_name}" was modified by another agent. Re-read and retry.` }] };
 
       // Merge via DB function (redirect links, delete secondary)
       const { error: mergeError } = await supabase.rpc("merge_memory_into", {
@@ -1609,6 +1987,35 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       console.log(`[aip] merge_memories "${secondary_name}"→"${primary_name}" by ${callerIdentity || "unverified"}`);
       return {
         content: [{ type: "text" as const, text: `Merged "${secondary_name}" into "${primary_name}".${contentNote}${tagNote} Secondary memory deleted, links redirected.` }],
+      };
+    }
+  );
+
+  // ── Tool: discard_redundant ──────────────────────────────────────────────────
+  server.tool(
+    "discard_redundant",
+    "Find near-duplicate memories (cosine similarity > threshold) and delete the lower-quality one from each pair. Quality = importance_score*0.5 + recall_factor*0.3 + access_factor*0.2. Use dry_run=true to preview without deleting. Implements AgeMem selective discard to prevent memory blindness.",
+    {
+      threshold: z.number().optional().describe("Cosine similarity threshold (default 0.92 — very high overlap). Lower = more aggressive pruning."),
+      max_discards: z.number().optional().describe("Max memories to discard in one call (default 10)"),
+      dry_run: z.boolean().optional().describe("Preview what would be discarded without deleting (default false)"),
+    },
+    async ({ threshold = 0.92, max_discards = 10, dry_run = false }) => {
+      const { data, error } = await supabase.rpc("discard_redundant_memories", {
+        p_similarity_threshold: threshold,
+        p_max_discards: max_discards,
+        p_dry_run: dry_run,
+      });
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      if (!data?.length) return { content: [{ type: "text" as const, text: `No redundant memories found at similarity threshold ${threshold}.` }] };
+
+      const action = dry_run ? "Would discard" : "Discarded";
+      const lines = (data as any[]).map((row) =>
+        `- **${row.discarded_name}** → kept **${row.kept_name}** (${(row.similarity * 100).toFixed(1)}% similar, score ${row.discarded_score.toFixed(3)} vs ${row.kept_score.toFixed(3)})`
+      );
+      console.log(`[aip] discard_redundant: ${data.length} pair(s) processed (dry_run=${dry_run}) by ${callerIdentity || "unverified"}`);
+      return {
+        content: [{ type: "text" as const, text: `${action} ${data.length} redundant memor${data.length === 1 ? "y" : "ies"} (threshold ${threshold}):\n\n${lines.join("\n")}` }],
       };
     }
   );
@@ -1798,6 +2205,98 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
     );
   }
 
+  // ── Tool: record_episode ───────────────────────────────────────────────────
+  server.tool(
+    "record_episode",
+    "Record or update an agent episode (task execution log). Captures input, actions, outcome, and learnings for episodic self-improvement (MemRL/CoALA pattern).",
+    {
+      agent: z.string().describe("Agent name: wren, iris, atlas, forge, volt"),
+      task_id: z.string().uuid().optional().describe("task_queue UUID this episode corresponds to"),
+      status: z.enum(["in_progress", "completed", "failed", "partial"]).optional().describe("Episode status (default: in_progress)"),
+      summary: z.string().optional().describe("1-2 sentence summary of what was done"),
+      input_summary: z.string().optional().describe("What task/request was given"),
+      actions: z.array(z.any()).optional().describe("Array of actions taken (tool calls, decisions)"),
+      outcome: z.string().optional().describe("What resulted — success, error message, partial"),
+      learnings: z.string().optional().describe("Key takeaways for future runs — what to do differently"),
+      memories_consulted: z.array(z.string().uuid()).optional().describe("UUIDs of memories recalled during this episode"),
+      episode_id: z.string().uuid().optional().describe("Existing episode ID to update (omit to create new)"),
+    },
+    async ({ agent, task_id, status, summary, input_summary, actions, outcome, learnings, memories_consulted, episode_id }) => {
+      if (episode_id) {
+        // Update existing episode
+        const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+        if (status) updates.status = status;
+        if (summary) updates.summary = summary;
+        if (input_summary) updates.input_summary = input_summary;
+        if (actions) updates.actions = actions;
+        if (outcome) updates.outcome = outcome;
+        if (learnings) updates.learnings = learnings;
+        if (memories_consulted) updates.memories_consulted = memories_consulted;
+        if (status && status !== "in_progress") updates.ended_at = new Date().toISOString();
+        const { error } = await supabase.from("agent_episodes").update(updates).eq("id", episode_id);
+        if (error) return { content: [{ type: "text" as const, text: `Failed to update episode: ${error.message}` }] };
+        return { content: [{ type: "text" as const, text: `Episode ${episode_id} updated (status: ${status || "unchanged"})` }] };
+      }
+      // Create new episode
+      const row: Record<string, unknown> = {
+        agent,
+        status: status || "in_progress",
+        started_at: new Date().toISOString(),
+      };
+      if (task_id) row.task_id = task_id;
+      if (summary) row.summary = summary;
+      if (input_summary) row.input_summary = input_summary;
+      if (actions) row.actions = actions;
+      if (outcome) row.outcome = outcome;
+      if (learnings) row.learnings = learnings;
+      if (memories_consulted) row.memories_consulted = memories_consulted;
+      if (status && status !== "in_progress") row.ended_at = new Date().toISOString();
+      const { data, error } = await supabase.from("agent_episodes").insert(row).select("id").single();
+      if (error) return { content: [{ type: "text" as const, text: `Failed to record episode: ${error.message}` }] };
+      return { content: [{ type: "text" as const, text: `Episode recorded: ${data.id} (agent: ${agent}, status: ${row.status})` }] };
+    }
+  );
+
+  // ── Tool: recall_episodes ──────────────────────────────────────────────────
+  server.tool(
+    "recall_episodes",
+    "Recall recent agent episodes to learn from past task outcomes. Surfaces prior runs matching agent or status filters.",
+    {
+      agent: z.string().optional().describe("Filter by agent name"),
+      status: z.enum(["in_progress", "completed", "failed", "partial"]).optional().describe("Filter by status"),
+      limit: z.number().optional().describe("Max episodes to return (default 5)"),
+      with_learnings_only: z.boolean().optional().describe("Only return episodes that have learnings captured"),
+    },
+    async ({ agent, status, limit, with_learnings_only }) => {
+      let q = supabase
+        .from("agent_episodes")
+        .select("id, agent, task_id, started_at, ended_at, status, summary, input_summary, outcome, learnings, memories_consulted")
+        .order("created_at", { ascending: false })
+        .limit(limit || 5);
+      if (agent) q = q.eq("agent", agent);
+      if (status) q = q.eq("status", status);
+      if (with_learnings_only) q = q.not("learnings", "is", null);
+      const { data, error } = await q;
+      if (error) return { content: [{ type: "text" as const, text: `Episode recall failed: ${error.message}` }] };
+      if (!data?.length) return { content: [{ type: "text" as const, text: "No episodes found matching criteria." }] };
+      const lines = data.map((ep) => {
+        const dur = ep.ended_at && ep.started_at
+          ? ` (${Math.round((new Date(ep.ended_at).getTime() - new Date(ep.started_at).getTime()) / 1000)}s)`
+          : "";
+        const taskRef = ep.task_id ? ` task:${ep.task_id.slice(0, 8)}` : "";
+        const memCount = ep.memories_consulted?.length ? ` mems:${ep.memories_consulted.length}` : "";
+        return [
+          `## ${ep.agent} — ${ep.status}${dur}${taskRef}${memCount}`,
+          ep.input_summary ? `**Input:** ${ep.input_summary}` : null,
+          ep.summary ? `**Summary:** ${ep.summary}` : null,
+          ep.outcome ? `**Outcome:** ${ep.outcome}` : null,
+          ep.learnings ? `**Learnings:** ${ep.learnings}` : null,
+        ].filter(Boolean).join("\n");
+      });
+      return { content: [{ type: "text" as const, text: `${data.length} episode(s):\n\n${lines.join("\n\n---\n\n")}` }] };
+    }
+  );
+
   return server;
 }
 
@@ -1823,8 +2322,8 @@ app.use((req: Request, res: Response, next: () => void) => {
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6; // +6: memory blocks (get/set) + add_memory_link; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "4.9.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 8; // +8: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant; r2: remember_file, recall_file, forget_file, store_file, get_file
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.6.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -1895,10 +2394,11 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v4.9.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v5.6.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
+  startStalenessJob(supabase);
 });
 
 // ── Cross-agent memory sync (Supabase Realtime) ──────────────────────────────
@@ -1906,7 +2406,7 @@ app.listen(PORT, "0.0.0.0", async () => {
 // Phoenix v1.0.0 WebSocket — supabase-js hardcodes vsn=2.0.0 which this
 // project's Realtime server doesn't support.
 function startMemorySyncListener() {
-  const RT_URL = `${SUPABASE_URL.replace("https://", "wss://")}/realtime/v1/websocket?apikey=${SUPABASE_ANON_KEY}&vsn=1.0.0`;
+  const RT_URL = `${SUPABASE_URL.replace("https://", "wss://")}/realtime/v1/websocket?apikey=${SUPABASE_PUBLISHABLE_KEY}&vsn=1.0.0`;
 
   let ws: any = null;
   let heartbeat: NodeJS.Timeout | null = null;

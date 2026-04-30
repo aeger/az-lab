@@ -28,6 +28,7 @@ infrastructure/traefik/*.txt
 # Service config (runtime/user-specific)
 services/webtop/config/
 services/monitoring/grafana/
+services/code-server/config/
 
 # Authelia config (contains secrets)
 infrastructure/authelia/config/

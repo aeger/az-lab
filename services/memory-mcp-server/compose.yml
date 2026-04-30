@@ -11,7 +11,7 @@ services:
     restart: unless-stopped
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - SUPABASE_SECRET_KEY=${SUPABASE_SECRET_KEY}
       - R2_ACCOUNT_ID=${R2_ACCOUNT_ID}
       - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
       - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
@@ -50,6 +50,7 @@ services:
       - "traefik.http.routers.memory-mcp.rule=Host(`memory-mcp.az-lab.dev`)"
       - "traefik.http.routers.memory-mcp.entrypoints=websecure"
       - "traefik.http.routers.memory-mcp.tls=true"
+      - "traefik.http.routers.memory-mcp.tls.certresolver=le"
       - "traefik.http.routers.memory-mcp.middlewares=lan-allow@file"
       - "traefik.http.services.memory-mcp.loadbalancer.server.port=3100"
 

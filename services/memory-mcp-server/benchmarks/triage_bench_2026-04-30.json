@@ -1,0 +1,102 @@
+{
+  "models": {
+    "gemma-4-31b": "google/gemma-4-31b-it",
+    "nemotron-120b": "nvidia/nemotron-3-super-120b-a12b"
+  },
+  "results": {
+    "gemma-4-31b": [
+      {
+        "name": "cluster_summarize",
+        "ok": true,
+        "latency_s": 1.4271018599392846,
+        "completion_tokens": 29,
+        "prompt_tokens": 114,
+        "tokens_per_s": 20.32090407424302,
+        "text": "Jeff prefers the DD/MM/YYYY date format across all interfaces, including the dashboard, goals widget, agent terminal, and Discord notifications."
+      },
+      {
+        "name": "triage_classify",
+        "ok": true,
+        "latency_s": 0.8393743849592283,
+        "completion_tokens": 2,
+        "prompt_tokens": 103,
+        "tokens_per_s": 2.38272698790677,
+        "text": "financial"
+      },
+      {
+        "name": "extract_facts",
+        "ok": true,
+        "latency_s": 1.828476405935362,
+        "completion_tokens": 60,
+        "prompt_tokens": 81,
+        "tokens_per_s": 32.81420520671517,
+        "text": "```json\n{\n  \"host\": \"svc-podman-01\",\n  \"ip\": \"192.168.1.181\",\n  \"role\": \"production VM hosting Podman containers and Traefik\"\n}\n```"
+      },
+      {
+        "name": "decision_tag",
+        "ok": true,
+        "latency_s": 0.6415904689347371,
+        "completion_tokens": 4,
+        "prompt_tokens": 91,
+        "tokens_per_s": 6.234506579627637,
+        "text": "info_only"
+      },
+      {
+        "name": "short_summarize",
+        "ok": true,
+        "latency_s": 2.6447310670046136,
+        "completion_tokens": 45,
+        "prompt_tokens": 107,
+        "tokens_per_s": 17.01496252734929,
+        "text": "MS-01 Proxmox node hosts VMs 107, 108, and LXC 106 using ZFS pools nvme-fast and nvme-fast-02."
+      }
+    ],
+    "nemotron-120b": [
+      {
+        "name": "cluster_summarize",
+        "ok": true,
+        "latency_s": 2.39637709595263,
+        "completion_tokens": 86,
+        "prompt_tokens": 93,
+        "tokens_per_s": 35.8875070811059,
+        "text": "Jeff prefers the DD/MM/YYYY date format, which has been implemented for the dashboard, goals widget, agent terminal timestamps, and Discord notifications."
+      },
+      {
+        "name": "triage_classify",
+        "ok": true,
+        "latency_s": 1.0692285989644006,
+        "completion_tokens": 52,
+        "prompt_tokens": 91,
+        "tokens_per_s": 48.63319223818415,
+        "text": "financial"
+      },
+      {
+        "name": "extract_facts",
+        "ok": true,
+        "latency_s": 1.8577071870677173,
+        "completion_tokens": 64,
+        "prompt_tokens": 68,
+        "tokens_per_s": 34.45106981634726,
+        "text": "We need to extract entities: host, ip, role. The sentence: \"svc-podman-01 at 192.168.1.181 is the production VM hosting Podman containers and Traefik.\"\n\nHost: svc-podman-01\nIP"
+      },
+      {
+        "name": "decision_tag",
+        "ok": true,
+        "latency_s": 1.4095993399387226,
+        "completion_tokens": 82,
+        "prompt_tokens": 74,
+        "tokens_per_s": 58.172558454492936,
+        "text": "info_only"
+      },
+      {
+        "name": "short_summarize",
+        "ok": true,
+        "latency_s": 4.4887186830164865,
+        "completion_tokens": 256,
+        "prompt_tokens": 101,
+        "tokens_per_s": 57.03186545608248,
+        "text": "We need to summarize in one sentence under 20 words, no preamble. So just a sentence. Count words. Let's craft: \"MS-01 Proxmox node runs VMs 107 (Home Assistant), 108 (NemoClaw) and LXC 106 (game server on VLAN30) using ZFS pools nvme-fast and nvme-fast-02.\" Count words.\n\nCount: MS-01(1) Proxmox2 node3 runs4 VMs5 107(6) (Home7 Assistant),8 108(9) (NemoClaw)10 and11 LXC12 10613 (game14 server15 on16 VLAN30)17 using18 ZFS19 pools20 nvme-fast21 and22 nvme-fast-0223.\n\n23 words >20. Need <=20. Let's shorten.\n\nMaybe: \"MS-01 Proxmox hosts VMs 107 (Home Assistant), 108 (NemoClaw"
+      }
+    ]
+  }
+}

@@ -1,0 +1,81 @@
+name: immich
+
+# Extracted from az-lab-dashboard 2026-04-30 so dashboard rebuilds
+# stop taking immich (4 containers + postgres) down with them.
+# The original podman volumes are reused as-is via `external: true`
+# so no photo/database data migration was required.
+
+services:
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:release
+    container_name: immich-server
+    restart: unless-stopped
+    environment:
+      - DB_HOSTNAME=immich-postgres
+      - DB_USERNAME=${IMMICH_DB_USERNAME:-postgres}
+      - DB_PASSWORD=${IMMICH_DB_PASSWORD:-postgres}
+      - DB_DATABASE_NAME=${IMMICH_DB_NAME:-immich}
+      - REDIS_HOSTNAME=immich-redis
+      - UPLOAD_LOCATION=/usr/src/app/upload
+    volumes:
+      - immich-upload:/usr/src/app/upload
+    depends_on:
+      - immich-redis
+      - immich-postgres
+    networks:
+      - proxy
+      - immich-internal
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.immich.rule=Host(`photos.az-lab.dev`)"
+      - "traefik.http.routers.immich.entrypoints=websecure"
+      - "traefik.http.routers.immich.tls=true"
+      - "traefik.http.routers.immich.middlewares=lan-allow@file"
+      - "traefik.http.services.immich.loadbalancer.server.port=2283"
+      - "traefik.docker.network=proxy"
+
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:release
+    container_name: immich-machine-learning
+    restart: unless-stopped
+    volumes:
+      - immich-model-cache:/cache
+    networks:
+      - immich-internal
+
+  immich-redis:
+    image: redis:6.2-alpine
+    container_name: immich-redis
+    restart: unless-stopped
+    networks:
+      - immich-internal
+
+  immich-postgres:
+    image: tensorchord/pgvecto-rs:pg14-v0.2.0
+    container_name: immich-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${IMMICH_DB_USERNAME:-postgres}
+      - POSTGRES_PASSWORD=${IMMICH_DB_PASSWORD:-postgres}
+      - POSTGRES_DB=${IMMICH_DB_NAME:-immich}
+    volumes:
+      - immich-postgres:/var/lib/postgresql/data
+    networks:
+      - immich-internal
+
+volumes:
+  immich-upload:
+    external: true
+    name: az-lab-dashboard_immich-upload
+  immich-model-cache:
+    external: true
+    name: az-lab-dashboard_immich-model-cache
+  immich-postgres:
+    external: true
+    name: az-lab-dashboard_immich-postgres
+
+networks:
+  proxy:
+    external: true
+  immich-internal:
+    internal: true

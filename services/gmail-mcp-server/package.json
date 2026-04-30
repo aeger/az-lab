@@ -1,0 +1,30 @@
+{
+  "name": "gmail-mcp-server",
+  "version": "1.1.0",
+  "description": "Full-featured Gmail MCP server with read, search, trash, delete, archive, batch, draft, send, label management, and signature operations",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "auth": "tsx src/auth-setup.ts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1016.0",
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "express": "^5.2.1",
+    "google-auth-library": "^10.6.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

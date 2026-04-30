@@ -61,10 +61,10 @@ def load_env_file(path):
 
 def get_credentials():
     env = load_env_file(MEMORY_MCP_ENV)
-    service_key = env.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY", "")
+    service_key = env.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SECRET_KEY", "")
     api_key = env.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY", "")
     if not service_key:
-        raise RuntimeError(f"SUPABASE_SERVICE_KEY not found in {MEMORY_MCP_ENV} or environment")
+        raise RuntimeError(f"SUPABASE_SECRET_KEY not found in {MEMORY_MCP_ENV} or environment")
     if not api_key:
         raise RuntimeError(f"ANTHROPIC_API_KEY not found in {MEMORY_MCP_ENV} or environment")
     return service_key, api_key

@@ -1,0 +1,20 @@
+http:
+  routers:
+    webmin:
+      rule: Host(`webmin.az-lab.dev`)
+      entryPoints:
+        - websecure
+      service: webmin
+      tls:
+        certResolver: le
+      middlewares:
+        - lan-allow@file
+  serversTransports:
+    webmin-transport:
+      insecureSkipVerify: true
+  services:
+    webmin:
+      loadBalancer:
+        serversTransport: webmin-transport
+        servers:
+          - url: https://192.168.1.182:10000
