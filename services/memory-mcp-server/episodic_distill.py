@@ -14,10 +14,19 @@ operational knowledge).
 Based on ElephantBroker 3-session promotion threshold and CraniMem
 scheduled consolidation replay pattern.
 
-LLM priority: NemoClaw (Nemotron 120B, on-prem) > claude-haiku-4-5 (Anthropic API) > heuristic
+LLM priority: NemoClaw (on-prem) > claude-haiku-4-5 (Anthropic API) > heuristic
 - NemoClaw: preferred when NVIDIA_API_KEY set (on-prem, no token cost)
 - Haiku: fallback when ANTHROPIC_API_KEY set (low-cost cloud, ~$0.25/MTok input)
 - Heuristic: always available, no LLM needed
+
+NemoClaw model selection:
+- TRIAGE_MODEL (default google/gemma-4-31b-it): triage/summarization callsites.
+  Per benchmarks/triage_bench_2026-04-30, Gemma-4 31B IT is 1.3-2.2x faster
+  wall-clock than Nemotron 120B on these workloads with no quality regression
+  at adequate token budgets, and avoids Nemotron's "thinking preamble" leak
+  at low max_tokens.
+- NEMOCLAW_MODEL (default Nemotron 120B): reserved for future hard-reasoning
+  callsites (multi-step planning, code generation, complex inference).
 
 Systemd timer: episodic-distill.timer (nightly at 03:00 UTC)
 """
@@ -37,6 +46,10 @@ MEMORY_MCP_URL = os.environ.get("MEMORY_MCP_URL", "http://localhost:3100")
 NEMOCLAW_URL  = os.environ.get("NEMOCLAW_URL", "http://192.168.1.183:8000")
 NEMOCLAW_KEY  = os.environ.get("NVIDIA_API_KEY", "")
 NEMOCLAW_MODEL = os.environ.get("NEMOCLAW_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+TRIAGE_MODEL  = os.environ.get("TRIAGE_MODEL", "google/gemma-4-31b-it")
+# Floor max_tokens at 128 for any Nemotron callsite — lower budgets crowd out
+# Nemotron's chain-of-thought preamble and produce truncated/garbage output.
+NEMOTRON_MIN_MAX_TOKENS = 128
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 HAIKU_MODEL   = os.environ.get("HAIKU_MODEL", "claude-haiku-4-5")
 
@@ -135,7 +148,7 @@ def cluster_memories(memories: list) -> list[list]:
 
 # ── LLM summarization ─────────────────────────────────────────────────────────
 def summarize_cluster_llm(memories: list) -> str | None:
-    """Try to summarize a cluster of episodic memories via NemoClaw."""
+    """Summarize a cluster of episodic memories via NemoClaw using TRIAGE_MODEL (gemma-4-31b-it)."""
     if not NEMOCLAW_KEY:
         return None
 
@@ -160,9 +173,9 @@ def summarize_cluster_llm(memories: list) -> str | None:
                 "Content-Type": "application/json",
             },
             json={
-                "model": NEMOCLAW_MODEL,
+                "model": TRIAGE_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 256,
+                "max_tokens": max(256, NEMOTRON_MIN_MAX_TOKENS),
                 "temperature": 0.3,
             },
             timeout=45,
@@ -339,7 +352,7 @@ def fetch_stale_project_memories() -> list:
 
 
 def summarize_project_cluster(memories: list) -> str | None:
-    """Distill a cluster of related project memories into a permanent reference fact."""
+    """Distill a cluster of related project memories into a permanent reference fact via TRIAGE_MODEL."""
     if not NEMOCLAW_KEY:
         return None
 
@@ -365,9 +378,9 @@ def summarize_project_cluster(memories: list) -> str | None:
                 "Content-Type": "application/json",
             },
             json={
-                "model": NEMOCLAW_MODEL,
+                "model": TRIAGE_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 300,
+                "max_tokens": max(300, NEMOTRON_MIN_MAX_TOKENS),
                 "temperature": 0.3,
             },
             timeout=45,
@@ -539,7 +552,7 @@ def main():
     use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
     use_llm = use_nemoclaw or use_haiku
     if use_nemoclaw:
-        llm_status = "NemoClaw"
+        llm_status = f"NemoClaw[{TRIAGE_MODEL}]"
     elif use_haiku:
         llm_status = f"claude-haiku-4-5"
     else:
@@ -855,7 +868,7 @@ def main_weekly():
 
     use_nemoclaw = bool(NEMOCLAW_KEY)
     use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
-    llm_status = "NemoClaw" if use_nemoclaw else ("claude-haiku-4-5" if use_haiku else "heuristic")
+    llm_status = f"NemoClaw[{TRIAGE_MODEL}]" if use_nemoclaw else ("claude-haiku-4-5" if use_haiku else "heuristic")
     log.info(f"Summarization mode: {llm_status}")
 
     created, processed = run_weekly_consolidation(use_nemoclaw, use_haiku)
