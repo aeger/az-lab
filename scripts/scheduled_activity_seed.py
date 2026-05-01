@@ -266,6 +266,13 @@ AGENT_LOOPS = [
         "description": "Always-on Python service spawning workers for ready tasks (max 3 parallel).",
     },
     {
+        "name": "agent-loop-scheduled-control",
+        "service": "scheduled-control.service",
+        "schedule": "loop:30s",
+        "display_name": "Scheduled Activity Control Daemon",
+        "description": "Reconciles native scheduler state to match scheduled_activity registry every 30s. Phase 3 of unified scheduler.",
+    },
+    {
         "name": "agent-loop-watchdog",
         "service": "watchdog.service",
         "schedule": "loop:30s",
