@@ -160,6 +160,60 @@ def systemd_unit_path(unit: str) -> Path | None:
     return p if p.exists() else None
 
 
+SYSTEMD_DROPIN_FILE = "wren-override.conf"
+
+
+def systemd_current_schedule(unit: str) -> str | None:
+    """Return current native schedule string in the same encoding the registry uses."""
+    rc, txt, _ = run(["systemctl", "--user", "cat", unit])
+    if rc != 0:
+        return None
+    on_cal = re.search(r"^OnCalendar\s*=\s*(.+)$", txt, re.M)
+    on_act = re.search(r"^OnUnitActiveSec\s*=\s*(.+)$", txt, re.M)
+    if on_cal:
+        return f"oncalendar:{on_cal.group(1).strip()}"
+    if on_act:
+        return f"every:{on_act.group(1).strip()}"
+    return None
+
+
+def systemd_write_dropin(unit: str, desired_schedule: str) -> tuple[bool, str]:
+    """Write a drop-in override that sets OnCalendar / OnUnitActiveSec, then
+    daemon-reload + restart the timer. Returns (ok, note).
+    """
+    if not unit.endswith(".timer"):
+        return (False, "schedule edit only supported for .timer units")
+    dropin_dir = USER_SYSTEMD_DIR / f"{unit}.d"
+    dropin_path = dropin_dir / SYSTEMD_DROPIN_FILE
+
+    # Decide which directive to set based on schedule prefix
+    if desired_schedule.startswith("oncalendar:"):
+        directive = "OnCalendar"
+        value = desired_schedule[len("oncalendar:"):].strip()
+        # Empty assignment first clears any inherited OnCalendar lines
+        body = f"# Managed by scheduled_control_daemon — do not edit manually.\n[Timer]\nOnCalendar=\nOnCalendar={value}\n"
+    elif desired_schedule.startswith("every:"):
+        directive = "OnUnitActiveSec"
+        value = desired_schedule[len("every:"):].strip()
+        body = f"# Managed by scheduled_control_daemon — do not edit manually.\n[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec={value}\n"
+    else:
+        return (False, f"unsupported schedule format for systemd: {desired_schedule!r}")
+
+    try:
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        dropin_path.write_text(body)
+    except OSError as e:
+        return (False, f"failed to write {dropin_path}: {e}")
+
+    rc, _, err = run(["systemctl", "--user", "daemon-reload"])
+    if rc != 0:
+        return (False, f"daemon-reload failed: {err.strip()[:100]}")
+    rc, _, err = run(["systemctl", "--user", "restart", unit])
+    if rc != 0:
+        return (False, f"restart {unit} failed: {err.strip()[:100]}")
+    return (True, f"wrote drop-in {dropin_path.name}, set {directive}={value}")
+
+
 def reconcile_systemd(row: dict) -> dict | None:
     """Return audit dict if any action taken, else None."""
     unit = row["source_ref"].get("unit")
@@ -188,20 +242,17 @@ def reconcile_systemd(row: dict) -> dict | None:
         if rc != 0:
             notes.append(f"{verb} stderr: {err.strip()[:100]}")
 
-    # TODO Phase 3.5: reconcile schedule via drop-in override file. For now,
-    # detect schedule drift and surface a warning so the dashboard can show it.
-    if row["schedule"].startswith("oncalendar:") or row["schedule"].startswith("every:"):
-        rc, txt, _ = run(["systemctl", "--user", "cat", unit])
-        if rc == 0:
-            on_cal = re.search(r"^OnCalendar\s*=\s*(.+)$", txt, re.M)
-            on_act = re.search(r"^OnUnitActiveSec\s*=\s*(.+)$", txt, re.M)
-            actual = (
-                f"oncalendar:{on_cal.group(1).strip()}" if on_cal
-                else f"every:{on_act.group(1).strip()}" if on_act
-                else None
-            )
-            if actual and actual != row["schedule"]:
-                notes.append(f"schedule drift: native={actual} desired={row['schedule']} — Phase 3.5 will reconcile")
+    # Phase 5.4 — reconcile schedule via drop-in override file. Only attempt
+    # for .timer units the user owns and when the registry's schedule has the
+    # expected prefix.
+    if (unit.endswith(".timer")
+            and (row["schedule"].startswith("oncalendar:")
+                 or row["schedule"].startswith("every:"))):
+        actual_schedule = systemd_current_schedule(unit)
+        if actual_schedule and actual_schedule != row["schedule"]:
+            ok, note = systemd_write_dropin(unit, row["schedule"])
+            actions.append(f"schedule={'ok' if ok else 'fail'}")
+            notes.append(note)
 
     if not actions and not notes:
         return None
@@ -209,7 +260,7 @@ def reconcile_systemd(row: dict) -> dict | None:
         "actions": actions,
         "notes": "; ".join(notes) if notes else None,
         "before": {"enabled": actual_enabled, "running": actual_running},
-        "after": {"enabled": desired_enabled, "running": desired_running},
+        "after": {"enabled": desired_enabled, "running": desired_running, "schedule": row["schedule"]},
     }
 
 
@@ -217,13 +268,15 @@ def reconcile_systemd(row: dict) -> dict | None:
 
 
 def reconcile_cron(row: dict) -> dict | None:
-    """Toggle a cron line by adding/removing a leading `# DISABLED:` marker.
+    """Reconcile a cron entry: toggle enabled via DISABLED-BY-WREN marker AND
+    apply schedule changes by replacing the 5-field cron expression on the
+    matching line.
 
-    The seeder records the literal line text in source_ref.line. We look for
-    that exact line in the user crontab, and either restore it or comment it
-    out depending on the desired enabled state.
+    source_ref.line holds the literal line text we matched at seed time. When
+    the registry's `schedule` differs from the line's first 5 fields, we
+    rewrite the line and update source_ref.line in the same call.
     """
-    target_line = row["source_ref"].get("line")
+    target_line = (row["source_ref"].get("line") or "").strip()
     if not target_line:
         return None
 
@@ -232,24 +285,54 @@ def reconcile_cron(row: dict) -> dict | None:
         return None  # no crontab installed; nothing to do
 
     desired_active = bool(row["enabled"]) and not row.get("paused_at")
+    desired_schedule = (row.get("schedule") or "").strip()
     disabled_marker = "# DISABLED-BY-WREN: "
+
+    # Extract current 5-field cron expression from the target line
+    parts = target_line.split(None, 5)
+    if len(parts) < 6:
+        return None
+    current_expr = " ".join(parts[:5])
+    cmd = parts[5]
+    schedule_changed = (
+        desired_schedule
+        and desired_schedule != current_expr
+        and not desired_schedule.startswith("oncalendar:")
+        and not desired_schedule.startswith("every:")
+        and not desired_schedule.startswith("loop:")
+    )
+    new_target_line = f"{desired_schedule} {cmd}" if schedule_changed else target_line
 
     new_lines: list[str] = []
     found_active = False
     found_disabled = False
+    line_changed = False
     for ln in current.splitlines():
-        if ln.strip() == target_line.strip():
+        ln_stripped = ln.strip()
+        is_match_active = (ln_stripped == target_line)
+        is_match_disabled = (
+            ln.startswith(disabled_marker)
+            and ln[len(disabled_marker):].strip() == target_line
+        )
+        if is_match_active:
             found_active = True
+            base = new_target_line if schedule_changed else ln
             if desired_active:
-                new_lines.append(ln)
+                new_lines.append(base)
             else:
-                new_lines.append(f"{disabled_marker}{ln}")
-        elif ln.startswith(disabled_marker) and ln[len(disabled_marker):].strip() == target_line.strip():
+                new_lines.append(f"{disabled_marker}{base}")
+            if base != ln:
+                line_changed = True
+        elif is_match_disabled:
             found_disabled = True
+            inner = ln[len(disabled_marker):]
+            base = new_target_line if schedule_changed else inner
             if desired_active:
-                new_lines.append(ln[len(disabled_marker):])  # restore
+                new_lines.append(base)  # restore (and possibly reschedule)
             else:
-                new_lines.append(ln)
+                new_lines.append(f"{disabled_marker}{base}")
+            if base != inner:
+                line_changed = True
         else:
             new_lines.append(ln)
 
@@ -264,14 +347,43 @@ def reconcile_cron(row: dict) -> dict | None:
         return {
             "actions": ["crontab-write=fail"],
             "notes": f"stderr: {proc.stderr.strip()[:120]}",
-            "before": {"enabled": found_active, "disabled_marker_present": found_disabled},
-            "after":  {"enabled": desired_active},
+            "before": {"enabled": found_active, "disabled_marker_present": found_disabled, "schedule": current_expr},
+            "after":  {"enabled": desired_active, "schedule": desired_schedule if schedule_changed else current_expr},
         }
+
+    # If we rewrote the line, update source_ref.line so future ticks match it.
+    if schedule_changed:
+        try:
+            req = urllib.request.Request(
+                f"{SUPABASE_URL}/rest/v1/scheduled_activity?id=eq.{row['id']}",
+                data=json.dumps({
+                    "source_ref": {**row["source_ref"], "line": new_target_line},
+                }).encode(),
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                method="PATCH",
+            )
+            urllib.request.urlopen(req, timeout=8).read()
+        except Exception as e:
+            log.warning(f"source_ref.line update failed for {row['name']}: {e}")
+
+    actions = ["crontab-write=ok"]
+    if schedule_changed:
+        actions.append("schedule=ok")
+    note = f"toggled cron line: '{target_line[:60]}…'"
+    if schedule_changed:
+        note = f"changed schedule {current_expr!r} → {desired_schedule!r} on '{cmd[:50]}…'"
+
     return {
-        "actions": ["crontab-write=ok"],
-        "notes": f"toggled cron line: '{target_line[:60]}…'",
-        "before": {"enabled": found_active, "disabled_marker_present": found_disabled},
-        "after":  {"enabled": desired_active},
+        "actions": actions,
+        "notes": note,
+        "before": {"enabled": found_active, "disabled_marker_present": found_disabled, "schedule": current_expr},
+        "after":  {"enabled": desired_active, "schedule": desired_schedule if schedule_changed else current_expr,
+                   "line_changed": line_changed},
     }
 
 
