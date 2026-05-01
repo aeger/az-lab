@@ -370,9 +370,54 @@ def reconcile_one(row: dict) -> None:
     )
 
 
+def auto_unpause(rows: list[dict]) -> None:
+    """Clear paused_at on rows whose unpause_at has elapsed.
+
+    Phase 5.1 — supports the "pause for 30m/1h/4h" UI. Daemon runs this
+    BEFORE the per-row reconciliation so the cleared pause propagates
+    into the same tick.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        ua = row.get("unpause_at")
+        if not ua or not row.get("paused_at"):
+            continue
+        try:
+            ua_dt = datetime.fromisoformat(ua.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if now < ua_dt:
+            continue
+        # Time's up — clear pause atomically
+        try:
+            req = urllib.request.Request(
+                f"{SUPABASE_URL}/rest/v1/scheduled_activity?id=eq.{row['id']}",
+                data=json.dumps({"paused_at": None, "unpause_at": None, "pause_reason": None}).encode(),
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                method="PATCH",
+            )
+            urllib.request.urlopen(req, timeout=8).read()
+            log.info(f"auto-unpaused {row['name']} (unpause_at elapsed)")
+            insert_audit(row["id"], row["name"], "auto_unpaused", None, None,
+                         notes=f"unpause_at={ua} reached")
+            # Reflect in our local copy so the immediate reconcile uses fresh state
+            row["paused_at"] = None
+            row["unpause_at"] = None
+            row["pause_reason"] = None
+        except Exception as e:
+            log.warning(f"auto-unpause failed for {row['name']}: {e}")
+
+
 def tick() -> None:
-    rows = rest_get("scheduled_activity?select=id,name,kind,schedule,enabled,paused_at,source_ref&order=name")
+    rows = rest_get("scheduled_activity?select=id,name,kind,schedule,enabled,paused_at,unpause_at,pause_reason,source_ref&order=name")
     log.debug(f"tick: {len(rows)} rows")
+    auto_unpause(rows)
     for row in rows:
         reconcile_one(row)
 
