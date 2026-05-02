@@ -1276,10 +1276,21 @@ def _needs_jeff_input(text: str) -> tuple[bool, str]:
 def mark_pending_jeff_action(task_id: str, result: str, reason: str, title: str = "", goal_id: str | None = None) -> None:
     """Transition task to pending_jeff_action and notify Jeff via Discord."""
     stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
+    # Read existing context so the reason note merges in without clobbering other fields.
+    existing = api_request("GET", f"task_queue?id=eq.{task_id}&select=context")
+    cur_ctx = (existing[0].get("context") if existing else None) or {}
+    merged_ctx = dict(cur_ctx)
+    merged_ctx["context_summary"] = f"Needs input: {reason[:140]}"
+    merged_ctx["action_required"] = reason[:240]
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
-        data={"status": "pending_jeff_action", "result": stored_result},
+        data={
+            "status": "pending_jeff_action",
+            "result": stored_result,
+            "target": "jeff",
+            "context": merged_ctx,
+        },
     )
     log_activity("status", f"Pending Jeff action: {reason[:100]}", task_id=task_id)
     display = title or task_id
