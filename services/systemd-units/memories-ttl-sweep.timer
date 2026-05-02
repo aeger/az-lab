@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly TTL sweep for memories.expires_at
+Requires=memories-ttl-sweep.service
+
+[Timer]
+OnCalendar=*-*-* *:13:00 UTC
+Persistent=true
+RandomizedDelaySec=60
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target
