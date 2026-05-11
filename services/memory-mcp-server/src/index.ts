@@ -884,6 +884,24 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 028 skipped:", err.message);
   }
+
+  // Migration 036: Active Retrieval — p_topic_hint parameter on hybrid_recall (MIRIX-paper, 85.4% LOCOMO).
+  // Adds a 5th RRF lane weighted 1.5 against agent-distilled topic phrases for sharper recall.
+  try {
+    const { data, error } = await supabase.rpc("apply_topic_hint_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 036 RPC not yet registered — apply migrations/036_active_retrieval_topic_hint.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 036 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 036 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 036 skipped:", err.message);
+  }
 }
 
 // ── Staleness maintenance job (runs once at startup, then every 24h) ─────────
@@ -892,8 +910,50 @@ function startStalenessJob(supabase: any): void {
   const run = async () => {
     try {
       const { data, error } = await supabase.rpc("flag_stale_memories");
-      if (error) console.warn("[staleness] flag_stale_memories error:", error.message);
-      else if ((data as number) > 0) console.log(`[staleness] Flagged ${data} stale memories`);
+      if (error) {
+        console.warn("[staleness] flag_stale_memories error:", error.message);
+        return;
+      }
+      const newlyFlagged = data as number;
+      if (newlyFlagged > 0) console.log(`[staleness] Newly flagged ${newlyFlagged} memories`);
+
+      // Queue a review task if there are any unresolved stale candidates and no pending task already
+      const { count: stalePending } = await supabase
+        .from("memories")
+        .select("id", { count: "exact", head: true })
+        .eq("staleness_candidate", true);
+      if (!stalePending || stalePending <= 0) return;
+
+      const { data: existingTask } = await supabase
+        .from("task_queue")
+        .select("id")
+        .eq("recurring_key", "staleness_review_pending")
+        .in("status", ["pending", "in_progress", "in_progress_agent"])
+        .maybeSingle();
+      if (existingTask) return;
+
+      const { data: top } = await supabase
+        .from("memories")
+        .select("name, importance_score, last_accessed")
+        .eq("staleness_candidate", true)
+        .order("importance_score", { ascending: false })
+        .limit(5);
+      const summary = (top || [])
+        .map((m: any) => `• ${m.name} (importance ${(m.importance_score ?? 0).toFixed(2)})`)
+        .join("\n");
+      const { error: insertErr } = await supabase.from("task_queue").insert({
+        title: `Review ${stalePending} stale high-importance memories`,
+        description:
+          `${stalePending} memories with importance>0.7 have gone cold (21+ days no access). Review top candidates and refresh, archive, or update:\n\n${summary}\n\nUse SELECT * FROM memories WHERE staleness_candidate=true to see all.`,
+        priority: 2,
+        status: "pending",
+        source: "system",
+        target: "wren",
+        recurring_key: "staleness_review_pending",
+        tags: ["memory-hygiene", "auto-queued"],
+      });
+      if (insertErr) console.warn("[staleness] task insert failed:", insertErr.message);
+      else console.log(`[staleness] Queued Wren review task for ${stalePending} stale memories`);
     } catch (err: any) {
       console.warn("[staleness] job error:", err.message);
     }
@@ -906,7 +966,7 @@ function startStalenessJob(supabase: any): void {
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.6.0",
+    version: "5.9.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -1029,6 +1089,23 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         return { content: [{ type: "text" as const, text: `Updated memory "${name}" (${type})${embedNote}.${linkNote}${updateConflictNote}` }] };
       }
 
+      // ── AMAC novelty admission gate: skip near-duplicate writes from agent overlap ─
+      // novelty < 0.3 (cosine ≥ 0.7) is the spec; we use a stricter cosine ≥ 0.85 + same-type
+      // hard skip to avoid false-merge into the wrong memory. The 0.7-0.85 band is left to mem0.
+      if (embedding) {
+        const { data: novCheck } = await supabase.rpc("match_memories", {
+          query_embedding: JSON.stringify(embedding),
+          match_threshold: 0.85,
+          match_count: 1,
+        });
+        const top = (novCheck as any[] | null)?.[0];
+        if (top && top.type === type && top.similarity >= 0.85) {
+          const novelty = (1 - top.similarity).toFixed(3);
+          console.log(`[novelty] SKIP "${name}": novelty=${novelty} vs "${top.name}" (cosine=${top.similarity.toFixed(3)})`);
+          return { content: [{ type: "text" as const, text: `Skipped: novelty=${novelty} (cosine=${top.similarity.toFixed(3)}) — content overlaps existing ${type} memory "${top.name}". Update that memory or use a more distinct name to force a new entry.` }] };
+        }
+      }
+
       // ── New-name path: full Mem0 conflict resolution ────────────────────────
       let mem0Note = "";
       if (embedding) {
@@ -1104,9 +1181,10 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
   // ── Tool: recall ────────────────────────────────────────────────────────────
   server.tool(
     "recall",
-    "Search memories by text, tags, or type. Uses semantic vector search when Ollama is available, falls back to keyword search.",
+    "Search memories by text, tags, or type. Uses semantic vector search when Ollama is available, falls back to keyword search. ACTIVE RETRIEVAL (MIRIX, 85.4% LOCOMO): always pass topic_hint — a 3-5 word distilled topic of what you actually need (e.g. 'cox business static ips', 'dashboard build process'). The hint contributes the highest-weight RRF lane and dramatically reduces hallucination on verbose queries.",
     {
-      query: z.string().optional().describe("Free-text or semantic search query"),
+      query: z.string().optional().describe("Free-text or semantic search query — can be verbose/conversational"),
+      topic_hint: z.string().optional().describe("ACTIVE RETRIEVAL — a 3-5 word topic phrase you generate before recalling, summarising the core thing you want to find (e.g. 'mikrotik vlan tagging', 'gmail send-as policy'). Strongest ranking signal in the RRF fusion (weight 1.5). Use it on every recall."),
       type: z.enum(["user", "feedback", "project", "reference"]).optional().describe("Filter by memory type"),
       tags: z.array(z.string()).optional().describe("Filter by tags (any match)"),
       limit: z.number().optional().describe("Max results (default 10)"),
@@ -1116,7 +1194,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       min_confidence: z.number().min(0).max(1).optional().describe("Exclude memories with confidence below this threshold (default 0.0 = return all). Use 0.5 to hide speculative/unverified memories."),
       memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Filter by memory class. episodic=event log, semantic=durable facts (default for most), procedural=skills/how-to, working=short-term context."),
     },
-    async ({ query, type, tags, limit, semantic, agent_id, agent_scope, min_confidence, memory_class }) => {
+    async ({ query, topic_hint, type, tags, limit, semantic, agent_id, agent_scope, min_confidence, memory_class }) => {
       const maxResults = limit || 10;
 
       // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled.
@@ -1139,6 +1217,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (agent_scope) rpcParams.p_agent_scope = agent_scope;
         if (min_confidence && min_confidence > 0) rpcParams.p_min_confidence = min_confidence;
         if (memory_class) rpcParams.p_memory_class = memory_class;
+        // Active Retrieval (MIRIX): topic_hint is the highest-weight RRF lane
+        if (topic_hint && topic_hint.trim().length > 0) rpcParams.p_topic_hint = topic_hint.trim();
         const { data, error } = await supabase.rpc("hybrid_recall", rpcParams);
 
         if (!error && data && data.length > 0) {
@@ -1467,6 +1547,52 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       return {
         content: [{ type: "text" as const, text: `${data.length} log entries:\n\n${entries.join("\n\n")}` }],
       };
+    }
+  );
+
+  // ── Tool: check_stale_context ───────────────────────────────────────────────
+  // Returns memories from a candidate set that have been mutated by another
+  // agent since this agent's last_seen_at watermark. Addresses the #1 production
+  // failure mode for multi-agent memory: context inconsistency across stores.
+  server.tool(
+    "check_stale_context",
+    "Check whether any of the given memory IDs have been modified by another agent since you last refreshed your view. Returns stale ones with the change action and timestamp. Call update_read_watermark after acting on the result.",
+    {
+      agent_name: z.string().describe("Your agent identity (wren, iris, atlas, volt, hermes, lumen)"),
+      memory_ids: z.array(z.string()).describe("UUIDs of memories you intend to rely on"),
+    },
+    async ({ agent_name, memory_ids }) => {
+      if (!memory_ids?.length) {
+        return { content: [{ type: "text" as const, text: "No memory_ids provided." }] };
+      }
+      const { data, error } = await supabase.rpc("check_stale_context", {
+        p_agent_name: agent_name,
+        p_memory_ids: memory_ids,
+      });
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      if (!data?.length) {
+        return { content: [{ type: "text" as const, text: `✓ All ${memory_ids.length} memories are fresh for ${agent_name}.` }] };
+      }
+      const lines = data.map((r: any) =>
+        `⚠️ **${r.memory_name || r.memory_id}** — ${r.action} by ${r.changed_by} at ${r.last_modified_at}`
+      );
+      return {
+        content: [{ type: "text" as const, text: `${data.length} stale memor${data.length === 1 ? "y" : "ies"} for ${agent_name} — re-recall before acting:\n\n${lines.join("\n")}` }],
+      };
+    }
+  );
+
+  // ── Tool: update_read_watermark ─────────────────────────────────────────────
+  server.tool(
+    "update_read_watermark",
+    "Bump your agent's last_seen_at watermark to now. Call this after you have processed a recall and any stale-context warnings, so future stale-checks compare against this moment.",
+    {
+      agent_name: z.string().describe("Your agent identity"),
+    },
+    async ({ agent_name }) => {
+      const { data, error } = await supabase.rpc("update_read_watermark", { p_agent_name: agent_name });
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      return { content: [{ type: "text" as const, text: `Watermark for ${agent_name} bumped to ${data}.` }] };
     }
   );
 
@@ -2323,7 +2449,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 8; // +8: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.6.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.8.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -2394,7 +2520,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 6;
-  console.log(`Memory MCP Server v5.6.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v5.7.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
