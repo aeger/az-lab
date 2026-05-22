@@ -352,6 +352,52 @@ def log_activity(activity_type, content, task_id=None, metadata=None):
         print(f"log_activity failed (non-fatal): {e}", file=sys.stderr)
 
 
+def start_episode(task):
+    """Open an agent_episodes row for this task run. Returns episode_id or None. Best-effort."""
+    try:
+        title = (task.get("title") or "")[:200]
+        desc = (task.get("description") or "")[:600]
+        input_summary = f"{title}\n{desc}".strip()[:800]
+        row = api_request(
+            "POST",
+            "agent_episodes",
+            data={
+                "agent": "wren",
+                "task_id": task.get("id"),
+                "status": "in_progress",
+                "input_summary": input_summary,
+            },
+            params={"select": "id"},
+        )
+        if isinstance(row, list) and row:
+            return row[0].get("id")
+        if isinstance(row, dict):
+            return row.get("id")
+    except Exception as e:
+        print(f"start_episode failed (non-fatal): {e}", file=sys.stderr)
+    return None
+
+
+def end_episode(episode_id, status, summary=None, outcome=None, learnings=None):
+    """Close an agent_episodes row with final status. Best-effort — never raises."""
+    if not episode_id:
+        return
+    try:
+        patch = {
+            "status": status,
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if summary:
+            patch["summary"] = summary[:1000]
+        if outcome:
+            patch["outcome"] = outcome[:1000]
+        if learnings:
+            patch["learnings"] = learnings[:2000]
+        api_request("PATCH", f"agent_episodes?id=eq.{episode_id}", data=patch)
+    except Exception as e:
+        print(f"end_episode failed (non-fatal): {e}", file=sys.stderr)
+
+
 def mark_in_progress(task_id):
     pass  # 'claimed' already signals in-progress; schema has no in_progress status
 
@@ -1387,6 +1433,7 @@ def main():
     mark_in_progress(task_id)
     log_activity("status", f"Claimed: {title}", task_id=task_id)
     discord_notify(f"🟡 Claimed: {title} — starting now")
+    episode_id = start_episode(task)
 
     try:
         routing = route_task(task)
@@ -1407,6 +1454,7 @@ def main():
         jeff_needed, jeff_reason = _needs_jeff_input(result)
         if jeff_needed:
             mark_pending_jeff_action(task_id, result, jeff_reason, title=title, goal_id=goal_id)
+            end_episode(episode_id, "pending_jeff_action", summary=summary, outcome=jeff_reason)
             return
 
         # Guardian: safety/alignment audit on every completed task
@@ -1419,6 +1467,7 @@ def main():
             )
             discord_notify(f"🚨 **Guardian CRITICAL:** {title} — escalated to Jeff")
             print(f"Task {task_id} escalated: Guardian CRITICAL finding.")
+            end_episode(episode_id, "pending_jeff_action", summary=summary, outcome="Guardian CRITICAL")
             return
 
         # CRIT (0) and HIGH (1) tasks go to Iris for evaluation before completion
@@ -1427,6 +1476,7 @@ def main():
             mark_pending_eval(task_id, result, goal_id=goal_id, original_task=task)
             discord_notify(f"🔍 Pending eval: {title} — {summary}")
             print(f"Task {task_id} pending evaluation by Iris.")
+            end_episode(episode_id, "pending_eval", summary=summary)
         else:
             is_recurring = bool(task.get("recurring"))
             mark_completed(task_id, result, goal_id=goal_id, recurring=is_recurring)
@@ -1436,12 +1486,14 @@ def main():
                 requeue_recurring(task)
             discord_notify(f"✅ Done: {title} — {summary}")
             print(f"Task {task_id} completed.")
+            end_episode(episode_id, "completed", summary=summary, outcome=summary)
     except Exception as e:
         error_msg = str(e)
         print(f"Task {task_id} failed: {error_msg}", file=sys.stderr)
         mark_failed(task_id, error_msg, goal_id=task.get("goal_id"), original_task=task)
         log_activity("error", error_msg[:200], task_id=task_id)
         discord_notify(f"❌ Failed: {title} — {error_msg[:120]}")
+        end_episode(episode_id, "failed", outcome=error_msg)
         sys.exit(1)
 
 
