@@ -25,8 +25,16 @@ export function Chat() {
     setInput('');
     setLoading(true);
 
+    const now = Date.now();
+    // Notify AlertsPanel that message was sent
+    chrome.runtime.sendMessage({ type: 'MESSAGE_SENT' }).catch(() => {});
+    // Share message time with Dashboard via localStorage
+    try {
+      localStorage.setItem('lumen:discord:lastMessageTime', String(now));
+    } catch { /* may be unavailable */ }
+
     // Optimistic user message
-    const userMsg: ChatMessage = { role: 'user', content: text, timestamp: Date.now() };
+    const userMsg: ChatMessage = { role: 'user', content: text, timestamp: now };
     setMessages(prev => [...prev, userMsg]);
 
     try {
@@ -54,6 +62,13 @@ export function Chat() {
       e.preventDefault();
       send();
     }
+  };
+
+  const handleInputChange = (value: string) => {
+    setInput(value);
+    // Notify AlertsPanel of typing state
+    const isTyping = value.length > 0;
+    chrome.runtime.sendMessage({ type: 'TYPING_STATE', payload: { isTyping } }).catch(() => {});
   };
 
   return (
@@ -86,7 +101,7 @@ export function Chat() {
       <div class="chat-input-area">
         <textarea
           value={input}
-          onInput={(e) => setInput((e.target as HTMLTextAreaElement).value)}
+          onInput={(e) => handleInputChange((e.target as HTMLTextAreaElement).value)}
           onKeyDown={handleKeyDown}
           placeholder="Ask Lumen anything..."
           rows={1}
