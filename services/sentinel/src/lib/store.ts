@@ -120,7 +120,7 @@ export class NotificationStore {
     return { notifications: items.slice(0, limit), unreadCount, criticalCount };
   }
 
-  async queryHistory(opts: QueryOptions & { days?: number } = {}): Promise<HistoryResponse> {
+  async queryHistory(opts: QueryOptions & { days?: number; severity?: string } = {}): Promise<HistoryResponse> {
     const key = config.supabase.serviceKey || config.supabase.anonKey;
     if (!config.supabase.url || !key) {
       return { notifications: [], total: 0, offset: 0 };
@@ -148,7 +148,7 @@ export class NotificationStore {
         },
       });
       if (!res.ok) throw new Error(`Supabase ${res.status}`);
-      const rows: any[] = await res.json() as any[];
+      const rows = (await res.json()) as Array<Record<string, unknown>>;
       const totalHeader = res.headers.get('content-range');
       const total = totalHeader ? parseInt(totalHeader.split('/')[1] || '0', 10) : rows.length;
 
@@ -156,7 +156,7 @@ export class NotificationStore {
         id: r.id,
         source: r.source,
         severity: r.severity,
-        urgency: severityToUrgency(r.severity, r.category),
+        urgency: severityToUrgency(String(r.severity) as any, String(r.category)),
         status: r.status,
         title: r.title,
         body: r.body,
@@ -174,6 +174,37 @@ export class NotificationStore {
     } catch (err: any) {
       console.error('[store] history query failed:', err.message);
       return { notifications: [], total: 0, offset };
+    }
+  }
+
+  async archiveOld(): Promise<number> {
+    const key = config.supabase.serviceKey || config.supabase.anonKey;
+    if (!config.supabase.url || !key) return 0;
+
+    try {
+      const cutoff = new Date(Date.now() - 30 * 86_400_000).toISOString();
+      const url = `${config.supabase.url}/rest/v1/sentinel_notifications?status=eq.read&received_at=lt.${encodeURIComponent(cutoff)}`;
+
+      const res = await fetch(url, {
+        method: 'DELETE',
+        headers: {
+          'apikey': key,
+          'Authorization': `Bearer ${key}`,
+          'Prefer': 'count=exact',
+        },
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Supabase ${res.status}: ${text}`);
+      }
+
+      const countHeader = res.headers.get('content-range');
+      const count = countHeader ? parseInt(countHeader.split('/')[1] || '0', 10) : 0;
+      return count;
+    } catch (err: any) {
+      console.error('[store] archive failed:', err.message);
+      throw err;
     }
   }
 
@@ -258,9 +289,9 @@ export class NotificationStore {
           },
         });
         if (res.ok) {
-          const rows: any[] = await res.json();
+          const rows = (await res.json()) as Array<{ settings: NotificationSettings }>;
           if (rows.length > 0) {
-            this.settings = rows[0].settings as NotificationSettings;
+            this.settings = rows[0].settings;
             return this.settings;
           }
         }

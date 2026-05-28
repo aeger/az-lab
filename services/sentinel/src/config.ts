@@ -52,6 +52,10 @@ export const config = {
     model: process.env.NEMOTRON_MODEL || 'nvidia/nemotron-3-super-120b-a12b',
   },
 
+  podman: {
+    socketPath: process.env.PODMAN_SOCKET || '/run/podman/podman.sock',
+  },
+
   guardian: {
     enabled: process.env.GUARDIAN_ENABLED !== 'false',
   },
@@ -60,6 +64,7 @@ export const config = {
 export function isCollectorEnabled(name: string): boolean {
   switch (name) {
     case 'task_queue': return !!(config.supabase.url && config.supabase.anonKey);
+    case 'atlas_tasks': return !!(config.supabase.url && config.supabase.anonKey);
     case 'home_assistant': return !!(config.ha.url && config.ha.accessToken);
     case 'discord': return !!(config.discord.botToken && config.discord.channelId);
     case 'grafana': return !!(config.grafana.url && config.grafana.password);

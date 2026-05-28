@@ -20,13 +20,13 @@ export function notificationsRouter(store: NotificationStore, digest?: DigestSch
   // Persistent history from Supabase — survives API restarts
   router.get('/notifications/history', async (req, res) => {
     const source = req.query.source as NotificationSource | undefined;
-    const status = req.query.status as string | undefined;
-    const urgency = req.query.urgency as string | undefined;
+    const statusStr = req.query.status as string | undefined;
+    const status = (statusStr && ['unread', 'read', 'dismissed'].includes(statusStr) ? statusStr : undefined) as any;
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
     const offset = req.query.offset ? parseInt(req.query.offset as string, 10) : 0;
     const days = req.query.days ? parseInt(req.query.days as string, 10) : 7;
 
-    const result = await store.queryHistory({ source, status, urgency, limit, offset, days });
+    const result = await store.queryHistory({ source, status, limit, offset, days });
     res.json(result);
   });
 
@@ -46,7 +46,8 @@ export function notificationsRouter(store: NotificationStore, digest?: DigestSch
 
   router.post('/notifications/read-all', (req, res) => {
     const source = req.body?.source as NotificationSource | undefined;
-    const count = store.markAllRead(source);
+    const filter = source ? { source } : undefined;
+    const count = store.markAllRead(filter);
     res.json({ ok: true, count });
   });
 
