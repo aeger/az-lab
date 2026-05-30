@@ -49,6 +49,24 @@ export async function busGetStatus(): Promise<AgentBusStatus> {
   return busRequest<AgentBusStatus>('/health');
 }
 
+export interface SecurityStatus {
+  level: 'connected' | 'error' | 'disconnected' | 'unknown'; // → dot CSS class
+  score: number | null;
+}
+
+// Security posture for the status dot. Reads the scanner output via the bus
+// (/security). score >= 80 green, 60-79 amber, < 60 red, no data grey.
+export async function busGetSecurity(): Promise<SecurityStatus> {
+  try {
+    const { score } = await busRequest<{ score: number | null }>('/security');
+    if (typeof score !== 'number') return { level: 'unknown', score: null };
+    const level = score >= 80 ? 'connected' : score >= 60 ? 'error' : 'disconnected';
+    return { level, score };
+  } catch {
+    return { level: 'unknown', score: null };
+  }
+}
+
 export async function busSendDiscord(message: string, channel?: string): Promise<void> {
   // Use MCP endpoint for tool calls
   await busRequest('/mcp', {

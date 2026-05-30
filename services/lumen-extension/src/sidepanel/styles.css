@@ -72,6 +72,7 @@ body {
 .status-dot.error { background: var(--warning); }
 .status-dot.configured { background: var(--success); }
 .status-dot.missing_key { background: var(--text-muted); }
+.status-dot.unknown { background: var(--text-muted); }
 
 /* Tabs */
 .tabs {

@@ -7,7 +7,7 @@ import { runStartup } from './startup';
 import { chat, loadChatHistory, getChatHistory } from './claude';
 import { mcpHealthCheck } from './mcp-client';
 import { searchMemoriesKeyword, fetchPendingTasks, fetchTasks, createTask, upsertMemory } from './supabase';
-import { busHealthCheck } from './agent-bus';
+import { busHealthCheck, busGetSecurity } from './agent-bus';
 import { fetchSentinelNotifications, markSentinelRead, markAllSentinelRead } from './sentinel';
 
 // In-memory notification cache for this session
@@ -18,7 +18,8 @@ let agentStatus: AgentStatus = {
   memoryMcp: 'disconnected',
   supabase: 'disconnected',
   agentBus: 'disconnected',
-  anthropic: 'missing_key',
+  security: 'unknown',
+  securityScore: null,
 };
 
 // --- Install & Startup ---
@@ -64,12 +65,17 @@ chrome.runtime.onStartup.addListener(async () => {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARMS.heartbeat) {
     // Lightweight connectivity check
-    const [mcpOk, busOk] = await Promise.allSettled([
+    const [mcpOk, busOk, security] = await Promise.allSettled([
       mcpHealthCheck(),
       busHealthCheck(),
+      busGetSecurity(),
     ]);
     agentStatus.memoryMcp = (mcpOk.status === 'fulfilled' && mcpOk.value) ? 'connected' : 'disconnected';
     agentStatus.agentBus = (busOk.status === 'fulfilled' && busOk.value) ? 'connected' : 'disconnected';
+    if (security.status === 'fulfilled') {
+      agentStatus.security = security.value.level;
+      agentStatus.securityScore = security.value.score;
+    }
   }
 
   if (alarm.name === ALARMS.taskPoll) {
