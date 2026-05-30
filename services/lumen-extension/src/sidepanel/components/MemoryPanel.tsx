@@ -1,11 +1,26 @@
-import { useState } from 'preact/hooks';
+import { useState, useEffect } from 'preact/hooks';
 import type { Memory } from '../../shared/types';
+
+// Cache the last memory search so results survive sidebar close / page refresh.
+const CACHE_KEY = 'lumen_memory_search';
+const MAX_CACHED = 30;
 
 export function MemoryPanel() {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<Memory[]>([]);
   const [loading, setLoading] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
+
+  // Restore the last search (query + results) on mount.
+  useEffect(() => {
+    chrome.storage.local.get(CACHE_KEY).then((stored) => {
+      const cached = stored[CACHE_KEY];
+      if (cached && Array.isArray(cached.results)) {
+        if (typeof cached.query === 'string') setQuery(cached.query);
+        setResults(cached.results);
+      }
+    }).catch(() => {});
+  }, []);
 
   const search = async () => {
     if (!query.trim()) return;
@@ -17,6 +32,10 @@ export function MemoryPanel() {
       });
       if (res?.type === 'MEMORY_RESULTS') {
         setResults(res.payload);
+        // Persist (capped) so it survives close/refresh.
+        chrome.storage.local.set({
+          [CACHE_KEY]: { query: query.trim(), results: res.payload.slice(0, MAX_CACHED), ts: Date.now() },
+        }).catch(() => {});
       }
     } catch {
       setResults([]);

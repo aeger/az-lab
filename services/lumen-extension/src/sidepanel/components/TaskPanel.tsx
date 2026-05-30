@@ -8,6 +8,8 @@ export function TaskPanel() {
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<string>('active');
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
+  const [sortBy, setSortBy] = useState<'priority' | 'newest' | 'oldest' | 'status'>('priority');
 
   const [showForm, setShowForm] = useState(false);
   const [title, setTitle] = useState('');
@@ -114,6 +116,33 @@ export function TaskPanel() {
     fontFamily: 'inherit',
   } as const;
 
+  // Client-side text search (title/description/tags) + sort over the loaded tasks.
+  const visibleTasks = (() => {
+    const q = search.trim().toLowerCase();
+    let list = q
+      ? tasks.filter((t) =>
+          t.title?.toLowerCase().includes(q) ||
+          t.description?.toLowerCase().includes(q) ||
+          t.tags?.some((tag) => tag.toLowerCase().includes(q)))
+      : tasks;
+    list = [...list];
+    switch (sortBy) {
+      case 'priority':
+        list.sort((a, b) => (a.priority - b.priority) || (b.updated_at ?? '').localeCompare(a.updated_at ?? ''));
+        break;
+      case 'newest':
+        list.sort((a, b) => (b.updated_at ?? b.created_at ?? '').localeCompare(a.updated_at ?? a.created_at ?? ''));
+        break;
+      case 'oldest':
+        list.sort((a, b) => (a.created_at ?? '').localeCompare(b.created_at ?? ''));
+        break;
+      case 'status':
+        list.sort((a, b) => (a.status ?? '').localeCompare(b.status ?? ''));
+        break;
+    }
+    return list;
+  })();
+
   return (
     <>
       <div class="search-bar">
@@ -152,6 +181,34 @@ export function TaskPanel() {
         <button onClick={loadTasks} disabled={loading}>
           {loading ? '...' : 'Refresh'}
         </button>
+      </div>
+
+      <div class="search-bar" style={{ paddingTop: 0 }}>
+        <input
+          type="text"
+          value={search}
+          onInput={(e) => setSearch((e.target as HTMLInputElement).value)}
+          placeholder="Search title, description, tags…"
+          style={{ flex: 2 }}
+        />
+        <select
+          value={sortBy}
+          onChange={(e) => setSortBy((e.target as HTMLSelectElement).value as typeof sortBy)}
+          style={{
+            flex: 1,
+            background: 'var(--bg-tertiary)',
+            color: 'var(--text-primary)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            padding: '6px 8px',
+            fontSize: '12px',
+          }}
+        >
+          <option value="priority">Priority</option>
+          <option value="newest">Newest</option>
+          <option value="oldest">Oldest</option>
+          <option value="status">Status</option>
+        </select>
       </div>
 
       {showForm && (
@@ -263,10 +320,12 @@ export function TaskPanel() {
       )}
 
       <div style={{ flex: 1, overflowY: 'auto' }}>
-        {tasks.length === 0 && !loading && (
-          <div class="empty">No {filter || ''} tasks</div>
+        {visibleTasks.length === 0 && !loading && (
+          <div class="empty">
+            {search.trim() ? 'No tasks match your search' : `No ${filter || ''} tasks`}
+          </div>
         )}
-        {tasks.map((task) => (
+        {visibleTasks.map((task) => (
           <div
             key={task.id}
             class="list-item"
