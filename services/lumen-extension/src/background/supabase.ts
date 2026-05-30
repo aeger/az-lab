@@ -126,14 +126,24 @@ export async function upsertMemory(memory: {
 
 // --- Task Queue ---
 
-export async function fetchTasks(status?: string, limit = 20): Promise<Task[]> {
-  let path = `task_queue?select=*&order=priority.asc,created_at.asc&limit=${limit}`;
-  if (status) path += `&status=eq.${status}`;
+// Statuses considered "active" (not terminal/parked) for the default Tasks view + badge.
+const TERMINAL_STATUSES = ['completed', 'cancelled', 'archived'];
+
+export async function fetchTasks(status?: string, limit = 50): Promise<Task[]> {
+  // Exclude archived rows always; order newest-first so recent work is on top
+  // (the old priority.asc,created_at.asc buried current tasks under ancient ones).
+  let path = `task_queue?select=*&archived_at=is.null&order=priority.asc,updated_at.desc&limit=${limit}`;
+  if (status === 'active') {
+    path += `&status=not.in.(${TERMINAL_STATUSES.join(',')})`;
+  } else if (status) {
+    path += `&status=eq.${status}`;
+  }
   return supabaseRead<Task[]>(path);
 }
 
+// Active (non-terminal) tasks — drives the toolbar badge count.
 export async function fetchPendingTasks(): Promise<Task[]> {
-  return fetchTasks('pending');
+  return fetchTasks('active');
 }
 
 export async function createTask(task: {

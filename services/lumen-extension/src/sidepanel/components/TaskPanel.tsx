@@ -4,7 +4,7 @@ import type { Task } from '../../shared/types';
 export function TaskPanel() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(true);
-  const [filter, setFilter] = useState<string>('pending');
+  const [filter, setFilter] = useState<string>('active');
   const [expanded, setExpanded] = useState<string | null>(null);
 
   const loadTasks = async () => {
@@ -31,11 +31,17 @@ export function TaskPanel() {
 
   const statusColor = (s: string) => {
     const colors: Record<string, string> = {
+      ready: 'var(--warning)',
       pending: 'var(--warning)',
       in_progress: 'var(--accent)',
+      review_needed: 'var(--accent)',
+      blocked: 'var(--error)',
+      paused: 'var(--text-muted)',
+      escalated: 'var(--error)',
       completed: 'var(--success)',
       failed: 'var(--error)',
       cancelled: 'var(--text-muted)',
+      archived: 'var(--text-muted)',
     };
     return colors[s] ?? 'var(--text-muted)';
   };
@@ -56,11 +62,16 @@ export function TaskPanel() {
             fontSize: '13px',
           }}
         >
-          <option value="">All</option>
-          <option value="pending">Pending</option>
+          <option value="active">Active</option>
+          <option value="ready">Ready</option>
           <option value="in_progress">In Progress</option>
+          <option value="review_needed">Review Needed</option>
+          <option value="blocked">Blocked</option>
+          <option value="paused">Paused</option>
           <option value="completed">Completed</option>
           <option value="failed">Failed</option>
+          <option value="cancelled">Cancelled</option>
+          <option value="">All</option>
         </select>
         <button onClick={loadTasks} disabled={loading}>
           {loading ? '...' : 'Refresh'}
