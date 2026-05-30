@@ -27,6 +27,8 @@ export const STORAGE_KEYS = {
   lastNotifId: 'lumen_last_notif_id',        // dedup: last seen notification receivedAt
   soundPrefs: 'lumen_sound_prefs',           // per-urgency sound preferences
   notifHistory: 'lumen_notif_history',       // local notification cache
+  actionLog: 'lumen_action_log',             // recent permissioned-action audit trail
+  sessionPermissions: 'lumen_session_perms', // session-scoped allow-list (cleared on restart)
 } as const;
 
 // Alarm names (chrome.alarms for periodic tasks)

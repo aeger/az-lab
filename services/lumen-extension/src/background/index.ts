@@ -4,11 +4,12 @@ import { AGENT_NAME, ALARMS, STORAGE_KEYS } from '../shared/config';
 import type { LumenMessage, BackgroundResponse } from '../shared/messages';
 import type { AgentStatus, SoundPrefs, DEFAULT_SOUND_PREFS, SentinelNotification } from '../shared/types';
 import { runStartup } from './startup';
-import { chat, loadChatHistory, getChatHistory } from './claude';
+import { chat, loadChatHistory, ensureChatHistoryLoaded, getChatHistory } from './claude';
 import { mcpHealthCheck } from './mcp-client';
 import { searchMemoriesKeyword, fetchPendingTasks, fetchTasks, createTask, upsertMemory } from './supabase';
 import { busHealthCheck, busGetSecurity } from './agent-bus';
 import { fetchSentinelNotifications, markSentinelRead, markAllSentinelRead } from './sentinel';
+import { resolvePermission, getActionLog, clearSessionPermissions } from './actions';
 
 // In-memory notification cache for this session
 let cachedNotifications: SentinelNotification[] = [];
@@ -144,6 +145,9 @@ async function handleMessage(message: LumenMessage): Promise<BackgroundResponse>
       return { type: 'STATUS', payload: agentStatus };
 
     case 'GET_CHAT_HISTORY':
+      // SW may have recycled since last hydrate — pull from storage so the
+      // sidebar doesn't render an empty thread after a ~30s idle.
+      await ensureChatHistoryLoaded();
       return { type: 'CHAT_HISTORY', payload: getChatHistory() };
 
     case 'CHAT_SEND': {
@@ -159,8 +163,23 @@ async function handleMessage(message: LumenMessage): Promise<BackgroundResponse>
         } catch { /* content script not loaded */ }
       }
 
-      const reply = await chat(message.payload.message, pageContext);
+      const reply = await chat(message.payload.message, pageContext, Boolean(message.payload.allowActions));
       return { type: 'CHAT_RESPONSE', payload: reply };
+    }
+
+    case 'PERMISSION_RESPONSE': {
+      resolvePermission(message.payload.actionId, message.payload.decision);
+      return { type: 'STATUS', payload: agentStatus };
+    }
+
+    case 'GET_ACTION_LOG': {
+      const log = await getActionLog();
+      return { type: 'ACTION_LOG', payload: log };
+    }
+
+    case 'CLEAR_SESSION_PERMISSIONS': {
+      await clearSessionPermissions();
+      return { type: 'STATUS', payload: agentStatus };
     }
 
     case 'MEMORY_SEARCH': {
