@@ -17,10 +17,18 @@ Team:
 - Hermes = Agent Bus (port 8765)
 - You = ${AGENT_DISPLAY_NAME} (Edge browser extension)
 
-IMPORTANT — your actual capabilities in this chat:
-You are a TEXT-ONLY assistant. You do NOT have live tools in this chat panel. You cannot
-run queries, search memory, or fetch the task list yourself from within a reply. The Lumen
-extension UI handles live data in its own tabs:
+IMPORTANT — your actual capabilities in this chat (state these accurately, never oversell):
+- **Seeing the page:** When the user has "Include page context" enabled (it's on by default),
+  you receive the current tab's URL, title, any selected text, AND the page's visible text
+  (truncated) as a [Page content …] block. So you CAN read and discuss what's on the page the
+  user is viewing. If no [Page content] block is present, context is off — ask them to toggle it
+  on rather than guessing.
+- **What you CANNOT do:** you cannot see rendered visuals/layout, screenshots, images, or the
+  browser console; you cannot click, type, scroll, or otherwise *interact* with the page
+  (interaction-with-permission is planned but not built yet). Don't claim you can.
+- You do NOT have live query tools in this chat panel. You cannot run DB queries, search memory,
+  or fetch the task list yourself from within a reply. The Lumen extension UI handles live data
+  in its own tabs:
 - The **Tasks** tab reads the \`task_queue\` Postgres table directly (statuses like ready,
   in_progress, review_needed, blocked, paused, completed). That is where tasks live and are shown.
 - The **Memory** tab and context-menu "Save to Lumen memory" handle the shared Supabase
@@ -65,15 +73,6 @@ export async function chat(
 ): Promise<ChatMessage> {
   const config = await getConfig();
 
-  // Build user message with page context
-  let fullMessage = userMessage;
-  if (pageContext) {
-    fullMessage += `\n\n[Current page: ${pageContext.title} — ${pageContext.url}]`;
-    if (pageContext.selection) {
-      fullMessage += `\n[Selected text: ${pageContext.selection}]`;
-    }
-  }
-
   // Add to history
   const userMsg: ChatMessage = {
     role: 'user',
@@ -88,13 +87,20 @@ export async function chat(
   const feedbackRules = (stored[STORAGE_KEYS.feedbackMemories] ?? []).join('\n\n');
   const systemPrompt = SYSTEM_PROMPT.replace('{FEEDBACK_RULES}', feedbackRules || '(none loaded yet — run startup)');
 
-  // Build messages for API
-  const messages = chatHistory.map((msg) => ({
-    role: msg.role as 'user' | 'assistant',
-    content: msg.role === 'user' && msg.pageContext
-      ? `${msg.content}\n\n[Page: ${msg.pageContext.title} — ${msg.pageContext.url}]${msg.pageContext.selection ? `\n[Selection: ${msg.pageContext.selection}]` : ''}`
-      : msg.content,
-  }));
+  // Build messages for API. Page title/URL/selection ride along on every turn that
+  // had context; the full visible page text is attached ONLY to the most recent
+  // message so history doesn't balloon with stale page dumps.
+  const lastIdx = chatHistory.length - 1;
+  const messages = chatHistory.map((msg, i) => {
+    if (msg.role === 'user' && msg.pageContext) {
+      const pc = msg.pageContext;
+      let suffix = `\n\n[Page: ${pc.title} — ${pc.url}]`;
+      if (pc.selection) suffix += `\n[Selection: ${pc.selection}]`;
+      if (i === lastIdx && pc.text) suffix += `\n[Page content (visible text):\n${pc.text}\n]`;
+      return { role: msg.role as 'user' | 'assistant', content: `${msg.content}${suffix}` };
+    }
+    return { role: msg.role as 'user' | 'assistant', content: msg.content };
+  });
 
   try {
     // Route through Agent Bus — no API key needed in the browser

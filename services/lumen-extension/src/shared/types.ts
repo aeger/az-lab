@@ -44,6 +44,7 @@ export interface PageContext {
   title: string;
   selection?: string;
   metaDescription?: string;
+  text?: string; // visible page innerText (truncated) — lets Lumen "see" the page
   tabId: number;
 }
 
