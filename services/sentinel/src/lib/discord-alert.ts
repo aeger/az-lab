@@ -29,7 +29,7 @@ export interface DigestSummary {
 
 export class DiscordAlerter {
   private get enabled(): boolean {
-    return !!(config.discord.botToken && config.discord.alertChannelId);
+    return !!(config.discord.webhookUrl || (config.discord.botToken && config.discord.alertChannelId));
   }
 
   async sendAlert(n: SentinelNotification): Promise<void> {
@@ -166,6 +166,27 @@ export class DiscordAlerter {
   }
 
   private async post(body: unknown): Promise<void> {
+    // Primary: the "Dashboard" webhook — keeps automated alerts visually distinct
+    // from Wren's conversational (bot-token) replies. Sub-labelled per source.
+    if (config.discord.webhookUrl) {
+      const payload =
+        typeof body === 'object' && body !== null
+          ? { username: 'Dashboard · Sentinel', ...(body as Record<string, unknown>) }
+          : body;
+      const res = await fetch(config.discord.webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      // Webhook success is 204 (or 200 with ?wait=true)
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Discord webhook send failed ${res.status}: ${text}`);
+      }
+      return;
+    }
+
+    // Fallback: bot API (posts as the bot/Wren identity — not ideal, but delivers)
     const res = await fetch(
       `${DISCORD_API}/channels/${config.discord.alertChannelId}/messages`,
       {

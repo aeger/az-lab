@@ -49,6 +49,7 @@ async function main() {
   const discord = new DiscordNotifier({
     botToken: config.discordBotToken,
     channelId: config.discordChannelId,
+    webhookUrl: config.discordWebhookUrl,
     fallbackLogFile: config.logFile,
   });
   const supabase = new SupabaseReporter({

@@ -21,6 +21,10 @@ export const config = {
     pollInterval: parseInt(process.env.POLL_DISCORD || '60000', 10),
     // Outbound alerts — defaults to same channel as the collector
     alertChannelId: process.env.DISCORD_ALERT_CHANNEL_ID || process.env.DISCORD_CHANNEL_ID || '',
+    // Outbound alerts post via the "Dashboard" webhook so automated alerts are
+    // visually distinct from Wren's conversational (bot-token) replies. Falls back
+    // to the bot API if unset. Reading the channel still uses the bot token.
+    webhookUrl: process.env.DISCORD_WEBHOOK_URL || '',
     // Breaking news: push critical (or warning+) notifications to Discord immediately
     breakingAlertsEnabled: process.env.BREAKING_ALERTS_ENABLED !== 'false',
     breakingSeverity: (process.env.BREAKING_SEVERITY || 'critical') as 'critical' | 'warning',

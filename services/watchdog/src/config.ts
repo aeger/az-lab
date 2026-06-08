@@ -20,6 +20,7 @@ export interface WatchdogConfig {
   logFile: string;
   discordChannelId: string;
   discordBotToken: string;
+  discordWebhookUrl: string;
   supabaseUrl: string;
   supabaseServiceKey: string;
   dashboardPort: number;
@@ -62,6 +63,18 @@ async function loadDiscordToken(): Promise<string> {
   return vars['BOT_TOKEN'] ?? '';
 }
 
+/** Load the "Dashboard" webhook URL from ~/claude/agent-bus/discord_webhooks.json */
+async function loadWebhookUrl(): Promise<string> {
+  const cfg = path.join(os.homedir(), 'claude', 'agent-bus', 'discord_webhooks.json');
+  try {
+    const raw = await fs.readFile(cfg, 'utf8');
+    const map = JSON.parse(raw) as Record<string, string>;
+    return map['claude-code'] ?? '';
+  } catch {
+    return '';
+  }
+}
+
 export async function loadConfig(): Promise<WatchdogConfig> {
   // Load watchdog.env if present
   const watchdogDir = expandHome(process.env['WATCHDOG_DIR'] ?? '~/.wren-watchdog');
@@ -95,6 +108,13 @@ export async function loadConfig(): Promise<WatchdogConfig> {
     discordBotToken = await loadDiscordToken();
   }
 
+  // Webhook for automated alerts (posts as "Dashboard"); env override, else the
+  // shared webhook map. Falls back to the bot token at send time if empty.
+  let discordWebhookUrl = get('DISCORD_WEBHOOK_URL', '');
+  if (!discordWebhookUrl) {
+    discordWebhookUrl = await loadWebhookUrl();
+  }
+
   return {
     staleThresholdSec,
     canaryTimeoutSec,
@@ -108,6 +128,7 @@ export async function loadConfig(): Promise<WatchdogConfig> {
     logFile: path.join(watchdogDir, 'watchdog-ts.log'),
     discordChannelId,
     discordBotToken,
+    discordWebhookUrl,
     supabaseUrl,
     supabaseServiceKey,
     dashboardPort,
