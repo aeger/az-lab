@@ -33,6 +33,7 @@ const COMPOSE_MAP: Record<string, [string, string]> = {
   'az-gmail-mcp':            ['gmail-mcp-server', 'az-gmail-mcp'],
   'az-memory-mcp':           ['memory-mcp-server', 'memory-mcp'],
   'az-ms-smtp-relay':        ['ms-smtp-relay', 'az-ms-smtp-relay'],
+  'ollama':                  ['ollama', 'ollama'],
 }
 
 const SERVICES_DIR = '/home/almty1/azlab/services'

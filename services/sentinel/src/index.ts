@@ -104,6 +104,23 @@ if (config.discord.breakingAlertsEnabled && config.discord.alertChannelId) {
   console.log(`[atlas-task-alert] enabled${atlasMention ? ` — mention: ${atlasMention}` : ''}`);
 }
 
+// discord_notify pings: any notification flagged with metadata.discord_notify gets a Discord
+// alert regardless of the breaking-alert severity threshold (used by the ingest endpoint, e.g.
+// the desktop Lumen auto-updater). Skip if breaking-alert already sent it.
+{
+  const severityRank: Record<string, number> = { info: 1, warning: 2, critical: 3 };
+  const threshold = severityRank[config.discord.breakingSeverity] ?? 3;
+  const breakingActive = config.discord.breakingAlertsEnabled && !!config.discord.alertChannelId;
+
+  store.onNew(n => {
+    if (!n.metadata?.discord_notify) return;
+    if (n.source === 'task_queue' && n.metadata?.atlas_notify) return; // atlas-task handled it
+    if (breakingActive && (severityRank[n.severity] ?? 0) >= threshold) return; // breaking-alert handled it
+    alerter.sendAlert(n).catch(err => console.error('[discord-notify] failed to send:', err.message));
+  });
+  console.log('[discord-notify] enabled');
+}
+
 // Build collectors
 const collectors = [
   {

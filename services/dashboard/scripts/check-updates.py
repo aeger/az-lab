@@ -54,30 +54,22 @@ def get_remote_digest(image):
             pass
     return None
 
-def check_update_via_pull(container_name, image):
+def check_update_via_manifest(container_name, image):
     """
-    Pull the image and compare the new ID with the running container's image ID.
-    Returns True if an update was pulled.
+    Compare local image digest with remote manifest digest without pulling.
+    Returns True if an update is available.
     """
-    # Get current image ID of running container
-    result = subprocess.run(
-        ['podman', 'inspect', container_name, '--format', '{{.Image}}'],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
+    local = get_local_digest(image)
+    if not local:
         return False
-    current_id = result.stdout.strip()
 
-    # Pull latest
-    result = subprocess.run(
-        ['podman', 'pull', '--quiet', image],
-        capture_output=True, text=True, timeout=120
-    )
-    if result.returncode != 0:
+    try:
+        remote = get_remote_digest(image)
+        if not remote:
+            return False
+        return local != remote
+    except Exception:
         return False
-    new_id = result.stdout.strip()
-
-    return bool(new_id) and new_id != current_id
 
 def main():
     containers = get_running_containers()
@@ -89,7 +81,7 @@ def main():
         image = c['image']
         print(f"  {name} ({image})...", end=' ', flush=True)
         try:
-            has_update = check_update_via_pull(name, image)
+            has_update = check_update_via_manifest(name, image)
             status = 'UPDATE' if has_update else 'current'
             print(status)
         except subprocess.TimeoutExpired:

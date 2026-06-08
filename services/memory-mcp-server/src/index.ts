@@ -902,6 +902,24 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 036 skipped:", err.message);
   }
+
+  // Migration 040: verified_at column + index + unverified_high_recall_memories() audit RPC.
+  // Tracks agent re-verification of high-recall memories; weekly audit job surfaces stale entries.
+  try {
+    const { data, error } = await supabase.rpc("apply_verified_at_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 040 RPC not yet registered — apply migrations/040_verified_at.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 040 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 040 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 040 skipped:", err.message);
+  }
 }
 
 // ── Staleness maintenance job (runs once at startup, then every 24h) ─────────
@@ -962,11 +980,89 @@ function startStalenessJob(supabase: any): void {
   setInterval(run, 24 * 60 * 60 * 1000);
 }
 
+// ── Weekly verification audit (Sun 05:00 UTC) ────────────────────────────────
+// Surfaces unverified high-recall memories (recall_count >= 10, importance >= 0.7,
+// verified_at NULL or > 30 days old) as a Wren task so agents can bulk-verify.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function startVerificationAuditJob(supabase: any): void {
+  const RECURRING_KEY = "memory_verification_audit";
+
+  const run = async () => {
+    try {
+      const { data, error } = await supabase.rpc("unverified_high_recall_memories", {
+        p_min_recall_count: 10,
+        p_min_importance: 0.7,
+        p_stale_days: 30,
+        p_limit: 100,
+      });
+      if (error) {
+        console.warn("[verify-audit] unverified_high_recall_memories error:", error.message);
+        return;
+      }
+      const rows = (data || []) as any[];
+      if (rows.length === 0) {
+        console.log("[verify-audit] All high-recall memories are fresh.");
+        return;
+      }
+
+      const { data: existingTask } = await supabase
+        .from("task_queue")
+        .select("id")
+        .eq("recurring_key", RECURRING_KEY)
+        .in("status", ["pending", "in_progress", "in_progress_agent"])
+        .maybeSingle();
+      if (existingTask) {
+        console.log(`[verify-audit] ${rows.length} candidates, but a review task is already open.`);
+        return;
+      }
+
+      const top = rows.slice(0, 10).map((r) => {
+        const age = r.verification_age_days == null
+          ? "never verified"
+          : `verified ${r.verification_age_days.toFixed(0)}d ago`;
+        return `• ${r.name} (recall:${r.recall_count}, imp:${(r.importance_score ?? 0).toFixed(2)}, ${age})`;
+      }).join("\n");
+
+      const { error: insertErr } = await supabase.from("task_queue").insert({
+        title: `Verify ${rows.length} high-recall memories`,
+        description:
+          `${rows.length} high-recall memories (recall_count >= 10, importance >= 0.7) have never been verified or were verified > 30 days ago. Re-read each, confirm still accurate, and call update_memory_verified(memory_id) to stamp verified_at=now(). Or update/forget if stale.\n\nTop candidates:\n${top}\n\nFull list: SELECT * FROM unverified_high_recall_memories();`,
+        priority: 3,
+        status: "pending",
+        source: "system",
+        target: "wren",
+        recurring_key: RECURRING_KEY,
+        tags: ["memory-hygiene", "auto-queued", "verification"],
+      });
+      if (insertErr) console.warn("[verify-audit] task insert failed:", insertErr.message);
+      else console.log(`[verify-audit] Queued Wren task for ${rows.length} unverified high-recall memories`);
+    } catch (err: any) {
+      console.warn("[verify-audit] job error:", err.message);
+    }
+  };
+
+  // Check every hour; only run the audit when it's Sunday between 05:00 and 06:00 UTC
+  // and we haven't already enqueued this week (recurring_key uniqueness handles that).
+  let lastRunIso: string | null = null;
+  const tick = () => {
+    const now = new Date();
+    const isSunday = now.getUTCDay() === 0;
+    const hour = now.getUTCHours();
+    if (!isSunday || hour !== 5) return;
+    const dayKey = now.toISOString().slice(0, 10);
+    if (lastRunIso === dayKey) return;
+    lastRunIso = dayKey;
+    run();
+  };
+  tick();
+  setInterval(tick, 60 * 60 * 1000);
+}
+
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.9.0",
+    version: "5.10.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -1051,7 +1147,11 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (embedding) update.embedding = JSON.stringify(embedding);
         if (importance_score !== undefined) update.importance_score = importance_score;
         if (confidence !== undefined) update.confidence = confidence;
-        if (agent_id) update.agent_id = agent_id;
+        if (agent_id) {
+          update.agent_id = agent_id;
+          // Update provenance with contributing_agent (REC3, arXiv 2505.18279)
+          update.provenance = { contributing_agent: agent_id };
+        }
         if (visibility) update.visibility = visibility;
         if (agent_scope) update.agent_scope = agent_scope;
         if (memory_class) update.memory_class = memory_class;
@@ -1089,20 +1189,24 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         return { content: [{ type: "text" as const, text: `Updated memory "${name}" (${type})${embedNote}.${linkNote}${updateConflictNote}` }] };
       }
 
-      // ── AMAC novelty admission gate: skip near-duplicate writes from agent overlap ─
-      // novelty < 0.3 (cosine ≥ 0.7) is the spec; we use a stricter cosine ≥ 0.85 + same-type
-      // hard skip to avoid false-merge into the wrong memory. The 0.7-0.85 band is left to mem0.
+      // ── AMAC novelty admission gate (REC #1, 2026-05-31 triage; A-MAC ICLR 2026) ──
+      // Hard auto-reject when cosine ≥ 0.92 vs a same-type memory and flag the
+      // existing twin (conflict_flagged=true) so the operator can review the
+      // near-duplicate. match_memories is the single-embedding analogue of
+      // find_duplicate_memories (which operates corpus-wide on pairs).
+      // The 0.7–0.92 band is left to mem0Resolve below.
       if (embedding) {
         const { data: novCheck } = await supabase.rpc("match_memories", {
           query_embedding: JSON.stringify(embedding),
-          match_threshold: 0.85,
+          match_threshold: 0.92,
           match_count: 1,
         });
         const top = (novCheck as any[] | null)?.[0];
-        if (top && top.type === type && top.similarity >= 0.85) {
+        if (top && top.type === type && top.similarity >= 0.92) {
           const novelty = (1 - top.similarity).toFixed(3);
-          console.log(`[novelty] SKIP "${name}": novelty=${novelty} vs "${top.name}" (cosine=${top.similarity.toFixed(3)})`);
-          return { content: [{ type: "text" as const, text: `Skipped: novelty=${novelty} (cosine=${top.similarity.toFixed(3)}) — content overlaps existing ${type} memory "${top.name}". Update that memory or use a more distinct name to force a new entry.` }] };
+          await supabase.from("memories").update({ conflict_flagged: true }).eq("id", top.id);
+          console.log(`[novelty] REJECT "${name}": novelty=${novelty} vs "${top.name}" (cosine=${top.similarity.toFixed(3)}) — flagged twin for review`);
+          return { content: [{ type: "text" as const, text: `Rejected: novelty=${novelty} (cosine=${top.similarity.toFixed(3)}) — near-duplicate of existing ${type} memory "${top.name}" (flagged for review). Update that memory or use a more distinct name to force a new entry.` }] };
         }
       }
 
@@ -1147,7 +1251,11 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (agent_id) insert.agent_id = agent_id;
       if (visibility) insert.visibility = visibility;
       if (agent_scope) insert.agent_scope = agent_scope;
-      if (memory_class) insert.memory_class = memory_class;
+      // Default memory_class so p_memory_class filtering in hybrid_recall
+      // doesn't silently drop new rows (Rec #4, 2026-05-29 audit).
+      insert.memory_class = memory_class || "semantic";
+      // Collaborative Memory provenance: track contributing agent (REC3, arXiv 2505.18279)
+      insert.provenance = agent_id ? { contributing_agent: agent_id } : {};
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
@@ -1188,26 +1296,41 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       type: z.enum(["user", "feedback", "project", "reference"]).optional().describe("Filter by memory type"),
       tags: z.array(z.string()).optional().describe("Filter by tags (any match)"),
       limit: z.number().optional().describe("Max results (default 10)"),
-      semantic: z.boolean().optional().describe("Force semantic search (default: true when Ollama available)"),
+      semantic: z.boolean().optional().describe("[DEPRECATED — use recall_mode] Force semantic search (default: true when Ollama available). Kept for back-compat; recall_mode takes precedence when set."),
+      recall_mode: z.enum(["hybrid", "semantic", "lexical"]).optional().describe("Retrieval mode (default 'hybrid'). 'hybrid' = pgvector cosine + BM25 (search_vec weighted + search_vector plain) + topic_hint + trigram via RRF k=60. 'semantic' = vector cosine only (skip BM25/trgm lanes). 'lexical' = BM25 + trigram only (skip embedding lane — useful when query is exact tokens like hostnames, function names, error codes)."),
       agent_id: z.string().optional().describe("Filter by agent ownership: returns shared memories + private memories owned by this agent_id. Omit to return all shared memories."),
       agent_scope: z.string().optional().describe("Filter by agent_scope array: pass agent name (e.g. 'wren') to see only memories scoped to 'shared' or this agent. Requires migration 012."),
       min_confidence: z.number().min(0).max(1).optional().describe("Exclude memories with confidence below this threshold (default 0.0 = return all). Use 0.5 to hide speculative/unverified memories."),
       memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Filter by memory class. episodic=event log, semantic=durable facts (default for most), procedural=skills/how-to, working=short-term context."),
     },
-    async ({ query, topic_hint, type, tags, limit, semantic, agent_id, agent_scope, min_confidence, memory_class }) => {
+    async ({ query, topic_hint, type, tags, limit, semantic, recall_mode, agent_id, agent_scope, min_confidence, memory_class }) => {
       const maxResults = limit || 10;
+
+      // recall_mode supersedes the legacy `semantic` boolean. Default to 'hybrid'.
+      const effectiveMode: "hybrid" | "semantic" | "lexical" =
+        recall_mode ?? (semantic === false ? "lexical" : "hybrid");
 
       // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled.
       // hybrid_recall with null embedding degrades gracefully to BM25-only (tsvector ts_rank),
       // ensuring BM25 is always used for text queries even when Ollama is unavailable.
-      if (query && semantic !== false) {
-        const queryEmbedding = await embed(query);
-        const hybridMode = queryEmbedding ? "hybrid BM25+vector" : "BM25-only";
+      if (query) {
+        // Mode routing:
+        //  - 'semantic' → only vector lane (pass empty query_text so BM25/trgm lanes drop out; skip topic_hint)
+        //  - 'lexical'  → only BM25/trgm lanes (force null embedding)
+        //  - 'hybrid'   → both (current behavior)
+        const wantsVector  = effectiveMode !== "lexical";
+        const wantsLexical = effectiveMode !== "semantic";
+        const queryEmbedding = wantsVector ? await embed(query) : null;
+        const lexicalQueryText = wantsLexical ? query : " "; // single space → empty plainto_tsquery → all lexical lanes drop
+        const hybridMode =
+          effectiveMode === "semantic" ? "semantic-only"
+          : effectiveMode === "lexical" ? "lexical-only (BM25+trgm)"
+          : (queryEmbedding ? "hybrid BM25+vector" : "BM25-only");
         // Build RPC params — only include p_agent_id when agent isolation is needed.
         // Omitting it lets the call succeed against the 5-param DB function (migration 009)
         // while remaining forward-compatible with the 6-param version (migration 010).
         const rpcParams: Record<string, unknown> = {
-          p_query_text: query,
+          p_query_text: lexicalQueryText,
           p_query_embedding: queryEmbedding ? JSON.stringify(queryEmbedding) : null,
           p_match_threshold: queryEmbedding ? 0.3 : 0.0,
           p_match_count: maxResults * 2, // wider pool, filter below
@@ -1217,8 +1340,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (agent_scope) rpcParams.p_agent_scope = agent_scope;
         if (min_confidence && min_confidence > 0) rpcParams.p_min_confidence = min_confidence;
         if (memory_class) rpcParams.p_memory_class = memory_class;
-        // Active Retrieval (MIRIX): topic_hint is the highest-weight RRF lane
-        if (topic_hint && topic_hint.trim().length > 0) rpcParams.p_topic_hint = topic_hint.trim();
+        // Active Retrieval (MIRIX): topic_hint is the highest-weight RRF lane.
+        // Semantic-only mode skips the hint so results stay purely embedding-driven.
+        if (wantsLexical && topic_hint && topic_hint.trim().length > 0) rpcParams.p_topic_hint = topic_hint.trim();
         const { data, error } = await supabase.rpc("hybrid_recall", rpcParams);
 
         if (!error && data && data.length > 0) {
@@ -1246,6 +1370,19 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
 
           if (filtered.length > 0) {
             await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
+
+            // Attach verified_at to each result so the display can show verification age.
+            const verifiedRows = await supabase
+              .from("memories")
+              .select("id, verified_at")
+              .in("id", filtered.map((m: any) => m.id));
+            const verifiedMap: Record<string, string | null> = {};
+            for (const row of (verifiedRows.data || []) as any[]) {
+              verifiedMap[row.id] = row.verified_at;
+            }
+            for (const m of filtered as any[]) {
+              m.verified_at = verifiedMap[m.id] ?? null;
+            }
 
             // Skill-memory auto-linking: fire-and-forget, threshold 0.75 cosine
             // Upserts skill_memory_links rows for skills semantically close to recalled memories.
@@ -1336,7 +1473,14 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
               const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
               const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
               const staleFlag = m.staleness_candidate ? " [stale?]" : "";
-              return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${confidenceStr}${trust}${conflictFlag}${staleFlag}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
+              let verifyStr = "";
+              if (m.verified_at) {
+                const ageDays = (Date.now() - new Date(m.verified_at).getTime()) / 86400000;
+                verifyStr = ` verified:${ageDays.toFixed(0)}d`;
+              } else if ((m.access_count || 0) >= 10 && (m.importance_score || 0) >= 0.7) {
+                verifyStr = " verified:never";
+              }
+              return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${confidenceStr}${trust}${conflictFlag}${staleFlag}${verifyStr}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
             });
 
             // Append temporal/causal boosted extras not already in results
@@ -2117,6 +2261,36 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
     }
   );
 
+  // ── Tool: update_memory_verified ─────────────────────────────────────────────
+  server.tool(
+    "update_memory_verified",
+    "Stamp verified_at=now() on a memory after re-reading it and confirming the content is still accurate. Resets the verification clock used by the weekly audit of high-recall memories. Pass either memory_id (UUID) or name.",
+    {
+      memory_id: z.string().optional().describe("UUID of the memory to mark verified"),
+      name: z.string().optional().describe("Exact memory name (used if memory_id not provided)"),
+    },
+    async ({ memory_id, name }) => {
+      let id = memory_id;
+      let resolvedName = name || memory_id;
+      if (!id) {
+        if (!name) return { content: [{ type: "text" as const, text: "Provide memory_id or name." }] };
+        const { data: row, error: lookupErr } = await supabase
+          .from("memories")
+          .select("id, name")
+          .eq("name", name)
+          .maybeSingle();
+        if (lookupErr) return { content: [{ type: "text" as const, text: `Lookup error: ${lookupErr.message}` }] };
+        if (!row) return { content: [{ type: "text" as const, text: `Memory "${name}" not found.` }] };
+        id = row.id;
+        resolvedName = row.name;
+      }
+      const { data, error } = await supabase.rpc("update_memory_verified", { p_memory_id: id });
+      if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
+      console.log(`[aip] update_memory_verified "${resolvedName}" by ${callerIdentity || "unverified"}`);
+      return { content: [{ type: "text" as const, text: `Verified "${resolvedName}" at ${data}.` }] };
+    }
+  );
+
   // ── Tool: discard_redundant ──────────────────────────────────────────────────
   server.tool(
     "discard_redundant",
@@ -2449,7 +2623,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 10; // +10: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant + check_stale_context + update_read_watermark; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.9.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.10.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -2519,12 +2693,13 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 });
 
 app.listen(PORT, "0.0.0.0", async () => {
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 8;
-  console.log(`Memory MCP Server v5.9.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 9;
+  console.log(`Memory MCP Server v5.10.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
   startStalenessJob(supabase);
+  startVerificationAuditJob(supabase);
 });
 
 // ── Cross-agent memory sync (Supabase Realtime) ──────────────────────────────

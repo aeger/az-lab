@@ -41,7 +41,7 @@ from typing import Any
 # ── Config ────────────────────────────────────────────────────────────────────
 SUPABASE_URL = "https://ogqjjlbupqnvlcyrfnxi.supabase.co"
 ENV_FILE = Path.home() / "azlab/services/memory-mcp-server/.env"
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))  # was 30 — Supabase usage 2026-05-29
 USER_SYSTEMD_DIR = Path.home() / ".config/systemd/user"
 
 logging.basicConfig(
@@ -92,7 +92,10 @@ def rpc(name: str, params: dict) -> Any:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
+            body = resp.read()
+            if not body:
+                return None  # void-returning function
+            return json.loads(body)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         log.error(f"RPC {name} failed: {e.code} {body[:200]}")
@@ -526,12 +529,115 @@ def auto_unpause(rows: list[dict]) -> None:
             log.warning(f"auto-unpause failed for {row['name']}: {e}")
 
 
+# ── systemd run-history poll ─────────────────────────────────────────────────
+#
+# The reconcile_* handlers only push registry → native. They never read native
+# run results back. That left last_run_at/runs[] frozen at whatever value the
+# seed script wrote (e.g. R2 backup stuck at 2026-04-30). This poll closes the
+# loop for systemd-backed activities (kind=systemd and kind=agent_loop, since
+# agent_loop's source_ref.service is also a systemd unit).
+
+def _systemd_service_for_row(row: dict) -> str | None:
+    """Map a row's source_ref to the .service unit that actually does work."""
+    if row["kind"] == "agent_loop":
+        svc = row["source_ref"].get("service")
+        return svc if svc and svc.endswith(".service") else None
+    unit = row["source_ref"].get("unit") or ""
+    if unit.endswith(".timer"):
+        return unit[:-6] + ".service"
+    if unit.endswith(".service"):
+        return unit
+    return None
+
+
+def _parse_systemd_ts(ts: str) -> str | None:
+    """`systemctl show` prints 'Wed 2026-05-28 02:00:08 UTC' or empty/'0' when
+    never run. Return ISO-8601 (UTC) or None."""
+    from datetime import datetime, timezone
+    s = (ts or "").strip()
+    if not s or s in {"0", "n/a"}:
+        return None
+    parts = s.split(None, 1)
+    if len(parts) == 2 and len(parts[0]) == 3:  # drop weekday
+        s = parts[1]
+    tokens = s.split()
+    try:
+        if len(tokens) >= 3 and tokens[2].upper() == "UTC":
+            return datetime.strptime(f"{tokens[0]} {tokens[1]}", "%Y-%m-%d %H:%M:%S")\
+                .replace(tzinfo=timezone.utc).isoformat()
+        return datetime.fromisoformat(s).isoformat()
+    except Exception:
+        return None
+
+
+def poll_systemd_run_history(row: dict) -> None:
+    """If the unit ran more recently than row.last_run_at, record it."""
+    if row["kind"] not in ("systemd", "agent_loop"):
+        return
+    service = _systemd_service_for_row(row)
+    if not service:
+        return
+    rc, out, _ = run([
+        "systemctl", "--user", "show", service,
+        "--property=ExecMainStartTimestamp,ExecMainExitTimestamp,Result",
+    ])
+    if rc != 0:
+        return
+    fields: dict[str, str] = {}
+    for ln in out.splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            fields[k] = v
+    start_iso = _parse_systemd_ts(fields.get("ExecMainStartTimestamp", ""))
+    exit_iso  = _parse_systemd_ts(fields.get("ExecMainExitTimestamp", ""))
+    # Only record completed runs (oneshot/agent_loop both populate ExecMainExitTimestamp on exit)
+    if not start_iso or not exit_iso:
+        return
+
+    from datetime import datetime
+    last = row.get("last_run_at")
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if datetime.fromisoformat(start_iso) <= last_dt:
+                return  # already recorded
+        except Exception:
+            pass
+
+    duration_sec: int | None = None
+    try:
+        sdt = datetime.fromisoformat(start_iso)
+        edt = datetime.fromisoformat(exit_iso)
+        duration_sec = max(0, int((edt - sdt).total_seconds()))
+    except Exception:
+        pass
+
+    result_word = (fields.get("Result") or "").strip() or "unknown"
+    status = "success" if result_word == "success" else "failed"
+    try:
+        rpc("record_scheduled_run", {
+            "p_name":           row["name"],
+            "p_status":         status,
+            "p_result_summary": f"systemd Result={result_word}",
+            "p_run_at":         start_iso,
+            "p_duration_sec":   duration_sec,
+            "p_notes":          None,
+        })
+        log.info(f"recorded systemd run for {row['name']}: status={status} run_at={start_iso} dur={duration_sec}s")
+    except Exception as e:
+        log.warning(f"record_scheduled_run failed for {row['name']}: {e}")
+
+
 def tick() -> None:
-    rows = rest_get("scheduled_activity?select=id,name,kind,schedule,enabled,paused_at,unpause_at,pause_reason,source_ref&order=name")
+    rows = rest_get("scheduled_activity?select=id,name,kind,schedule,enabled,paused_at,unpause_at,pause_reason,source_ref,last_run_at&order=name")
     log.debug(f"tick: {len(rows)} rows")
     auto_unpause(rows)
     for row in rows:
         reconcile_one(row)
+        try:
+            poll_systemd_run_history(row)
+        except Exception as e:
+            log.warning(f"poll_systemd_run_history failed for {row['name']}: {e}")
 
 
 def main() -> int:
