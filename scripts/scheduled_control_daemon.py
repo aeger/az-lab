@@ -167,16 +167,29 @@ SYSTEMD_DROPIN_FILE = "wren-override.conf"
 
 
 def systemd_current_schedule(unit: str) -> str | None:
-    """Return current native schedule string in the same encoding the registry uses."""
+    """Return current native schedule string in the same encoding the registry uses.
+
+    OnCalendar / OnUnitActiveSec are ADDITIVE across the base unit and its
+    drop-ins; an empty assignment (e.g. our drop-in's `OnCalendar=`) resets the
+    accumulated list. The effective value is therefore the LAST non-empty line,
+    not the first. Using re.search() here grabbed the base unit's original line
+    and never matched the drop-in we just wrote — causing reconcile_systemd to
+    rewrite the drop-in + daemon-reload + restart + audit on EVERY poll. (Fixed
+    2026-06-11 after recurring Supabase IO-budget blowout.)
+    """
     rc, txt, _ = run(["systemctl", "--user", "cat", unit])
     if rc != 0:
         return None
-    on_cal = re.search(r"^OnCalendar\s*=\s*(.+)$", txt, re.M)
-    on_act = re.search(r"^OnUnitActiveSec\s*=\s*(.+)$", txt, re.M)
-    if on_cal:
-        return f"oncalendar:{on_cal.group(1).strip()}"
-    if on_act:
-        return f"every:{on_act.group(1).strip()}"
+    # NOTE: use [ \t]* (not \s*) for inter-token whitespace — \s* matches
+    # newlines, so on our drop-in's empty `OnCalendar=` reset line it would
+    # swallow the following line and capture "OnCalendar=..." literally,
+    # permanently breaking the comparison.
+    cals = [m.strip() for m in re.findall(r"^OnCalendar[ \t]*=[ \t]*(.*)$", txt, re.M) if m.strip()]
+    acts = [m.strip() for m in re.findall(r"^OnUnitActiveSec[ \t]*=[ \t]*(.*)$", txt, re.M) if m.strip()]
+    if cals:
+        return f"oncalendar:{cals[-1]}"
+    if acts:
+        return f"every:{acts[-1]}"
     return None
 
 
@@ -204,6 +217,11 @@ def systemd_write_dropin(unit: str, desired_schedule: str) -> tuple[bool, str]:
 
     try:
         dropin_dir.mkdir(parents=True, exist_ok=True)
+        # Idempotency guard: if the managed drop-in already holds exactly this
+        # body, do not rewrite / daemon-reload / restart. Defence-in-depth so a
+        # schedule-comparison miss can never re-trigger the 30s thrash loop.
+        if dropin_path.exists() and dropin_path.read_text() == body:
+            return (True, "drop-in already current")
         dropin_path.write_text(body)
     except OSError as e:
         return (False, f"failed to write {dropin_path}: {e}")
