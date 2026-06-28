@@ -463,6 +463,31 @@ const SOURCE_TRUST: Record<string, string> = {
   "manual": "verified",
 };
 
+// ── Writer-agent inference (migration 048 provenance) ───────────────────────
+// Resolves the writer_agent column from explicit agent_id, AIP-verified
+// caller identity, or the free-text source field. Closes the cron-injection
+// silent-pollution gap flagged by 2606.24535 — without this, scheduled
+// triggers (ai-memory-research-trigger, etc.) write rows with no agent
+// attribution.
+const KNOWN_AGENTS = ["wren", "iris", "atlas", "forge", "volt", "hermes", "lumen"];
+const KNOWN_AGENTS_SET = new Set(KNOWN_AGENTS);
+function deriveWriterAgent(explicit: string | undefined, src: string): string | undefined {
+  if (explicit && KNOWN_AGENTS_SET.has(explicit.toLowerCase())) return explicit.toLowerCase();
+  if (!src) return undefined;
+  const s = src.toLowerCase();
+  if (KNOWN_AGENTS_SET.has(s)) return s;
+  // Token match: agent appears bounded by string start/end or any non-alphanumeric
+  for (const a of KNOWN_AGENTS) {
+    if (new RegExp(`(^|[^a-z0-9])${a}([^a-z0-9]|$)`).test(s)) return a;
+  }
+  // Surface conventions
+  if (s === "claude-ai" || s === "cowork" || s.startsWith("cowork-")) return "iris";
+  // Wren-hosted cron/timer sources (run on svc-podman-01)
+  if (s === "claude-code" || s === "consolidation" || s === "dreaming_consolidate"
+      || s.endsWith("-trigger") || s.startsWith("ccr-") || s.startsWith("daily-")) return "wren";
+  return undefined;
+}
+
 // ── Startup Migration ────────────────────────────────────────────────────────
 // Attempts to add link_type column to memory_links via the pre-registered
 // add_link_type_if_missing() SECURITY DEFINER function.
@@ -1062,7 +1087,7 @@ function startVerificationAuditJob(supabase: any): void {
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.10.0",
+    version: "5.10.1",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -1147,12 +1172,13 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (embedding) update.embedding = JSON.stringify(embedding);
         if (importance_score !== undefined) update.importance_score = importance_score;
         if (confidence !== undefined) update.confidence = confidence;
+        const derivedWriter = deriveWriterAgent(agent_id, src);
         if (agent_id) {
           update.agent_id = agent_id;
-          update.writer_agent = agent_id;
           // Update provenance with contributing_agent (REC3, arXiv 2505.18279)
           update.provenance = { contributing_agent: agent_id };
         }
+        if (derivedWriter) update.writer_agent = derivedWriter;
         if (visibility) update.visibility = visibility;
         if (agent_scope) update.agent_scope = agent_scope;
         if (memory_class) update.memory_class = memory_class;
@@ -1232,7 +1258,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
             const upd: Record<string, unknown> = { description, content, tags: memTags, source: src };
             upd.embedding = JSON.stringify(embedding);
             if (importance_score !== undefined) upd.importance_score = importance_score;
-            if (agent_id) upd.writer_agent = agent_id;
+            const mem0Writer = deriveWriterAgent(agent_id, src);
+            if (mem0Writer) upd.writer_agent = mem0Writer;
             const { error: updErr } = await supabase.from("memories").update(upd).eq("id", d.target_id);
             if (!updErr) {
               return { content: [{ type: "text" as const, text: `mem0 UPDATE: merged "${name}" into existing memory "${d.target_name}". (${d.rationale})${embedNote}` }] };
@@ -1251,10 +1278,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (embedding) insert.embedding = JSON.stringify(embedding);
       if (importance_score !== undefined) insert.importance_score = importance_score;
       if (confidence !== undefined) insert.confidence = confidence;
-      if (agent_id) {
-        insert.agent_id = agent_id;
-        insert.writer_agent = agent_id;
-      }
+      const insertWriter = deriveWriterAgent(agent_id, src);
+      if (agent_id) insert.agent_id = agent_id;
+      if (insertWriter) insert.writer_agent = insertWriter;
       if (visibility) insert.visibility = visibility;
       if (agent_scope) insert.agent_scope = agent_scope;
       // Default memory_class so p_memory_class filtering in hybrid_recall
@@ -2672,7 +2698,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 10; // +10: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant + check_stale_context + update_read_watermark; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.10.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.10.1", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -2743,7 +2769,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 9;
-  console.log(`Memory MCP Server v5.10.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v5.10.1 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
