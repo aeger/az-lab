@@ -1,0 +1,120 @@
+services:
+  # VPN gateway — everything below routes through this with a kill-switch.
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file: .env
+    environment:
+      - TZ=America/Phoenix
+      - FIREWALL_OUTBOUND_SUBNETS=192.168.1.0/24,10.89.0.0/24   # LAN + podman net (WebUI reachability + reach calibre/abs)
+      - FIREWALL_INPUT_PORTS=8080,9696,8191,8084
+    ports:   # bound to LAN IP (not 0.0.0.0) for defense-in-depth; Traefik reaches these via the proxy network
+      - "192.168.1.181:8090:8080"   # qBittorrent WebUI
+      - "192.168.1.181:9696:9696"   # Prowlarr
+      - "192.168.1.181:8191:8191"   # FlareSolverr
+      - "192.168.1.181:8084:8084"   # Shelfmark WebUI
+    restart: unless-stopped
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      # qBittorrent
+      - "traefik.http.routers.qbit.rule=Host(`qbit.az-lab.dev`)"
+      - "traefik.http.routers.qbit.entrypoints=websecure"
+      - "traefik.http.routers.qbit.tls=true"
+      - "traefik.http.routers.qbit.tls.certresolver=le"
+      - "traefik.http.routers.qbit.middlewares=lan-allow@file"
+      - "traefik.http.routers.qbit.service=qbit"
+      - "traefik.http.services.qbit.loadbalancer.server.port=8080"
+      # Prowlarr
+      - "traefik.http.routers.prowlarr.rule=Host(`prowlarr.az-lab.dev`)"
+      - "traefik.http.routers.prowlarr.entrypoints=websecure"
+      - "traefik.http.routers.prowlarr.tls=true"
+      - "traefik.http.routers.prowlarr.tls.certresolver=le"
+      - "traefik.http.routers.prowlarr.middlewares=lan-allow@file"
+      - "traefik.http.routers.prowlarr.service=prowlarr"
+      - "traefik.http.services.prowlarr.loadbalancer.server.port=9696"
+      # Shelfmark (moved here so its traffic is VPN'd)
+      - "traefik.http.routers.shelfmark.rule=Host(`shelfmark.az-lab.dev`)"
+      - "traefik.http.routers.shelfmark.entrypoints=websecure"
+      - "traefik.http.routers.shelfmark.tls=true"
+      - "traefik.http.routers.shelfmark.tls.certresolver=le"
+      - "traefik.http.routers.shelfmark.middlewares=lan-allow@file"
+      - "traefik.http.routers.shelfmark.service=shelfmark"
+      - "traefik.http.services.shelfmark.loadbalancer.server.port=8084"
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Phoenix
+      - WEBUI_PORT=8080
+    volumes:
+      - qbittorrent-config:/config
+      - /mnt/calibre/ingest:/downloads
+      - audiobookshelf-audiobooks:/audiobooks   # audio category lands straight in ABS library
+    restart: unless-stopped
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Phoenix
+    volumes:
+      - prowlarr-config:/config
+    restart: unless-stopped
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    environment:
+      - TZ=America/Phoenix
+      - LOG_LEVEL=info
+    restart: unless-stopped
+
+  # Shelfmark — front-end, now VPN'd (IRC + direct downloads egress via Proton).
+  shelfmark:
+    image: ghcr.io/calibrain/shelfmark:latest
+    container_name: shelfmark
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Phoenix
+      - INGEST_DIR=/books
+    volumes:
+      - shelfmark-config:/config:Z
+      - /mnt/calibre/ingest:/books
+      - /home/almty1/calibre-config/app.db:/auth/app.db:ro
+    restart: unless-stopped
+
+networks:
+  proxy:
+    external: true
+
+volumes:
+  qbittorrent-config:
+  prowlarr-config:
+  shelfmark-config:
+    external: true
+  audiobookshelf-audiobooks:   # shared with the audiobookshelf stack so audio torrents import into ABS
+    external: true
