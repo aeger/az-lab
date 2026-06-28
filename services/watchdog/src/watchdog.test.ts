@@ -583,3 +583,167 @@ describe('GracefulDegradation', () => {
     expect(lineCount).toBeLessThanOrEqual(500);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. HangDetector — slow-hang detection (2026-06-16 incident gap)
+// ─────────────────────────────────────────────────────────────────────────────
+describe('HangDetector', () => {
+  const T_HANG = 20; // minutes
+  const NOW = 1_700_000_000;
+  const LONG_AGO = NOW - 30 * 60; // 30m — past threshold
+  const SHORT_AGO = NOW - 5 * 60; // 5m — under threshold
+
+  let tmpDir: string;
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'watchdog-hang-'));
+  });
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  const makeDetector = async () => {
+    const { HangDetector } = await import('./hang-detector.js');
+    return new HangDetector({
+      lastPromptAtFile: path.join(tmpDir, 'last_prompt_at'),
+      lastResponseAtFile: path.join(tmpDir, 'last_response_at'),
+      lastToolAtFile: path.join(tmpDir, 'last_tool_at'),
+      hangThresholdMin: T_HANG,
+    });
+  };
+
+  it('flags hang when a genuine prompt is unanswered + no tool activity (canary-masked wedge)', async () => {
+    const detector = await makeDetector();
+    const result = detector.assess({
+      nowSec: NOW,
+      signals: { lastPromptAt: LONG_AGO, lastResponseAt: null, lastToolAt: LONG_AGO },
+    });
+    expect(result.isHung).toBe(true);
+    expect(result.reasons.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('still flags when a stale response predates the outstanding prompt', async () => {
+    const detector = await makeDetector();
+    const result = detector.assess({
+      nowSec: NOW,
+      signals: { lastPromptAt: LONG_AGO, lastResponseAt: LONG_AGO - 60, lastToolAt: LONG_AGO },
+    });
+    expect(result.isHung).toBe(true);
+  });
+
+  it('does not flag when the prompt was answered (response newer than prompt)', async () => {
+    const detector = await makeDetector();
+    const result = detector.assess({
+      nowSec: NOW,
+      signals: { lastPromptAt: LONG_AGO, lastResponseAt: SHORT_AGO, lastToolAt: SHORT_AGO },
+    });
+    expect(result.isHung).toBe(false);
+  });
+
+  it('does not flag a long but healthy task (tools still firing)', async () => {
+    const detector = await makeDetector();
+    const result = detector.assess({
+      nowSec: NOW,
+      signals: { lastPromptAt: LONG_AGO, lastResponseAt: null, lastToolAt: SHORT_AGO },
+    });
+    expect(result.isHung).toBe(false);
+  });
+
+  it('does not false-positive when genuinely idle (last prompt long answered)', async () => {
+    const detector = await makeDetector();
+    const result = detector.assess({
+      nowSec: NOW,
+      signals: { lastPromptAt: LONG_AGO - 120, lastResponseAt: LONG_AGO, lastToolAt: LONG_AGO },
+    });
+    expect(result.isHung).toBe(false);
+  });
+
+  it('does not flag when no prompt has ever been recorded', async () => {
+    const detector = await makeDetector();
+    const result = detector.assess({
+      nowSec: NOW,
+      signals: { lastPromptAt: null, lastResponseAt: null, lastToolAt: LONG_AGO },
+    });
+    expect(result.isHung).toBe(false);
+  });
+
+  it('fails safe when last_tool_at was never written (fresh deploy)', async () => {
+    const detector = await makeDetector();
+    const result = detector.assess({
+      nowSec: NOW,
+      signals: { lastPromptAt: LONG_AGO, lastResponseAt: null, lastToolAt: null },
+    });
+    expect(result.isHung).toBe(false);
+  });
+
+  it('does not flag a prompt that is outstanding but still under threshold', async () => {
+    const detector = await makeDetector();
+    const result = detector.assess({
+      nowSec: NOW,
+      signals: { lastPromptAt: SHORT_AGO, lastResponseAt: null, lastToolAt: LONG_AGO },
+    });
+    expect(result.isHung).toBe(false);
+  });
+
+  it('fetchSignals reads the three timestamp files (missing => null)', async () => {
+    const detector = await makeDetector();
+    await fs.writeFile(path.join(tmpDir, 'last_prompt_at'), `${LONG_AGO}\n`, 'utf8');
+    await fs.writeFile(path.join(tmpDir, 'last_tool_at'), `${SHORT_AGO}`, 'utf8');
+    // last_response_at intentionally absent
+    const signals = await detector.fetchSignals();
+    expect(signals.lastPromptAt).toBe(LONG_AGO);
+    expect(signals.lastToolAt).toBe(SHORT_AGO);
+    expect(signals.lastResponseAt).toBeNull();
+  });
+
+  it('fetchSignals treats a corrupt/empty file as null', async () => {
+    const detector = await makeDetector();
+    await fs.writeFile(path.join(tmpDir, 'last_prompt_at'), 'not-a-number', 'utf8');
+    const signals = await detector.fetchSignals();
+    expect(signals.lastPromptAt).toBeNull();
+  });
+
+  it('runHangSelfTest passes for the shipping detector', async () => {
+    const { runHangSelfTest } = await import('./hang-self-test.js');
+    const detector = await makeDetector();
+    const result = runHangSelfTest(detector);
+    expect(result.ok).toBe(true);
+    expect(result.failures).toEqual([]);
+    expect(result.checks).toBeGreaterThan(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. CircuitBreaker isolation — its state file must be independent of the
+//    watchdog StateManager so restart history is never clobbered (the
+//    2026-06-16 every-60s hang-restart loop).
+// ─────────────────────────────────────────────────────────────────────────────
+describe('CircuitBreaker / StateManager isolation', () => {
+  let tmpDir: string;
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'watchdog-iso-'));
+  });
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it('StateManager.save does not erase recorded breaker restarts', async () => {
+    const { CircuitBreaker } = await import('./circuit-breaker.js');
+    const { StateManager } = await import('./state.js');
+    const breakerFile = path.join(tmpDir, 'breaker.json');
+    const stateFile = path.join(tmpDir, 'state.json');
+
+    const cb = new CircuitBreaker({ stateFile: breakerFile, maxRestartsHour: 3, cooldownSec: 1800 });
+    const sm = new StateManager(stateFile);
+
+    // Record restarts on the breaker, then have the watchdog persist its own
+    // state — as handleHang does on every tick. With separate files this must
+    // NOT reset the breaker's count.
+    await cb.recordRestart();
+    await cb.recordRestart();
+    const loaded = await sm.load();
+    await sm.save({ ...loaded, lastStatus: 'restarting' });
+
+    const status = await cb.getStatus();
+    expect(status.restartsInLastHour).toBe(2);
+  });
+});

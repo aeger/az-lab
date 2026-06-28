@@ -16,7 +16,16 @@ export interface WatchdogConfig {
   watchdogDir: string;
   heartbeatFile: string;
   stateFile: string;
+  /** Circuit-breaker state — kept in its OWN file so the watchdog StateManager
+   * can never clobber the recorded restart history (2026-06-16 loop bug). */
+  breakerStateFile: string;
   counterFile: string;
+  /** Hang detector — epoch-sec of last genuine inbound prompt. */
+  lastPromptAtFile: string;
+  /** Hang detector — epoch-sec of last genuine response delivered. */
+  lastResponseAtFile: string;
+  /** Hang detector — epoch-sec of last tool execution. */
+  lastToolAtFile: string;
   logFile: string;
   discordChannelId: string;
   discordBotToken: string;
@@ -26,6 +35,20 @@ export interface WatchdogConfig {
   dashboardPort: number;
   tmuxSession: string;
   pollIntervalSec: number;
+  /** Minutes a genuine prompt may stay unanswered (no tool activity) before hung. */
+  hangThresholdMin: number;
+  /** Seconds after a hang restart during which the detector will not re-fire. */
+  hangRestartCooldownSec: number;
+  /** When true, run an in-process hang-detector self-test on startup. */
+  hangSelfTest: boolean;
+  /**
+   * When true, the slow-hang detector may auto-restart claude-discord. Disabled
+   * by default (2026-06-16): its progress signals (prompt_count growth, open
+   * agent_episodes) are not yet reliable — the Stop hook never increments
+   * prompt_count and episodes are never closed, so the detector false-positives
+   * and self-loops. Crash / stale-heartbeat detection is unaffected.
+   */
+  hangDetectionEnabled: boolean;
 }
 
 /** Expand ~ in paths */
@@ -101,6 +124,12 @@ export async function loadConfig(): Promise<WatchdogConfig> {
   }
   const tmuxSession = get('TMUX_SESSION', 'claude-discord');
   const pollIntervalSec = parseInt(get('POLL_INTERVAL_SEC', '60'), 10);
+  const hangThresholdMin = parseInt(get('HANG_THRESHOLD_MIN', '20'), 10);
+  const hangRestartCooldownSec = parseInt(get('HANG_RESTART_COOLDOWN_SEC', '300'), 10);
+  const hangSelfTest = get('HANG_SELF_TEST', '1') !== '0';
+  // Re-enabled by default 2026-06-16 after the signal redesign (file-based,
+  // canary-proof). Set HANG_DETECTION_ENABLED=0 to disable auto-restart-on-hang.
+  const hangDetectionEnabled = get('HANG_DETECTION_ENABLED', '1') === '1';
 
   // Discord token: prefer env var, fall back to ~/.claude/channels/discord/.env
   let discordBotToken = process.env['BOT_TOKEN'] ?? envVars['BOT_TOKEN'] ?? '';
@@ -124,7 +153,11 @@ export async function loadConfig(): Promise<WatchdogConfig> {
     watchdogDir,
     heartbeatFile: path.join(watchdogDir, 'heartbeat'),
     stateFile: path.join(watchdogDir, 'state.json'),
+    breakerStateFile: path.join(watchdogDir, 'breaker.json'),
     counterFile: path.join(watchdogDir, 'prompt_count'),
+    lastPromptAtFile: path.join(watchdogDir, 'last_prompt_at'),
+    lastResponseAtFile: path.join(watchdogDir, 'last_response_at'),
+    lastToolAtFile: path.join(watchdogDir, 'last_tool_at'),
     logFile: path.join(watchdogDir, 'watchdog-ts.log'),
     discordChannelId,
     discordBotToken,
@@ -134,5 +167,9 @@ export async function loadConfig(): Promise<WatchdogConfig> {
     dashboardPort,
     tmuxSession,
     pollIntervalSec,
+    hangThresholdMin,
+    hangRestartCooldownSec,
+    hangSelfTest,
+    hangDetectionEnabled,
   };
 }

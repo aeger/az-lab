@@ -80,7 +80,7 @@ ADGUARD_PASSWORD = env.get("ADGUARD_PASSWORD", "") or os.environ.get("ADGUARD_PA
 
 DISCORD_CHANNEL = "1012721652049657896"
 AGENT_BUS_URL = "http://localhost:8765"
-AGENT_BUS_SECRET = env.get("AGENT_BUS_SECRET", "") or os.environ.get("AGENT_BUS_SECRET", "azlab-agent-bus")
+AGENT_BUS_SECRET = env.get("AGENT_BUS_SECRET", "") or os.environ.get("AGENT_BUS_SECRET", "")
 HOST = os.environ.get("HOSTNAME") or os.uname().nodename
 
 if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):

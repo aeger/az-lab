@@ -7,7 +7,12 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=America/Phoenix
-      - NETWORK_SHARE_MODE=false
+      # true: skip the recursive `chown -R abc:abc /calibre-library` on every
+      # ingest/start. Required under rootless-podman userns — namespace-root
+      # can't chown the subuid-mapped (100999) bind mount, so the chown failed
+      # EPERM per file and spammed the watchdog log (651MB on 2026-06-11).
+      # Files are already correctly owned, so the chown was pointless anyway.
+      - NETWORK_SHARE_MODE=true
       - TRUSTED_PROXY_COUNT=1
       # HARDCOVER_TOKEN configured in Calibre-Web general settings (not compose)
     volumes:

@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily Supabase JSON export to /home/almty1/backups/supabase
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/home/almty1/azlab/services/backups/supabase-export.env
+ExecStart=/home/almty1/azlab/services/backups/bin/supabase-export.py
+StandardOutput=append:/home/almty1/backups/logs/supabase-export.log
+StandardError=append:/home/almty1/backups/logs/supabase-export.log
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

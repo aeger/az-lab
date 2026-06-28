@@ -12,6 +12,13 @@ export interface WatchdogState {
   breakerTrippedAt: number | null;
   lastRestartAt: string | null;
   promptCount: number;
+  /** Hang detector — last observed prompt_count and when (epoch sec). */
+  lastSeenPromptCount: number | null;
+  lastSeenPromptCountAt: number | null;
+  /** Hang detector — last observed agent_activity.created_at (epoch sec). */
+  lastSeenActivityAt: number | null;
+  /** Hang detector — when the most recent hang was confirmed (epoch sec). */
+  hangDetectedAt: number | null;
 }
 
 const DEFAULT_STATE: WatchdogState = {
@@ -21,6 +28,10 @@ const DEFAULT_STATE: WatchdogState = {
   breakerTrippedAt: null,
   lastRestartAt: null,
   promptCount: 0,
+  lastSeenPromptCount: null,
+  lastSeenPromptCountAt: null,
+  lastSeenActivityAt: null,
+  hangDetectedAt: null,
 };
 
 export class StateManager {
@@ -42,6 +53,10 @@ export class StateManager {
         breakerTrippedAt: parsed.breakerTrippedAt ?? (parsed as any).breaker_tripped_at ?? null,
         lastRestartAt: parsed.lastRestartAt ?? null,
         promptCount: parsed.promptCount ?? 0,
+        lastSeenPromptCount: parsed.lastSeenPromptCount ?? null,
+        lastSeenPromptCountAt: parsed.lastSeenPromptCountAt ?? null,
+        lastSeenActivityAt: parsed.lastSeenActivityAt ?? null,
+        hangDetectedAt: parsed.hangDetectedAt ?? null,
       };
     } catch {
       return { ...DEFAULT_STATE };

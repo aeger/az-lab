@@ -20,7 +20,7 @@ async function busRequest<T>(
     method: options.method ?? 'GET',
     headers: {
       'Content-Type': 'application/json',
-      'X-Agent-Secret': 'azlab-agent-bus',
+      'X-Agent-Secret': import.meta.env.VITE_AGENT_BUS_SECRET as string,
       ...options.headers,
     },
     body: options.body ? JSON.stringify(options.body) : undefined,

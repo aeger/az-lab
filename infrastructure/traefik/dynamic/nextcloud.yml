@@ -1,0 +1,19 @@
+http:
+  routers:
+    nextcloud:
+      rule: "Host(`nextcloud.az-lab.dev`)"
+      entryPoints:
+        - websecure
+      service: nextcloud
+      tls:
+        certResolver: le
+      middlewares:
+        - lan-allow@file
+
+  services:
+    nextcloud:
+      loadBalancer:
+        # Nextcloud AIO apache container on VM 110 (192.168.1.175), reverse-proxy mode.
+        servers:
+          - url: "http://192.168.1.175:11000"
+        passHostHeader: true

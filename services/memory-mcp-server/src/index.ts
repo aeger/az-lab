@@ -1149,6 +1149,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (confidence !== undefined) update.confidence = confidence;
         if (agent_id) {
           update.agent_id = agent_id;
+          update.writer_agent = agent_id;
           // Update provenance with contributing_agent (REC3, arXiv 2505.18279)
           update.provenance = { contributing_agent: agent_id };
         }
@@ -1211,7 +1212,11 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       }
 
       // ── New-name path: full Mem0 conflict resolution ────────────────────────
+      // Migration 048 (2026-06-26): DELETE decisions are deferred to a
+      // non-destructive supersede_memory() call after the new row is
+      // inserted, so the old row + its content survive for audit/lineage.
       let mem0Note = "";
+      const toSupersede: Array<{ id: string; name: string; rationale: string }> = [];
       if (embedding) {
         const decisions = await mem0Resolve(name, content, type, embedding);
 
@@ -1227,6 +1232,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
             const upd: Record<string, unknown> = { description, content, tags: memTags, source: src };
             upd.embedding = JSON.stringify(embedding);
             if (importance_score !== undefined) upd.importance_score = importance_score;
+            if (agent_id) upd.writer_agent = agent_id;
             const { error: updErr } = await supabase.from("memories").update(upd).eq("id", d.target_id);
             if (!updErr) {
               return { content: [{ type: "text" as const, text: `mem0 UPDATE: merged "${name}" into existing memory "${d.target_name}". (${d.rationale})${embedNote}` }] };
@@ -1234,11 +1240,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
           }
 
           if (d.action === "DELETE" && d.target_id) {
-            // Remove stale/contradicted memory before inserting the new one
-            console.log(`[mem0] DELETE "${d.target_name}": ${d.rationale}`);
-            await supabase.from("memory_links").delete().or(`source_id.eq.${d.target_id},target_id.eq.${d.target_id}`);
-            await supabase.from("memories").delete().eq("id", d.target_id);
-            mem0Note += ` Removed stale memory "${d.target_name}".`;
+            // Defer: supersede after new memory is inserted (preserves history).
+            toSupersede.push({ id: d.target_id, name: d.target_name || "?", rationale: d.rationale });
           }
         }
       }
@@ -1248,7 +1251,10 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (embedding) insert.embedding = JSON.stringify(embedding);
       if (importance_score !== undefined) insert.importance_score = importance_score;
       if (confidence !== undefined) insert.confidence = confidence;
-      if (agent_id) insert.agent_id = agent_id;
+      if (agent_id) {
+        insert.agent_id = agent_id;
+        insert.writer_agent = agent_id;
+      }
       if (visibility) insert.visibility = visibility;
       if (agent_scope) insert.agent_scope = agent_scope;
       // Default memory_class so p_memory_class filtering in hybrid_recall
@@ -1259,6 +1265,20 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
+
+      // Apply deferred supersessions now that we have the new id
+      for (const sup of toSupersede) {
+        const { error: supErr } = await supabase.rpc("supersede_memory", {
+          p_old_id: sup.id, p_new_id: inserted.id, p_reason: `mem0: ${sup.rationale}`,
+        });
+        if (supErr) {
+          console.warn(`[mem0] supersede_memory(${sup.id}, ${inserted.id}) failed: ${supErr.message}`);
+          mem0Note += ` Could not supersede stale "${sup.name}": ${supErr.message}.`;
+        } else {
+          console.log(`[mem0] SUPERSEDE "${sup.name}" → "${name}": ${sup.rationale}`);
+          mem0Note += ` Superseded stale memory "${sup.name}" (preserved for audit).`;
+        }
+      }
 
       // Auto-link
       let linkNote = "";
@@ -1553,6 +1573,35 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (error) return { content: [{ type: "text" as const, text: `Error deleting: ${error.message}` }] };
       console.log(`[aip] forget "${name}" by ${callerIdentity || "unverified"}`);
       return { content: [{ type: "text" as const, text: `Deleted memory "${name}". Audit log preserved.` }] };
+    }
+  );
+
+  // ── Tool: supersede_memory ──────────────────────────────────────────────────
+  // Non-destructive replacement: marks the old memory is_active=false and
+  // links it to the new one. Old row stays in the table for audit/lineage;
+  // hybrid_recall filters it out. Use when a fact has been updated and you
+  // want history preserved instead of overwritten.
+  server.tool(
+    "supersede_memory",
+    "Mark an old memory as superseded by a new one. The old row stays in the table for audit, but recall ignores it. Use when a fact has been replaced — preferred over forget+remember when history matters.",
+    {
+      old_name: z.string().describe("Exact name of the memory to retire"),
+      new_name: z.string().describe("Exact name of the memory that supersedes it"),
+      reason: z.string().optional().describe("Why the supersession (e.g. 'IP address changed', 'service migrated to new host')"),
+    },
+    async ({ old_name, new_name, reason }) => {
+      const { data: oldMem } = await supabase.from("memories").select("id").eq("name", old_name).maybeSingle();
+      if (!oldMem) return { content: [{ type: "text" as const, text: `No memory found with name "${old_name}"` }] };
+      const { data: newMem } = await supabase.from("memories").select("id").eq("name", new_name).maybeSingle();
+      if (!newMem) return { content: [{ type: "text" as const, text: `No memory found with name "${new_name}"` }] };
+
+      const { data, error } = await supabase.rpc("supersede_memory", {
+        p_old_id: oldMem.id, p_new_id: newMem.id, p_reason: reason || null,
+      });
+      if (error) return { content: [{ type: "text" as const, text: `Error superseding: ${error.message}` }] };
+      const rewired = (data as any[] | null)?.[0]?.rewired_links ?? 0;
+      console.log(`[aip] supersede_memory "${old_name}" → "${new_name}" by ${callerIdentity || "unverified"} (rewired ${rewired} links)`);
+      return { content: [{ type: "text" as const, text: `Superseded "${old_name}" with "${new_name}". Rewired ${rewired} inbound link${rewired === 1 ? "" : "s"}. Old row preserved (is_active=false).` }] };
     }
   );
 

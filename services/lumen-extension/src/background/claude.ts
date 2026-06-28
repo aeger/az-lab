@@ -121,7 +121,7 @@ async function callAgentBusChat(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-Agent-Secret': 'azlab-agent-bus',
+      'X-Agent-Secret': import.meta.env.VITE_AGENT_BUS_SECRET as string,
     },
     body: JSON.stringify({
       system: systemPrompt,

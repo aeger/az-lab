@@ -63,7 +63,7 @@ PROJECT_AGE_MAX_DAYS = int(os.environ.get("PROJECT_AGE_MAX_DAYS", "14"))
 WEEKLY_LOOKBACK_DAYS = int(os.environ.get("WEEKLY_LOOKBACK_DAYS", "30"))
 DISCORD_CHANNEL = "1012721652049657896"
 AGENT_BUS_URL = os.environ.get("AGENT_BUS_URL", "http://localhost:8765")
-AGENT_BUS_SECRET = os.environ.get("AGENT_BUS_SECRET", "azlab-agent-bus")
+AGENT_BUS_SECRET = os.environ.get("AGENT_BUS_SECRET", "")
 
 logging.basicConfig(
     level=logging.INFO,

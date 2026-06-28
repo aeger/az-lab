@@ -18,9 +18,11 @@ import { CanarySender } from './canary.js';
 import { CircuitBreaker } from './circuit-breaker.js';
 import { DiscordNotifier } from './discord.js';
 import { SupabaseReporter } from './supabase-reporter.js';
-import { StateManager } from './state.js';
+import { StateManager, WatchdogState } from './state.js';
 import { WatchdogDashboard } from './dashboard.js';
 import { LocalLogger } from './logger.js';
+import { HangDetector } from './hang-detector.js';
+import { runHangSelfTest } from './hang-self-test.js';
 import { exec as execCallback } from 'child_process';
 import { promisify } from 'util';
 import { promises as fs } from 'fs';
@@ -42,7 +44,7 @@ async function main() {
     canaryTimeoutSec: config.canaryTimeoutSec,
   });
   const breaker = new CircuitBreaker({
-    stateFile: config.stateFile,
+    stateFile: config.breakerStateFile,
     maxRestartsHour: config.maxRestartsHour,
     cooldownSec: config.breakerCooldownSec,
   });
@@ -57,6 +59,22 @@ async function main() {
     serviceKey: config.supabaseServiceKey,
     fallbackLogFile: config.logFile,
   });
+  const hangDetector = new HangDetector({
+    lastPromptAtFile: config.lastPromptAtFile,
+    lastResponseAtFile: config.lastResponseAtFile,
+    lastToolAtFile: config.lastToolAtFile,
+    hangThresholdMin: config.hangThresholdMin,
+    fallbackLogFile: config.logFile,
+  });
+
+  if (config.hangSelfTest) {
+    const result = runHangSelfTest(hangDetector);
+    if (!result.ok) {
+      await logger.log(`Hang self-test FAILED: ${result.failures.join('; ')}`);
+    } else {
+      await logger.log(`Hang self-test ok (${result.checks} checks)`);
+    }
+  }
 
   // Start dashboard HTTP server
   const dashboard = new WatchdogDashboard({ port: config.dashboardPort });
@@ -75,7 +93,7 @@ async function main() {
   // Main poll loop
   const poll = async () => {
     try {
-      await tick(config, logger, stateMgr, heartbeat, canary, breaker, discord, supabase, dashboard);
+      await tick(config, logger, stateMgr, heartbeat, canary, breaker, discord, supabase, dashboard, hangDetector);
     } catch (err) {
       await logger.log(`Unhandled error in tick: ${err}`).catch(() => {});
     }
@@ -96,6 +114,7 @@ async function tick(
   discord: DiscordNotifier,
   supabase: SupabaseReporter,
   dashboard: WatchdogDashboard,
+  hangDetector: HangDetector,
 ) {
   const now = Math.floor(Date.now() / 1000);
 
@@ -136,19 +155,51 @@ async function tick(
 
   // ── HEALTHY path ────────────────────────────────────────────────────────────
   if (!hbResult.stale) {
+    // Heartbeat looks fresh — but a slow hang can keep heartbeats ticking via
+    // Stop hooks fired by canary replies / Discord reactions while the actual
+    // work loop is wedged (2026-06-16 incident). Run hang detection BEFORE
+    // declaring healthy, using positive, canary-proof, file-based signals (see
+    // hang-detector.ts). Gated behind hangDetectionEnabled; short-circuits this
+    // branch when it fires a restart.
+    const trackedState: WatchdogState = state;
+    if (config.hangDetectionEnabled) {
+      const hangSignals = await hangDetector.fetchSignals();
+      const assessment = hangDetector.assess({ nowSec: now, signals: hangSignals });
+
+      if (assessment.isHung) {
+        // Post-restart cooldown: after a hang restart, give the restarted
+        // session time to answer or emit tool activity before we re-evaluate, so
+        // a still-settling restart can't be bounced again every poll.
+        const sinceHangRestart =
+          state.hangDetectedAt !== null ? now - state.hangDetectedAt : Infinity;
+        if (sinceHangRestart < config.hangRestartCooldownSec) {
+          await logger.log(
+            `Hang condition persists but within post-restart cooldown ` +
+              `(${sinceHangRestart}s / ${config.hangRestartCooldownSec}s) — not restarting`,
+          );
+          return;
+        }
+        await handleHang(
+          config, logger, stateMgr, trackedState, breaker, discord, supabase, dashboard,
+          breakerStatus, assessment.reasons, hangSignals, promptCount, hbResult.ageSec,
+        );
+        return;
+      }
+    }
+
     const wasUnhealthy = state.lastStatus !== 'healthy';
 
     if (wasUnhealthy) {
       await logger.log(`Recovered to healthy (was: ${state.lastStatus}, age: ${hbResult.ageSec}s, prompts: ${promptCount})`);
       await supabase.updateStatus('healthy', { prompt_count: promptCount, recovered_from: state.lastStatus });
-      if (state.lastStatus === 'restarting' || state.lastStatus === 'critical') {
+      if (state.lastStatus === 'restarting' || state.lastStatus === 'critical' || state.lastStatus === 'hung') {
         await discord.send(`Wren recovered and responding (prompts: ${promptCount})`, 3066993).catch(() => {});
       }
     } else {
       await supabase.updateStatus('healthy', { prompt_count: promptCount });
     }
 
-    await stateMgr.save({ ...state, lastStatus: 'healthy', canarySentAt: null });
+    await stateMgr.save({ ...trackedState, lastStatus: 'healthy', canarySentAt: null, hangDetectedAt: null });
     dashboard.updateStatus({ status: 'healthy' });
 
     // Proactive overnight restart
@@ -159,7 +210,7 @@ async function tick(
       await supabase.updateStatus('restarting', { reason: 'proactive', prompt_count: promptCount });
       await writeCounter(config.counterFile, 0);
       await exec('systemctl --user restart claude-discord.service').catch(() => {});
-      await stateMgr.save({ ...state, lastStatus: 'restarting', canarySentAt: null });
+      await stateMgr.save({ ...trackedState, lastStatus: 'restarting', canarySentAt: null });
     }
 
     return;
@@ -258,6 +309,129 @@ async function tick(
 
   await discord.send(msg, color).catch(() => {});
   await logger.log('Restart issued');
+}
+
+/**
+ * Slow-hang handler. Runs when the heartbeat looks fresh but the hang detector
+ * says no work is making progress. Mirrors the unresponsive-restart path but
+ * keyed off a different signal — and writes a reasoning row to agent_activity
+ * BEFORE issuing the restart, per wren_constitution principle 2.
+ */
+async function handleHang(
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  logger: LocalLogger,
+  stateMgr: StateManager,
+  trackedState: WatchdogState,
+  breaker: CircuitBreaker,
+  discord: DiscordNotifier,
+  supabase: SupabaseReporter,
+  dashboard: WatchdogDashboard,
+  breakerStatus: { tripped: boolean; restartsInLastHour: number; cooldownRemaining: number },
+  reasons: string[],
+  signals: import('./hang-detector.js').HangSignals,
+  promptCount: number,
+  heartbeatAgeSec: number,
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  const reasonSummary = reasons.join(' | ');
+  await logger.log(`HANG DETECTED — ${reasonSummary}`);
+
+  const hangMetadata = {
+    reasons,
+    prompt_count: promptCount,
+    heartbeat_age_sec: heartbeatAgeSec,
+    last_prompt_at: signals.lastPromptAt,
+    last_response_at: signals.lastResponseAt,
+    last_tool_at: signals.lastToolAt,
+    hang_threshold_min: config.hangThresholdMin,
+  };
+
+  // Reasoning row — written BEFORE any restart so the trail survives even if
+  // the restart itself fails or wedges.
+  await supabase.logActivity(
+    'hang_detected',
+    `Slow hang detected by watchdog: ${reasonSummary}`,
+    hangMetadata,
+  );
+
+  // Sentinel notification — drives the dashboard alert ribbon.
+  await supabase.emitSentinelNotification(
+    'critical',
+    'Wren slow hang detected',
+    `Wren heartbeat is fresh but the work loop is wedged.\n\n${reasonSummary}`,
+    `hang:${signals.lastPromptAt ?? 'no-prompt'}:${now}`,
+    hangMetadata,
+  );
+
+  // Breaker check — if already tripped, page and bail. We do NOT auto-restart
+  // through a tripped breaker; the manual-reset path is the escape hatch.
+  if (breakerStatus.tripped) {
+    await logger.log(`Hang detected but circuit breaker tripped — paging without restart`);
+    await stateMgr.save({
+      ...trackedState,
+      lastStatus: 'hung',
+      hangDetectedAt: now,
+    });
+    await supabase.updateStatus('hung', {
+      ...hangMetadata,
+      breaker_tripped: true,
+      cooldown_remaining: breakerStatus.cooldownRemaining,
+    });
+    dashboard.updateStatus({ status: 'critical' });
+    await discord.send(
+      `CRITICAL: Wren slow-hang detected but breaker is tripped (cooldown ${breakerStatus.cooldownRemaining}s).\n` +
+        `Manual intervention needed: \`touch ~/.wren-watchdog/reset && systemctl --user restart claude-discord.service\`\n` +
+        `Reasons: ${reasonSummary}`,
+      15158332,
+    ).catch(() => {});
+    return;
+  }
+
+  const canRestart = await breaker.allowsRestart();
+  if (!canRestart) {
+    await logger.log('Hang detected but breaker tripped on this restart attempt');
+    await stateMgr.save({
+      ...trackedState,
+      lastStatus: 'hung',
+      hangDetectedAt: now,
+    });
+    await supabase.updateStatus('hung', { ...hangMetadata, breaker_tripped: true });
+    dashboard.updateStatus({ status: 'critical' });
+    return;
+  }
+
+  const tier = breakerStatus.restartsInLastHour + 1;
+  await logger.log(`Restarting claude-discord on hang (tier ${tier})`);
+  await breaker.recordRestart();
+  const restartAt = new Date().toISOString();
+
+  await stateMgr.save({
+    ...trackedState,
+    canarySentAt: null,
+    lastStatus: 'restarting',
+    lastRestartAt: restartAt,
+    hangDetectedAt: now,
+  });
+  await writeCounter(config.counterFile, 0);
+  await supabase.updateStatus('restarting', {
+    reason: 'slow_hang',
+    tier,
+    ...hangMetadata,
+  });
+  await supabase.updateLastRestart(restartAt, tier);
+
+  await exec('systemctl --user restart claude-discord.service').catch(async (err) => {
+    await logger.log(`Hang restart failed: ${err}`);
+  });
+
+  dashboard.updateStatus({ status: 'restarting', last_restart: restartAt });
+
+  const color = tier === 1 ? 15105570 : tier === 2 ? 16744448 : 15158332;
+  await discord.send(
+    `Wren slow-hang restart #${tier} — heartbeat looked fresh but no work progressed.\n` +
+      `Reasons: ${reasonSummary}`,
+    color,
+  ).catch(() => {});
 }
 
 async function readCounter(counterFile: string): Promise<number> {
