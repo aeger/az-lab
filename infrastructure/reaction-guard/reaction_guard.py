@@ -163,6 +163,7 @@ def main():
         log.info(f"seeded {len(state['seen_ids'])} existing messages on startup")
         save_state(state)
 
+    last_hb_read = 0.0  # wall-clock of last agent_heartbeat read (Supabase IO throttle)
     while True:
         try:
             messages = get_messages(bot_token)
@@ -186,10 +187,19 @@ def main():
             if len(state["seen_ids"]) > 500:
                 state["seen_ids"] = state["seen_ids"][-500:]
 
-            current_hb = get_heartbeat(supabase_url, service_key)
-            if current_hb and current_hb != state["last_heartbeat_ts"]:
-                hb_advanced = True
-                state["last_heartbeat_ts"] = current_hb
+            # Only hit Supabase for the heartbeat every 3s while messages await a
+            # ✅; when idle, drop to every 30s. Wren writes its heartbeat at most
+            # every 60s, so 3s idle reads were pure waste (Supabase IO budget,
+            # 2026-06-11). Baseline stays <=30s fresh, so a newly-arrived message
+            # never false-positives a ✅ off a stale timestamp.
+            if state["pending"] or (now - last_hb_read >= 30):
+                current_hb = get_heartbeat(supabase_url, service_key)
+                last_hb_read = now
+                if current_hb and current_hb != state["last_heartbeat_ts"]:
+                    hb_advanced = True
+                    state["last_heartbeat_ts"] = current_hb
+                else:
+                    hb_advanced = False
             else:
                 hb_advanced = False
 

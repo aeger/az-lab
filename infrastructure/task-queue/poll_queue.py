@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
@@ -259,7 +260,7 @@ def headers(extra=None):
 def api_request(method, path, data=None, params=None):
     url = f"{SUPABASE_URL}/rest/v1/{path}"
     if params:
-        url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+        url += "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
     body = json.dumps(data).encode() if data else None
     req = urllib.request.Request(url, data=body, headers=headers(), method=method)
     try:
@@ -350,6 +351,52 @@ def log_activity(activity_type, content, task_id=None, metadata=None):
         api_request("POST", "agent_activity", data=data)
     except Exception as e:
         print(f"log_activity failed (non-fatal): {e}", file=sys.stderr)
+
+
+def start_episode(task):
+    """Open an agent_episodes row for this task run. Returns episode_id or None. Best-effort."""
+    try:
+        title = (task.get("title") or "")[:200]
+        desc = (task.get("description") or "")[:600]
+        input_summary = f"{title}\n{desc}".strip()[:800]
+        row = api_request(
+            "POST",
+            "agent_episodes",
+            data={
+                "agent": "wren",
+                "task_id": task.get("id"),
+                "status": "in_progress",
+                "input_summary": input_summary,
+            },
+            params={"select": "id"},
+        )
+        if isinstance(row, list) and row:
+            return row[0].get("id")
+        if isinstance(row, dict):
+            return row.get("id")
+    except Exception as e:
+        print(f"start_episode failed (non-fatal): {e}", file=sys.stderr)
+    return None
+
+
+def end_episode(episode_id, status, summary=None, outcome=None, learnings=None):
+    """Close an agent_episodes row with final status. Best-effort — never raises."""
+    if not episode_id:
+        return
+    try:
+        patch = {
+            "status": status,
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if summary:
+            patch["summary"] = summary[:1000]
+        if outcome:
+            patch["outcome"] = outcome[:1000]
+        if learnings:
+            patch["learnings"] = learnings[:2000]
+        api_request("PATCH", f"agent_episodes?id=eq.{episode_id}", data=patch)
+    except Exception as e:
+        print(f"end_episode failed (non-fatal): {e}", file=sys.stderr)
 
 
 def mark_in_progress(task_id):
@@ -697,8 +744,15 @@ def build_prompt(task):
     )
 
 
-def run_claude(prompt, task_id=None, model=None):
-    """Run claude with streaming output, writing events to agent_activity in real-time."""
+def run_claude(prompt, task_id=None, model=None, proc_register=None, max_runtime=5400):
+    """Run claude with streaming output, writing events to agent_activity in real-time.
+
+    proc_register: optional callable(subprocess.Popen) — invoked once with the spawned
+                   process so the orchestrator (Argus) can SIGKILL it on stall.
+    max_runtime:   wall-clock backstop in seconds. A watchdog thread kills the
+                   subprocess after this many seconds even if stdout has gone silent.
+                   Default 5400s = 3× the per-line 1800s deadline.
+    """
     cmd = [CLAUDE_CMD, "--print", "--dangerously-skip-permissions",
            "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
     if model:
@@ -710,6 +764,12 @@ def run_claude(prompt, task_id=None, model=None):
         stderr=subprocess.PIPE,
         text=True,
     )
+
+    if proc_register is not None:
+        try:
+            proc_register(proc)
+        except Exception as e:
+            print(f"run_claude: proc_register failed (non-fatal): {e}", file=sys.stderr)
 
     final_text = ""
     stderr_lines = []
@@ -725,6 +785,23 @@ def run_claude(prompt, task_id=None, model=None):
         for line in proc.stderr:
             stderr_q.put(line.rstrip())
     threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    # Wall-clock backstop: SIGKILL the subprocess if it's still running past
+    # max_runtime. The for-loop deadline below only fires when stdout is flowing,
+    # so a wedged claude with no output would otherwise block forever.
+    def _watchdog():
+        end = time.monotonic() + max_runtime
+        while time.monotonic() < end:
+            if proc.poll() is not None:
+                return
+            time.sleep(min(30, max(1, end - time.monotonic())))
+        if proc.poll() is None:
+            try:
+                proc.kill()
+                print(f"run_claude watchdog: killed PID {proc.pid} after {max_runtime}s wall-clock backstop", file=sys.stderr)
+            except Exception:
+                pass
+    threading.Thread(target=_watchdog, daemon=True).start()
 
     deadline = time.time() + 1800
     for raw_line in proc.stdout:
@@ -980,31 +1057,33 @@ def _has_recent_pending_task(goal_id: str) -> bool:
 
 
 def _promote_planned_milestones():
-    """Activate the next planned milestone in each strategy when no active sibling is pending/queued."""
+    """Activate the next planned milestone in each strategy when no active sibling is pending/queued.
+
+    Single-query version (was 1 + 2N round-trips, now 1 + K where K = strategies needing a promote).
+    Refactored 2026-05-29 — Supabase usage incident: cut ~20 sequential GETs per cycle.
+    """
     try:
-        # Find strategies that have at least one completed milestone but no active/pending ones
-        strategies = api_request("GET", "goals", params={
-            "level": "eq.strategy", "select": "id", "limit": "10"
+        # One call: pull every active+planned milestone across all strategies, group by parent.
+        milestones = api_request("GET", "goals", params={
+            "level": "eq.milestone",
+            "status": "in.(active,planned)",
+            "auto_queue": "eq.true",
+            "select": "id,title,parent_id,status,priority,sort_order",
+            "order": "priority.asc,sort_order.asc",
         })
-        for s in strategies:
-            sid = s["id"]
-            # Check if any milestone in this strategy is active or has a recent pending task
-            active = api_request("GET", "goals", params={
-                "parent_id": f"eq.{sid}", "level": "eq.milestone",
-                "status": "eq.active", "select": "id", "limit": "1"
-            })
-            if active:
-                continue  # already has active milestone, skip
-            # Promote the lowest-priority planned milestone
-            planned = api_request("GET", "goals", params={
-                "parent_id": f"eq.{sid}", "level": "eq.milestone",
-                "status": "eq.planned", "auto_queue": "eq.true",
-                "select": "id,title,priority", "order": "priority.asc,sort_order.asc", "limit": "1"
-            })
+        by_parent: dict = {}
+        for m in milestones:
+            by_parent.setdefault(m.get("parent_id"), []).append(m)
+        for parent_id, mss in by_parent.items():
+            if not parent_id:
+                continue
+            if any(m["status"] == "active" for m in mss):
+                continue  # strategy already has an active milestone
+            # Already sorted by priority.asc,sort_order.asc → take first planned
+            planned = next((m for m in mss if m["status"] == "planned"), None)
             if planned:
-                nxt = planned[0]
-                api_request("PATCH", f"goals?id=eq.{nxt['id']}", data={"status": "active"})
-                print(f"Promoted milestone to active: {nxt['title']}")
+                api_request("PATCH", f"goals?id=eq.{planned['id']}", data={"status": "active"})
+                print(f"Promoted milestone to active: {planned['title']}")
     except Exception as e:
         print(f"_promote_planned_milestones failed (non-fatal): {e}", file=sys.stderr)
 
@@ -1276,21 +1355,10 @@ def _needs_jeff_input(text: str) -> tuple[bool, str]:
 def mark_pending_jeff_action(task_id: str, result: str, reason: str, title: str = "", goal_id: str | None = None) -> None:
     """Transition task to pending_jeff_action and notify Jeff via Discord."""
     stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
-    # Read existing context so the reason note merges in without clobbering other fields.
-    existing = api_request("GET", f"task_queue?id=eq.{task_id}&select=context")
-    cur_ctx = (existing[0].get("context") if existing else None) or {}
-    merged_ctx = dict(cur_ctx)
-    merged_ctx["context_summary"] = f"Needs input: {reason[:140]}"
-    merged_ctx["action_required"] = reason[:240]
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
-        data={
-            "status": "pending_jeff_action",
-            "result": stored_result,
-            "target": "jeff",
-            "context": merged_ctx,
-        },
+        data={"status": "pending_jeff_action", "result": stored_result},
     )
     log_activity("status", f"Pending Jeff action: {reason[:100]}", task_id=task_id)
     display = title or task_id
@@ -1387,6 +1455,7 @@ def main():
     mark_in_progress(task_id)
     log_activity("status", f"Claimed: {title}", task_id=task_id)
     discord_notify(f"🟡 Claimed: {title} — starting now")
+    episode_id = start_episode(task)
 
     try:
         routing = route_task(task)
@@ -1407,6 +1476,7 @@ def main():
         jeff_needed, jeff_reason = _needs_jeff_input(result)
         if jeff_needed:
             mark_pending_jeff_action(task_id, result, jeff_reason, title=title, goal_id=goal_id)
+            end_episode(episode_id, "pending_jeff_action", summary=summary, outcome=jeff_reason)
             return
 
         # Guardian: safety/alignment audit on every completed task
@@ -1419,6 +1489,7 @@ def main():
             )
             discord_notify(f"🚨 **Guardian CRITICAL:** {title} — escalated to Jeff")
             print(f"Task {task_id} escalated: Guardian CRITICAL finding.")
+            end_episode(episode_id, "pending_jeff_action", summary=summary, outcome="Guardian CRITICAL")
             return
 
         # CRIT (0) and HIGH (1) tasks go to Iris for evaluation before completion
@@ -1427,6 +1498,7 @@ def main():
             mark_pending_eval(task_id, result, goal_id=goal_id, original_task=task)
             discord_notify(f"🔍 Pending eval: {title} — {summary}")
             print(f"Task {task_id} pending evaluation by Iris.")
+            end_episode(episode_id, "pending_eval", summary=summary)
         else:
             is_recurring = bool(task.get("recurring"))
             mark_completed(task_id, result, goal_id=goal_id, recurring=is_recurring)
@@ -1436,12 +1508,14 @@ def main():
                 requeue_recurring(task)
             discord_notify(f"✅ Done: {title} — {summary}")
             print(f"Task {task_id} completed.")
+            end_episode(episode_id, "completed", summary=summary, outcome=summary)
     except Exception as e:
         error_msg = str(e)
         print(f"Task {task_id} failed: {error_msg}", file=sys.stderr)
         mark_failed(task_id, error_msg, goal_id=task.get("goal_id"), original_task=task)
         log_activity("error", error_msg[:200], task_id=task_id)
         discord_notify(f"❌ Failed: {title} — {error_msg[:120]}")
+        end_episode(episode_id, "failed", outcome=error_msg)
         sys.exit(1)
 
 

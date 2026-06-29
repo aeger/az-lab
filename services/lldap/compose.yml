@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      - "3890:3890"
+      - "127.0.0.1:3890:3890"   # LDAP only used by other containers via proxy network; localhost mirror for host-side debug
     volumes:
       - ./data:/data
     networks:

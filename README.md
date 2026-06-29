@@ -132,7 +132,7 @@ Python HTTP server at `~/claude/agent-bus/` on port 8765.
 - `POST /message` — send a message to an agent
 - `GET /health` — server health
 - `POST /mcp` — MCP protocol endpoint (no auth required)
-- Auth: `X-Agent-Secret: azlab-agent-bus`
+- Auth: `X-Agent-Secret: <AGENT_BUS_SECRET>`
 
 ---
 

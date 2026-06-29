@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Supabase JSON export daily at 03:15
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=supabase-export.service
+
+[Install]
+WantedBy=timers.target

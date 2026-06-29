@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'preact/hooks';
+import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import type { SentinelNotification, Urgency, SoundPrefs } from '../../shared/types';
 import { DEFAULT_SOUND_PREFS } from '../../shared/types';
 import { playSound, playSoundForUrgency, ALL_SOUND_IDS, SOUND_LABELS } from '../../shared/sounds';
@@ -42,6 +42,10 @@ export function AlertsPanel() {
   const [showSoundSettings, setShowSoundSettings] = useState(false);
   const [soundPrefs, setSoundPrefs] = useState<SoundPrefs>(DEFAULT_SOUND_PREFS);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [isTyping, setIsTyping] = useState(false);
+  const [lastMessageSentTime, setLastMessageSentTime] = useState<number | null>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const alreadyPlayedRef = useRef<Set<string>>(new Set());
 
   const loadSoundPrefs = useCallback(async () => {
     const res = await chrome.runtime.sendMessage({ type: 'GET_SOUND_PREFS' });
@@ -49,6 +53,35 @@ export function AlertsPanel() {
       setSoundPrefs({ ...DEFAULT_SOUND_PREFS, ...res.payload });
     }
   }, []);
+
+  const handleTypingState = useCallback((typing: boolean) => {
+    setIsTyping(typing);
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    if (typing) {
+      typingTimeoutRef.current = setTimeout(() => setIsTyping(false), 2000);
+    }
+  }, []);
+
+  const handleMessageSent = useCallback(() => {
+    setLastMessageSentTime(Date.now());
+    alreadyPlayedRef.current.clear();
+  }, []);
+
+  const shouldPlaySound = (notif: SentinelNotification): boolean => {
+    // Don't play if already played this notification
+    if (alreadyPlayedRef.current.has(notif.id)) return false;
+
+    // Discord source: mute if currently typing, and if response wait < 5 min
+    if (notif.source === 'discord') {
+      if (isTyping) return false;
+      if (lastMessageSentTime !== null) {
+        const elapsedMs = Date.now() - lastMessageSentTime;
+        if (elapsedMs < 5 * 60 * 1000) return false;
+      }
+    }
+
+    return true;
+  };
 
   const fetchNotifications = useCallback(async (playNewSounds = false) => {
     const res = await chrome.runtime.sendMessage({
@@ -62,11 +95,13 @@ export function AlertsPanel() {
       );
 
       if (playNewSounds && newNotifs.length > 0) {
-        // Play sound for the highest urgency new notification
+        // Play sound for the highest urgency new notification, respecting mute rules
         const urgencies: Urgency[] = ['critical', 'high', 'medium', 'low'];
         for (const u of urgencies) {
-          if (newNotifs.some(n => n.urgency === u)) {
+          const notif = newNotifs.find(n => n.urgency === u);
+          if (notif && shouldPlaySound(notif)) {
             playSoundForUrgency(u, soundPrefs as any);
+            alreadyPlayedRef.current.add(notif.id);
             break;
           }
         }
@@ -77,13 +112,25 @@ export function AlertsPanel() {
       setCriticalCount(res.payload.criticalCount);
       setLoading(false);
     }
-  }, [notifications, soundPrefs]);
+  }, [notifications, soundPrefs, isTyping, lastMessageSentTime, shouldPlaySound]);
 
   useEffect(() => {
     loadSoundPrefs();
     fetchNotifications(false);
     const interval = setInterval(() => fetchNotifications(true), 30_000);
-    return () => clearInterval(interval);
+    // Listen for message sent events
+    chrome.runtime.onMessage.addListener((msg: any) => {
+      if (msg.type === 'MESSAGE_SENT') {
+        handleMessageSent();
+      }
+      if (msg.type === 'TYPING_STATE') {
+        handleTypingState(msg.payload?.isTyping ?? false);
+      }
+    });
+    return () => {
+      clearInterval(interval);
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    };
   }, []);
 
   async function markRead(id: string) {

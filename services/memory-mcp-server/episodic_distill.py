@@ -43,7 +43,7 @@ from datetime import datetime, timezone, timedelta
 SUPABASE_URL  = os.environ.get("SUPABASE_URL", "https://ogqjjlbupqnvlcyrfnxi.supabase.co")
 SUPABASE_KEY  = os.environ.get("SUPABASE_SECRET_KEY", "")
 MEMORY_MCP_URL = os.environ.get("MEMORY_MCP_URL", "http://localhost:3100")
-NEMOCLAW_URL  = os.environ.get("NEMOCLAW_URL", "http://192.168.1.183:8000")
+NEMOCLAW_URL  = os.environ.get("NEMOCLAW_URL", "https://integrate.api.nvidia.com")
 NEMOCLAW_KEY  = os.environ.get("NVIDIA_API_KEY", "")
 NEMOCLAW_MODEL = os.environ.get("NEMOCLAW_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 TRIAGE_MODEL  = os.environ.get("TRIAGE_MODEL", "google/gemma-4-31b-it")
@@ -62,7 +62,8 @@ PROJECT_AGE_MIN_DAYS = int(os.environ.get("PROJECT_AGE_MIN_DAYS", "7"))
 PROJECT_AGE_MAX_DAYS = int(os.environ.get("PROJECT_AGE_MAX_DAYS", "14"))
 WEEKLY_LOOKBACK_DAYS = int(os.environ.get("WEEKLY_LOOKBACK_DAYS", "30"))
 DISCORD_CHANNEL = "1012721652049657896"
-AGENT_BUS_URL = "http://localhost:8765"
+AGENT_BUS_URL = os.environ.get("AGENT_BUS_URL", "http://localhost:8765")
+AGENT_BUS_SECRET = os.environ.get("AGENT_BUS_SECRET", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -256,31 +257,8 @@ def summarize_project_cluster_haiku(memories: list) -> str | None:
     )
     return _call_claude_haiku(prompt, max_tokens=300)
 
-# ── Memory MCP write (via HTTP) ───────────────────────────────────────────────
+# ── Memory write (direct Supabase — MCP server speaks JSON-RPC, not REST) ─────
 def write_semantic_memory(name: str, description: str, content: str, tags: list) -> str | None:
-    """Write a semantic memory via memory-mcp-server HTTP API."""
-    try:
-        r = httpx.post(
-            f"{MEMORY_MCP_URL}/tools/remember",
-            json={
-                "type": "semantic",
-                "name": name,
-                "description": description,
-                "content": content,
-                "tags": tags,
-                "source": "claude-code",
-                "importance_score": 0.75,
-            },
-            timeout=30,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            # Extract memory ID from result if available
-            return data.get("id") or "ok"
-    except Exception as e:
-        log.warning(f"MCP write failed, falling back to direct Supabase: {e}")
-
-    # Fallback: direct Supabase insert
     try:
         result = supa_post("memories", {
             "type": "semantic",
@@ -294,7 +272,7 @@ def write_semantic_memory(name: str, description: str, content: str, tags: list)
         if isinstance(result, list) and result:
             return result[0].get("id")
     except Exception as e:
-        log.error(f"Direct Supabase write failed: {e}")
+        log.error(f"Supabase write failed: {e}")
     return None
 
 def create_link(source_id: str, target_id: str, relationship: str, link_type: str = "semantic"):
@@ -319,8 +297,9 @@ def mark_consolidated(memory_id: str, existing_tags: list):
 def send_discord(msg: str):
     try:
         httpx.post(
-            f"{AGENT_BUS_URL}/send-discord",
-            json={"channel": DISCORD_CHANNEL, "message": msg},
+            f"{AGENT_BUS_URL}/message",
+            json={"text": msg},
+            headers={"X-Agent-Secret": AGENT_BUS_SECRET},
             timeout=10,
         )
     except Exception:
@@ -393,26 +372,6 @@ def summarize_project_cluster(memories: list) -> str | None:
 
 
 def write_reference_memory(name: str, description: str, content: str, tags: list) -> str | None:
-    """Write a reference memory via MCP (with Supabase fallback)."""
-    try:
-        r = httpx.post(
-            f"{MEMORY_MCP_URL}/tools/remember",
-            json={
-                "type": "reference",
-                "name": name,
-                "description": description,
-                "content": content,
-                "tags": tags,
-                "source": "claude-code",
-                "importance_score": 0.80,
-            },
-            timeout=30,
-        )
-        if r.status_code == 200:
-            return r.json().get("id") or "ok"
-    except Exception as e:
-        log.warning(f"MCP reference write failed, falling back to Supabase: {e}")
-
     try:
         result = supa_post("memories", {
             "type": "reference",
@@ -426,7 +385,7 @@ def write_reference_memory(name: str, description: str, content: str, tags: list
         if isinstance(result, list) and result:
             return result[0].get("id")
     except Exception as e:
-        log.error(f"Direct Supabase reference write failed: {e}")
+        log.error(f"Supabase reference write failed: {e}")
     return None
 
 
@@ -482,7 +441,7 @@ def run_project_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int,
 
         if ref_id:
             for ep_mem in cluster_mems:
-                create_link(ref_id, ep_mem["id"], "consolidated_from", "semantic")
+                create_link(ref_id, ep_mem["id"], "refines", "semantic")
             for ep_mem in cluster_mems:
                 mark_consolidated(ep_mem["id"], ep_mem.get("tags") or [])
             created += 1
@@ -596,7 +555,7 @@ def main():
                         sem_id = result[0]["id"] if result else None
                     if sem_id:
                         for ep in batch:
-                            create_link(sem_id, ep["id"], "distilled_from", "semantic")
+                            create_link(sem_id, ep["id"], "refines", "semantic")
                         for ep in batch:
                             mark_consolidated(ep["id"], ep.get("tags") or [])
                         p0_created += 1
@@ -623,7 +582,7 @@ def main():
                         sem_id = result[0]["id"] if result else None
                     if sem_id:
                         for ep in cluster_mems:
-                            create_link(sem_id, ep["id"], "distilled_from", "semantic")
+                            create_link(sem_id, ep["id"], "refines", "semantic")
                         for ep in cluster_mems:
                             mark_consolidated(ep["id"], ep.get("tags") or [])
                         p0_created += 1
@@ -689,7 +648,7 @@ def main():
         if semantic_id:
             # Create semantic→episodic links
             for ep_mem in cluster_mems:
-                create_link(semantic_id, ep_mem["id"], "distilled_from", "semantic")
+                create_link(semantic_id, ep_mem["id"], "refines", "semantic")
 
             # 6. Mark episodic memories as consolidated
             for ep_mem in cluster_mems:
@@ -747,26 +706,6 @@ def fetch_project_30day_memories() -> list:
 
 
 def write_consolidation_memory(name: str, description: str, content: str, tags: list) -> str | None:
-    """Write a reference memory with source='consolidation' via Supabase."""
-    try:
-        r = httpx.post(
-            f"{MEMORY_MCP_URL}/tools/remember",
-            json={
-                "type": "reference",
-                "name": name,
-                "description": description,
-                "content": content,
-                "tags": tags,
-                "source": "consolidation",
-                "importance_score": 0.80,
-            },
-            timeout=30,
-        )
-        if r.status_code == 200:
-            return r.json().get("id") or "ok"
-    except Exception as e:
-        log.warning(f"[Phase 3] MCP write failed, falling back to Supabase: {e}")
-
     try:
         result = supa_post("memories", {
             "type": "reference",
@@ -780,7 +719,7 @@ def write_consolidation_memory(name: str, description: str, content: str, tags: 
         if isinstance(result, list) and result:
             return result[0].get("id")
     except Exception as e:
-        log.error(f"[Phase 3] Direct Supabase write failed: {e}")
+        log.error(f"[Phase 3] Supabase write failed: {e}")
     return None
 
 
@@ -835,7 +774,7 @@ def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, 
 
         if ref_id:
             for m in cluster_mems:
-                create_link(ref_id, m["id"], "weekly_consolidated_from", "semantic")
+                create_link(ref_id, m["id"], "refines", "semantic")
             for m in cluster_mems:
                 mark_consolidated(m["id"], m.get("tags") or [])
             created += 1

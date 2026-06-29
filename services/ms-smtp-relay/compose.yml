@@ -9,7 +9,7 @@ services:
     container_name: az-ms-smtp-relay
     restart: unless-stopped
     ports:
-      - "587:2587"        # SMTP relay — direct LAN access (raw TCP, no Traefik)
+      - "192.168.1.181:587:2587"   # SMTP relay — LAN-only (raw TCP, no Traefik)
     environment:
       # Azure App Registration (Microsoft Graph OAuth2)
       - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}

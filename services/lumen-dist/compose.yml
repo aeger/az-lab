@@ -1,0 +1,23 @@
+services:
+  lumen-dist:
+    image: docker.io/library/nginx:alpine
+    container_name: lumen-dist
+    restart: unless-stopped
+    networks:
+      - proxy
+    volumes:
+      # Published Lumen artifacts: lumen-dist.zip, .sha256, version.txt
+      - /home/almty1/azlab/services/lumen-extension/pub:/usr/share/nginx/html:ro,Z
+      - /home/almty1/azlab/services/lumen-dist/default.conf:/etc/nginx/conf.d/default.conf:ro,Z
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.lumen-dist.rule=Host(`lumen.az-lab.dev`)"
+      - "traefik.http.routers.lumen-dist.entrypoints=websecure"
+      - "traefik.http.routers.lumen-dist.tls=true"
+      - "traefik.http.routers.lumen-dist.tls.certresolver=le"
+      - "traefik.http.routers.lumen-dist.middlewares=lan-allow@file"
+      - "traefik.http.services.lumen-dist.loadbalancer.server.port=80"
+
+networks:
+  proxy:
+    external: true

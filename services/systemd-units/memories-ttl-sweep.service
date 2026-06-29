@@ -1,0 +1,8 @@
+[Unit]
+Description=Sweep expired memories rows (TTL backstop for bench/research jobs)
+
+[Service]
+Type=oneshot
+ExecStart=/home/almty1/azlab/scripts/memories_ttl_sweep.sh
+StandardOutput=journal
+StandardError=journal

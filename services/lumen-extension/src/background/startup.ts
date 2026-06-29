@@ -3,7 +3,7 @@
 import { STORAGE_KEYS, AGENT_NAME } from '../shared/config';
 import { mcpHealthCheck, mcpInitialize } from './mcp-client';
 import { fetchMemories, fetchPendingTasks, fetchSharedContext } from './supabase';
-import { busHealthCheck } from './agent-bus';
+import { busHealthCheck, busGetSecurity } from './agent-bus';
 import type { AgentStatus } from '../shared/types';
 
 export interface StartupResult {
@@ -55,24 +55,22 @@ export async function runStartup(): Promise<StartupResult> {
     await chrome.storage.local.set({ [STORAGE_KEYS.sessionContext]: context });
   }
 
+  // Security posture (replaces the old Anthropic-key dot — chat keys live on the bus)
+  const security = await busGetSecurity();
+
   const status: AgentStatus = {
     memoryMcp: mcpConnected ? 'connected' : 'disconnected',
     supabase: supabaseOk ? 'connected' : 'disconnected',
     agentBus: busConnected ? 'connected' : 'disconnected',
-    anthropic: 'missing_key', // updated by checkAnthropicKey
+    security: security.level,
+    securityScore: security.score,
   };
-
-  // Check Anthropic key
-  const stored = await chrome.storage.local.get(STORAGE_KEYS.anthropicApiKey);
-  if (stored[STORAGE_KEYS.anthropicApiKey]) {
-    status.anthropic = 'configured';
-  }
 
   console.log(`[${AGENT_NAME}] Startup complete:`, {
     mcp: status.memoryMcp,
     supabase: status.supabase,
     bus: status.agentBus,
-    anthropic: status.anthropic,
+    security: `${status.security} (${status.securityScore ?? '?'})`,
     feedbackRules: feedbackRules.length,
     pendingTasks: pendingCount,
   });

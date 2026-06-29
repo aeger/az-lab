@@ -16,7 +16,7 @@ Always-on HTTP server for az-lab inter-agent communication. Runs on svc-podman-0
 | POST | `/trigger` | Secret | Fire a trigger event |
 | POST | `/message` | Secret | Send Discord message |
 
-Auth header: `X-Agent-Secret: <AGENT_BUS_SECRET>` (default: `azlab-agent-bus`)
+Auth header: `X-Agent-Secret: <AGENT_BUS_SECRET>` (default: `<AGENT_BUS_SECRET>`)
 
 ## Agent Cards
 

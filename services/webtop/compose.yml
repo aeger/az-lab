@@ -13,7 +13,7 @@ services:
       - proxy
 
     ports:
-      - "${WEBTOP_PORT:-3080}:3000"
+      - "127.0.0.1:${WEBTOP_PORT:-3080}:3000"   # Public access via Traefik (svc-podman-01.az-lab.dev); host port is localhost-only fallback
 
     environment:
       - PUID=${PUID:-1000}

@@ -49,3 +49,19 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# --- Secret hygiene (added by Wren 2026-06-28) ---
+# env backups hold live secrets (Supabase/R2/HA) — NEVER commit
+*.env.bak*
+.env.bak*
+# Python bytecode
+__pycache__/
+*.pyc
+# Generated runtime state (not source)
+services/calibre-web/pdf_epub_progress.json
+services/calibre-web/short_books_index.json
+services/memory-mcp-server/oom
+# Built extension distribution artifacts (rebuild via publish.sh, contain baked secret)
+services/lumen-extension/lumen-dist.zip
+services/lumen-extension/pub/lumen-dist.zip
+services/lumen-extension/pub/lumen-dist.zip.sha256

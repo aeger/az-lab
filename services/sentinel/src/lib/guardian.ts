@@ -2,7 +2,7 @@ import { config } from '../config';
 import { DiscordAlerter } from './discord-alert';
 import { NotificationStore } from './store';
 import { v4 as uuidv4 } from 'uuid';
-import { SentinelNotification } from '../types';
+import { SentinelNotification, severityToUrgency } from '../types';
 
 const DEAD_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 const CHECK_INTERVAL_MS = 5 * 60 * 1000; // check every 5 minutes
@@ -113,6 +113,7 @@ export class GuardianAgent {
         id: uuidv4(),
         source: 'agent_health',
         severity: 'warning',
+        urgency: severityToUrgency('warning', 'guardian_heal'),
         status: 'unread',
         title: 'Extension listener was dead — restarted',
         body: `Edge Sentinel extension has not sent a heartbeat in ${missedMin}+ minutes. Reconnect requested.`,

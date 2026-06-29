@@ -11,6 +11,7 @@ services:
     volumes:
       - shelfmark-config:/config:Z
       - /mnt/calibre/ingest:/books  # NFS on Proxmox nvme-fast-02
+      - /home/almty1/calibre-config/app.db:/auth/app.db:ro  # Calibre-Web user DB for auth
     networks:
       - proxy
     labels:

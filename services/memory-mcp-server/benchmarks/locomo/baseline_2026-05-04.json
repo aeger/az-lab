@@ -1,0 +1,30 @@
+{
+  "version": "memory-mcp-server v5.7.0",
+  "run_date": "2026-05-04",
+  "eval_date": "2026-05-02",
+  "corpus": "locomo10.json",
+  "n_conversations": 10,
+  "n_turns_ingested": 5882,
+  "n_questions": 694,
+  "pipeline": "hybrid_recall (vector + keyword RRF + bge-reranker-v2-m3 + spreading activation)",
+  "evaluation_type": "retrieval-only (no answer generation)",
+  "overall": {
+    "mrr": 0.1171,
+    "r1": 0.0518,
+    "r5": 0.1176,
+    "r10": 0.1494,
+    "r20": 0.2163
+  },
+  "by_category": {
+    "1_single-hop": {"mrr": 0.115, "r1": 0.0234, "r5": 0.058, "r10": 0.0996, "r20": 0.1692, "n": 282},
+    "2_multi-hop":  {"mrr": 0.1401,"r1": 0.0917,"r5": 0.1865,"r10": 0.213, "r20": 0.275,  "n": 320},
+    "3_temporal":   {"mrr": 0.0437,"r1": 0.0,   "r5": 0.0604,"r10": 0.0803,"r20": 0.1564,"n": 92}
+  },
+  "published_reference_caveat": "Mem0/A-Mem report LLM-judge answer F1 on LOCOMO, not retrieval MRR. Numbers below are NOT directly comparable to ours.",
+  "published_reference": {
+    "mem0_j_score_overall": "~0.66-0.68",
+    "a_mem_f1_overall": "~0.52-0.55",
+    "memgpt_f1_overall": "~0.38-0.42"
+  },
+  "memory_id": "c81c5ed4-4544-48b8-b1b2-363667263b6a"
+}

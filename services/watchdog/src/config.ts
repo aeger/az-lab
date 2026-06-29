@@ -16,15 +16,39 @@ export interface WatchdogConfig {
   watchdogDir: string;
   heartbeatFile: string;
   stateFile: string;
+  /** Circuit-breaker state — kept in its OWN file so the watchdog StateManager
+   * can never clobber the recorded restart history (2026-06-16 loop bug). */
+  breakerStateFile: string;
   counterFile: string;
+  /** Hang detector — epoch-sec of last genuine inbound prompt. */
+  lastPromptAtFile: string;
+  /** Hang detector — epoch-sec of last genuine response delivered. */
+  lastResponseAtFile: string;
+  /** Hang detector — epoch-sec of last tool execution. */
+  lastToolAtFile: string;
   logFile: string;
   discordChannelId: string;
   discordBotToken: string;
+  discordWebhookUrl: string;
   supabaseUrl: string;
   supabaseServiceKey: string;
   dashboardPort: number;
   tmuxSession: string;
   pollIntervalSec: number;
+  /** Minutes a genuine prompt may stay unanswered (no tool activity) before hung. */
+  hangThresholdMin: number;
+  /** Seconds after a hang restart during which the detector will not re-fire. */
+  hangRestartCooldownSec: number;
+  /** When true, run an in-process hang-detector self-test on startup. */
+  hangSelfTest: boolean;
+  /**
+   * When true, the slow-hang detector may auto-restart claude-discord. Disabled
+   * by default (2026-06-16): its progress signals (prompt_count growth, open
+   * agent_episodes) are not yet reliable — the Stop hook never increments
+   * prompt_count and episodes are never closed, so the detector false-positives
+   * and self-loops. Crash / stale-heartbeat detection is unaffected.
+   */
+  hangDetectionEnabled: boolean;
 }
 
 /** Expand ~ in paths */
@@ -62,6 +86,18 @@ async function loadDiscordToken(): Promise<string> {
   return vars['BOT_TOKEN'] ?? '';
 }
 
+/** Load the "Dashboard" webhook URL from ~/claude/agent-bus/discord_webhooks.json */
+async function loadWebhookUrl(): Promise<string> {
+  const cfg = path.join(os.homedir(), 'claude', 'agent-bus', 'discord_webhooks.json');
+  try {
+    const raw = await fs.readFile(cfg, 'utf8');
+    const map = JSON.parse(raw) as Record<string, string>;
+    return map['claude-code'] ?? '';
+  } catch {
+    return '';
+  }
+}
+
 export async function loadConfig(): Promise<WatchdogConfig> {
   // Load watchdog.env if present
   const watchdogDir = expandHome(process.env['WATCHDOG_DIR'] ?? '~/.wren-watchdog');
@@ -88,11 +124,24 @@ export async function loadConfig(): Promise<WatchdogConfig> {
   }
   const tmuxSession = get('TMUX_SESSION', 'claude-discord');
   const pollIntervalSec = parseInt(get('POLL_INTERVAL_SEC', '60'), 10);
+  const hangThresholdMin = parseInt(get('HANG_THRESHOLD_MIN', '20'), 10);
+  const hangRestartCooldownSec = parseInt(get('HANG_RESTART_COOLDOWN_SEC', '300'), 10);
+  const hangSelfTest = get('HANG_SELF_TEST', '1') !== '0';
+  // Re-enabled by default 2026-06-16 after the signal redesign (file-based,
+  // canary-proof). Set HANG_DETECTION_ENABLED=0 to disable auto-restart-on-hang.
+  const hangDetectionEnabled = get('HANG_DETECTION_ENABLED', '1') === '1';
 
   // Discord token: prefer env var, fall back to ~/.claude/channels/discord/.env
   let discordBotToken = process.env['BOT_TOKEN'] ?? envVars['BOT_TOKEN'] ?? '';
   if (!discordBotToken) {
     discordBotToken = await loadDiscordToken();
+  }
+
+  // Webhook for automated alerts (posts as "Dashboard"); env override, else the
+  // shared webhook map. Falls back to the bot token at send time if empty.
+  let discordWebhookUrl = get('DISCORD_WEBHOOK_URL', '');
+  if (!discordWebhookUrl) {
+    discordWebhookUrl = await loadWebhookUrl();
   }
 
   return {
@@ -104,14 +153,23 @@ export async function loadConfig(): Promise<WatchdogConfig> {
     watchdogDir,
     heartbeatFile: path.join(watchdogDir, 'heartbeat'),
     stateFile: path.join(watchdogDir, 'state.json'),
+    breakerStateFile: path.join(watchdogDir, 'breaker.json'),
     counterFile: path.join(watchdogDir, 'prompt_count'),
+    lastPromptAtFile: path.join(watchdogDir, 'last_prompt_at'),
+    lastResponseAtFile: path.join(watchdogDir, 'last_response_at'),
+    lastToolAtFile: path.join(watchdogDir, 'last_tool_at'),
     logFile: path.join(watchdogDir, 'watchdog-ts.log'),
     discordChannelId,
     discordBotToken,
+    discordWebhookUrl,
     supabaseUrl,
     supabaseServiceKey,
     dashboardPort,
     tmuxSession,
     pollIntervalSec,
+    hangThresholdMin,
+    hangRestartCooldownSec,
+    hangSelfTest,
+    hangDetectionEnabled,
   };
 }

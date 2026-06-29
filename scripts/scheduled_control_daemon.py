@@ -41,7 +41,7 @@ from typing import Any
 # ── Config ────────────────────────────────────────────────────────────────────
 SUPABASE_URL = "https://ogqjjlbupqnvlcyrfnxi.supabase.co"
 ENV_FILE = Path.home() / "azlab/services/memory-mcp-server/.env"
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))  # was 30 — Supabase usage 2026-05-29
 USER_SYSTEMD_DIR = Path.home() / ".config/systemd/user"
 
 logging.basicConfig(
@@ -92,7 +92,10 @@ def rpc(name: str, params: dict) -> Any:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
+            body = resp.read()
+            if not body:
+                return None  # void-returning function
+            return json.loads(body)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
         log.error(f"RPC {name} failed: {e.code} {body[:200]}")
@@ -164,16 +167,29 @@ SYSTEMD_DROPIN_FILE = "wren-override.conf"
 
 
 def systemd_current_schedule(unit: str) -> str | None:
-    """Return current native schedule string in the same encoding the registry uses."""
+    """Return current native schedule string in the same encoding the registry uses.
+
+    OnCalendar / OnUnitActiveSec are ADDITIVE across the base unit and its
+    drop-ins; an empty assignment (e.g. our drop-in's `OnCalendar=`) resets the
+    accumulated list. The effective value is therefore the LAST non-empty line,
+    not the first. Using re.search() here grabbed the base unit's original line
+    and never matched the drop-in we just wrote — causing reconcile_systemd to
+    rewrite the drop-in + daemon-reload + restart + audit on EVERY poll. (Fixed
+    2026-06-11 after recurring Supabase IO-budget blowout.)
+    """
     rc, txt, _ = run(["systemctl", "--user", "cat", unit])
     if rc != 0:
         return None
-    on_cal = re.search(r"^OnCalendar\s*=\s*(.+)$", txt, re.M)
-    on_act = re.search(r"^OnUnitActiveSec\s*=\s*(.+)$", txt, re.M)
-    if on_cal:
-        return f"oncalendar:{on_cal.group(1).strip()}"
-    if on_act:
-        return f"every:{on_act.group(1).strip()}"
+    # NOTE: use [ \t]* (not \s*) for inter-token whitespace — \s* matches
+    # newlines, so on our drop-in's empty `OnCalendar=` reset line it would
+    # swallow the following line and capture "OnCalendar=..." literally,
+    # permanently breaking the comparison.
+    cals = [m.strip() for m in re.findall(r"^OnCalendar[ \t]*=[ \t]*(.*)$", txt, re.M) if m.strip()]
+    acts = [m.strip() for m in re.findall(r"^OnUnitActiveSec[ \t]*=[ \t]*(.*)$", txt, re.M) if m.strip()]
+    if cals:
+        return f"oncalendar:{cals[-1]}"
+    if acts:
+        return f"every:{acts[-1]}"
     return None
 
 
@@ -201,6 +217,11 @@ def systemd_write_dropin(unit: str, desired_schedule: str) -> tuple[bool, str]:
 
     try:
         dropin_dir.mkdir(parents=True, exist_ok=True)
+        # Idempotency guard: if the managed drop-in already holds exactly this
+        # body, do not rewrite / daemon-reload / restart. Defence-in-depth so a
+        # schedule-comparison miss can never re-trigger the 30s thrash loop.
+        if dropin_path.exists() and dropin_path.read_text() == body:
+            return (True, "drop-in already current")
         dropin_path.write_text(body)
     except OSError as e:
         return (False, f"failed to write {dropin_path}: {e}")
@@ -526,12 +547,115 @@ def auto_unpause(rows: list[dict]) -> None:
             log.warning(f"auto-unpause failed for {row['name']}: {e}")
 
 
+# ── systemd run-history poll ─────────────────────────────────────────────────
+#
+# The reconcile_* handlers only push registry → native. They never read native
+# run results back. That left last_run_at/runs[] frozen at whatever value the
+# seed script wrote (e.g. R2 backup stuck at 2026-04-30). This poll closes the
+# loop for systemd-backed activities (kind=systemd and kind=agent_loop, since
+# agent_loop's source_ref.service is also a systemd unit).
+
+def _systemd_service_for_row(row: dict) -> str | None:
+    """Map a row's source_ref to the .service unit that actually does work."""
+    if row["kind"] == "agent_loop":
+        svc = row["source_ref"].get("service")
+        return svc if svc and svc.endswith(".service") else None
+    unit = row["source_ref"].get("unit") or ""
+    if unit.endswith(".timer"):
+        return unit[:-6] + ".service"
+    if unit.endswith(".service"):
+        return unit
+    return None
+
+
+def _parse_systemd_ts(ts: str) -> str | None:
+    """`systemctl show` prints 'Wed 2026-05-28 02:00:08 UTC' or empty/'0' when
+    never run. Return ISO-8601 (UTC) or None."""
+    from datetime import datetime, timezone
+    s = (ts or "").strip()
+    if not s or s in {"0", "n/a"}:
+        return None
+    parts = s.split(None, 1)
+    if len(parts) == 2 and len(parts[0]) == 3:  # drop weekday
+        s = parts[1]
+    tokens = s.split()
+    try:
+        if len(tokens) >= 3 and tokens[2].upper() == "UTC":
+            return datetime.strptime(f"{tokens[0]} {tokens[1]}", "%Y-%m-%d %H:%M:%S")\
+                .replace(tzinfo=timezone.utc).isoformat()
+        return datetime.fromisoformat(s).isoformat()
+    except Exception:
+        return None
+
+
+def poll_systemd_run_history(row: dict) -> None:
+    """If the unit ran more recently than row.last_run_at, record it."""
+    if row["kind"] not in ("systemd", "agent_loop"):
+        return
+    service = _systemd_service_for_row(row)
+    if not service:
+        return
+    rc, out, _ = run([
+        "systemctl", "--user", "show", service,
+        "--property=ExecMainStartTimestamp,ExecMainExitTimestamp,Result",
+    ])
+    if rc != 0:
+        return
+    fields: dict[str, str] = {}
+    for ln in out.splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            fields[k] = v
+    start_iso = _parse_systemd_ts(fields.get("ExecMainStartTimestamp", ""))
+    exit_iso  = _parse_systemd_ts(fields.get("ExecMainExitTimestamp", ""))
+    # Only record completed runs (oneshot/agent_loop both populate ExecMainExitTimestamp on exit)
+    if not start_iso or not exit_iso:
+        return
+
+    from datetime import datetime
+    last = row.get("last_run_at")
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if datetime.fromisoformat(start_iso) <= last_dt:
+                return  # already recorded
+        except Exception:
+            pass
+
+    duration_sec: int | None = None
+    try:
+        sdt = datetime.fromisoformat(start_iso)
+        edt = datetime.fromisoformat(exit_iso)
+        duration_sec = max(0, int((edt - sdt).total_seconds()))
+    except Exception:
+        pass
+
+    result_word = (fields.get("Result") or "").strip() or "unknown"
+    status = "success" if result_word == "success" else "failed"
+    try:
+        rpc("record_scheduled_run", {
+            "p_name":           row["name"],
+            "p_status":         status,
+            "p_result_summary": f"systemd Result={result_word}",
+            "p_run_at":         start_iso,
+            "p_duration_sec":   duration_sec,
+            "p_notes":          None,
+        })
+        log.info(f"recorded systemd run for {row['name']}: status={status} run_at={start_iso} dur={duration_sec}s")
+    except Exception as e:
+        log.warning(f"record_scheduled_run failed for {row['name']}: {e}")
+
+
 def tick() -> None:
-    rows = rest_get("scheduled_activity?select=id,name,kind,schedule,enabled,paused_at,unpause_at,pause_reason,source_ref&order=name")
+    rows = rest_get("scheduled_activity?select=id,name,kind,schedule,enabled,paused_at,unpause_at,pause_reason,source_ref,last_run_at&order=name")
     log.debug(f"tick: {len(rows)} rows")
     auto_unpause(rows)
     for row in rows:
         reconcile_one(row)
+        try:
+            poll_systemd_run_history(row)
+        except Exception as e:
+            log.warning(f"poll_systemd_run_history failed for {row['name']}: {e}")
 
 
 def main() -> int:

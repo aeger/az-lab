@@ -2,6 +2,14 @@ import { config } from '../config';
 import type { NotificationStore } from './store';
 import { DiscordAlerter } from './discord-alert';
 
+export interface DigestSummary {
+  unreadCount: number;
+  criticalCount: number;
+  byUrgency: Record<string, number>;
+  bySource: Record<string, number>;
+  content: string;
+}
+
 export class DigestScheduler {
   private timer: NodeJS.Timeout | null = null;
 
@@ -19,25 +27,8 @@ export class DigestScheduler {
     if (this.timer) clearTimeout(this.timer);
   }
 
-  private scheduleNext() {
-    const now = new Date();
-    const next = new Date();
-    next.setUTCHours(config.discord.digestHour, 0, 0, 0);
-    if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-    const msUntil = next.getTime() - now.getTime();
-    console.log(`[digest] next run at ${next.toISOString()} (${Math.round(msUntil / 60000)} min from now)`);
-
-    this.timer = setTimeout(async () => {
-      await this.sendDigest();
-      this.scheduleNext();
-    }, msUntil);
-  }
-
-  private async sendDigest() {
-    if (!config.discord.botToken || !config.discord.channelId) return;
-
+  async buildDigest(): Promise<DigestSummary> {
     const { notifications, unreadCount, criticalCount } = this.store.query({ status: 'unread', limit: 200 });
-    if (unreadCount === 0) return;
 
     const byUrgency: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
     const bySource: Record<string, number> = {};
@@ -66,14 +57,41 @@ export class DigestScheduler {
       }
     }
 
-    const url = `https://discord.com/api/v10/channels/${config.discord.channelId}/messages`;
-    await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bot ${config.discord.botToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ content: lines.join('\n').slice(0, 2000) }),
-    });
+    const content = lines.join('\n').slice(0, 2000);
+
+    return { unreadCount, criticalCount, byUrgency, bySource, content };
+  }
+
+  async runDigest(): Promise<DigestSummary> {
+    const summary = await this.buildDigest();
+    if (summary.unreadCount === 0) return summary;
+
+    if (config.discord.botToken && config.discord.channelId) {
+      const url = `https://discord.com/api/v10/channels/${config.discord.channelId}/messages`;
+      await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bot ${config.discord.botToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ content: summary.content }),
+      });
+    }
+
+    return summary;
+  }
+
+  private scheduleNext() {
+    const now = new Date();
+    const next = new Date();
+    next.setUTCHours(config.discord.digestHour, 0, 0, 0);
+    if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+    const msUntil = next.getTime() - now.getTime();
+    console.log(`[digest] next run at ${next.toISOString()} (${Math.round(msUntil / 60000)} min from now)`);
+
+    this.timer = setTimeout(async () => {
+      await this.runDigest();
+      this.scheduleNext();
+    }, msUntil);
   }
 }

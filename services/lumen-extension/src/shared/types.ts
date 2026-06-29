@@ -44,6 +44,7 @@ export interface PageContext {
   title: string;
   selection?: string;
   metaDescription?: string;
+  text?: string; // visible page innerText (truncated) — lets Lumen "see" the page
   tabId: number;
 }
 
@@ -89,5 +90,6 @@ export interface AgentStatus {
   memoryMcp: 'connected' | 'disconnected' | 'error';
   supabase: 'connected' | 'disconnected' | 'error';
   agentBus: 'connected' | 'disconnected' | 'error';
-  anthropic: 'configured' | 'missing_key' | 'error';
+  security: 'connected' | 'error' | 'disconnected' | 'unknown'; // → dot CSS class
+  securityScore: number | null;
 }

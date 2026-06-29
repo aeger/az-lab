@@ -1,11 +1,45 @@
 import { Router } from 'express';
+import { v4 as uuidv4 } from 'uuid';
 import { NotificationStore } from '../lib/store';
 import { DigestScheduler } from '../lib/digest';
-import { NotificationSource, NotificationStatus } from '../types';
+import { NotificationSource, NotificationStatus, Severity, SentinelNotification } from '../types';
 import { parseSearchQuery } from '../lib/nemotron';
+
+const VALID_SOURCES: NotificationSource[] = ['task_queue', 'home_assistant', 'discord', 'grafana', 'services', 'agent_health'];
+const VALID_SEVERITIES: Severity[] = ['critical', 'warning', 'info'];
 
 export function notificationsRouter(store: NotificationStore, digest?: DigestScheduler): Router {
   const router = Router();
+
+  // POST /api/notifications — ingest an external notification (e.g. from the desktop
+  // Lumen auto-updater). Shows in the Sentinel feed like any collector notification.
+  // Set metadata.discord_notify=true to force a Discord ping regardless of severity.
+  router.post('/notifications', (req, res) => {
+    const b = req.body ?? {};
+    if (!b.title || typeof b.title !== 'string') {
+      return res.status(400).json({ error: 'title is required' });
+    }
+    const source: NotificationSource = VALID_SOURCES.includes(b.source) ? b.source : 'services';
+    const severity: Severity = VALID_SEVERITIES.includes(b.severity) ? b.severity : 'info';
+    const now = new Date().toISOString();
+    const n: SentinelNotification = {
+      id: uuidv4(),
+      source,
+      severity,
+      urgency: 'medium', // recomputed by store.add via severityToUrgency
+      status: 'unread',
+      title: b.title.slice(0, 500),
+      body: typeof b.body === 'string' ? b.body.slice(0, 4096) : '',
+      category: typeof b.category === 'string' ? b.category.slice(0, 100) : 'external',
+      sourceId: typeof b.sourceId === 'string' ? b.sourceId.slice(0, 200) : `ext:${uuidv4()}`,
+      metadata: (b.metadata && typeof b.metadata === 'object') ? b.metadata : {},
+      timestamp: typeof b.timestamp === 'string' ? b.timestamp : now,
+      receivedAt: now,
+    };
+    const created = store.add(n);
+    if (!created) return res.status(409).json({ error: 'Duplicate (source:category:sourceId already seen)' });
+    res.status(201).json({ ok: true, notification: n });
+  });
 
   router.get('/notifications', (req, res) => {
     const since = req.query.since as string | undefined;
@@ -20,13 +54,13 @@ export function notificationsRouter(store: NotificationStore, digest?: DigestSch
   // Persistent history from Supabase — survives API restarts
   router.get('/notifications/history', async (req, res) => {
     const source = req.query.source as NotificationSource | undefined;
-    const status = req.query.status as string | undefined;
-    const urgency = req.query.urgency as string | undefined;
+    const statusStr = req.query.status as string | undefined;
+    const status = (statusStr && ['unread', 'read', 'dismissed'].includes(statusStr) ? statusStr : undefined) as any;
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
     const offset = req.query.offset ? parseInt(req.query.offset as string, 10) : 0;
     const days = req.query.days ? parseInt(req.query.days as string, 10) : 7;
 
-    const result = await store.queryHistory({ source, status, urgency, limit, offset, days });
+    const result = await store.queryHistory({ source, status, limit, offset, days });
     res.json(result);
   });
 
@@ -46,7 +80,8 @@ export function notificationsRouter(store: NotificationStore, digest?: DigestSch
 
   router.post('/notifications/read-all', (req, res) => {
     const source = req.body?.source as NotificationSource | undefined;
-    const count = store.markAllRead(source);
+    const filter = source ? { source } : undefined;
+    const count = store.markAllRead(filter);
     res.json({ ok: true, count });
   });
 

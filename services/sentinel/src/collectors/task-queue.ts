@@ -12,7 +12,11 @@ export function createTaskQueueCollector() {
     if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text()}`);
     const tasks: any[] = await res.json() as any[];
 
-    return tasks.map(task => {
+    // Build notifications with dedup per task — keep highest severity
+    const notifsByTaskId = new Map<string, SentinelNotification>();
+    const severityRank: Record<string, number> = { critical: 3, warning: 2, info: 1 };
+
+    for (const task of tasks) {
       let severity: 'critical' | 'warning' | 'info' = 'info';
       let category = `task_${task.status}`;
       let title = task.title;
@@ -32,7 +36,6 @@ export function createTaskQueueCollector() {
           category = 'task_stale';
         }
       } else if (task.status === 'in_progress') {
-        // in_progress tasks are informational unless very overdue
         const ageMs = Date.now() - new Date(task.updated_at || task.created_at).getTime();
         if (ageMs > 4 * 60 * 60 * 1000) { // stuck > 4hr
           severity = 'warning';
@@ -41,7 +44,7 @@ export function createTaskQueueCollector() {
         }
       }
 
-      return {
+      const notif: SentinelNotification = {
         id: uuidv4(),
         source: 'task_queue' as const,
         severity,
@@ -61,6 +64,14 @@ export function createTaskQueueCollector() {
         timestamp: task.updated_at || task.created_at,
         receivedAt: new Date().toISOString(),
       };
-    });
+
+      // Keep only the highest severity notification per task
+      const existing = notifsByTaskId.get(task.id);
+      if (!existing || severityRank[severity] > severityRank[existing.severity]) {
+        notifsByTaskId.set(task.id, notif);
+      }
+    }
+
+    return Array.from(notifsByTaskId.values());
   };
 }

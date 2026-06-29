@@ -14,6 +14,9 @@ export type FetchFn = typeof fetch;
 export interface DiscordConfig {
   botToken: string;
   channelId: string;
+  /** If set, post via this "Dashboard" webhook instead of the bot token, so
+   *  watchdog alerts are visually distinct from Wren's conversational replies. */
+  webhookUrl?: string;
   /** Injectable fetch for testing */
   fetchFn?: FetchFn;
   /** Fallback log file when Discord is unreachable */
@@ -48,12 +51,23 @@ export class DiscordNotifier {
       timestamp: new Date().toISOString(),
     };
 
-    const body = JSON.stringify({ embeds: [embed] });
-    const url = `https://discord.com/api/v10/channels/${this.config.channelId}/messages`;
-    const headers = {
-      'Authorization': `Bot ${this.config.botToken}`,
-      'Content-Type': 'application/json',
-    };
+    // Primary: the "Dashboard" webhook (posts under the webhook identity);
+    // fallback to the bot API when no webhook is configured.
+    const useWebhook = !!this.config.webhookUrl;
+    const body = JSON.stringify(
+      useWebhook
+        ? { username: 'Dashboard · Watchdog', embeds: [embed] }
+        : { embeds: [embed] },
+    );
+    const url = useWebhook
+      ? this.config.webhookUrl!
+      : `https://discord.com/api/v10/channels/${this.config.channelId}/messages`;
+    const headers: Record<string, string> = useWebhook
+      ? { 'Content-Type': 'application/json' }
+      : {
+          'Authorization': `Bot ${this.config.botToken}`,
+          'Content-Type': 'application/json',
+        };
 
     let lastError: string = '';
 

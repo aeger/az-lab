@@ -13,10 +13,10 @@ import { notificationsRouter } from './routes/notifications';
 import { settingsRouter } from './routes/settings';
 import { extensionRouter } from './routes/extension';
 import { actionsRouter } from './routes/actions';
-import { CollectorConfig } from './types';
 
 // Collectors
 import { createTaskQueueCollector } from './collectors/task-queue';
+import { createAtlasTaskCollector } from './collectors/atlas-tasks';
 import { createHACollector } from './collectors/home-assistant';
 import { createDiscordCollector } from './collectors/discord';
 import { createGrafanaCollector } from './collectors/grafana';
@@ -70,6 +70,57 @@ if (config.discord.breakingAlertsEnabled && config.discord.alertChannelId) {
   console.log(`[breaking-alert] enabled — threshold: ${minSeverity}+`);
 }
 
+// Atlas-task pings: route every notification flagged with metadata.atlas_notify to Discord,
+// regardless of the breaking-alert severity threshold. Skip if breaking-alert already sent it.
+{
+  const severityRank: Record<string, number> = { info: 1, warning: 2, critical: 3 };
+  const threshold = severityRank[config.discord.breakingSeverity] ?? 3;
+  const breakingActive = config.discord.breakingAlertsEnabled && !!config.discord.alertChannelId;
+  const atlasMention = process.env.DISCORD_ATLAS_MENTION || '';
+
+  store.onNew(n => {
+    if (n.source !== 'task_queue' || !n.metadata?.atlas_notify) return;
+    if (breakingActive && (severityRank[n.severity] ?? 0) >= threshold) return; // breaking-alert handled it
+    const send = atlasMention
+      ? alerter.sendRaw({
+          content: atlasMention,
+          allowed_mentions: { parse: ['users', 'roles'] },
+          embeds: [{
+            title: `📋 ${n.title}`,
+            description: n.body.slice(0, 4096),
+            color: 0x6366F1,
+            fields: [
+              { name: 'Source', value: String(n.metadata?.source_agent ?? 'unknown'), inline: true },
+              { name: 'Target', value: String(n.metadata?.target_agent ?? 'atlas'), inline: true },
+              { name: 'Priority', value: String(n.metadata?.priority ?? 'n/a'), inline: true },
+            ],
+            timestamp: n.timestamp,
+            footer: { text: 'az-lab sentinel · atlas-task' },
+          }],
+        })
+      : alerter.sendAlert(n);
+    send.catch(err => console.error('[atlas-task-alert] failed to send:', err.message));
+  });
+  console.log(`[atlas-task-alert] enabled${atlasMention ? ` — mention: ${atlasMention}` : ''}`);
+}
+
+// discord_notify pings: any notification flagged with metadata.discord_notify gets a Discord
+// alert regardless of the breaking-alert severity threshold (used by the ingest endpoint, e.g.
+// the desktop Lumen auto-updater). Skip if breaking-alert already sent it.
+{
+  const severityRank: Record<string, number> = { info: 1, warning: 2, critical: 3 };
+  const threshold = severityRank[config.discord.breakingSeverity] ?? 3;
+  const breakingActive = config.discord.breakingAlertsEnabled && !!config.discord.alertChannelId;
+
+  store.onNew(n => {
+    if (!n.metadata?.discord_notify) return;
+    if (n.source === 'task_queue' && n.metadata?.atlas_notify) return; // atlas-task handled it
+    if (breakingActive && (severityRank[n.severity] ?? 0) >= threshold) return; // breaking-alert handled it
+    alerter.sendAlert(n).catch(err => console.error('[discord-notify] failed to send:', err.message));
+  });
+  console.log('[discord-notify] enabled');
+}
+
 // Build collectors
 const collectors = [
   {
@@ -77,6 +128,12 @@ const collectors = [
     fn: createTaskQueueCollector(),
     intervalMs: config.supabase.pollInterval,
     enabled: isCollectorEnabled('task_queue'),
+  },
+  {
+    name: 'atlas_tasks',
+    fn: createAtlasTaskCollector(),
+    intervalMs: config.supabase.pollInterval,
+    enabled: isCollectorEnabled('atlas_tasks'),
   },
   {
     name: 'home_assistant',

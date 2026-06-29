@@ -14,8 +14,15 @@ export function App() {
     memoryMcp: 'disconnected',
     supabase: 'disconnected',
     agentBus: 'disconnected',
-    anthropic: 'missing_key',
+    security: 'unknown',
+    securityScore: null,
   });
+
+  const securityLabel = (s: AgentStatus) => {
+    if (s.securityScore == null) return 'Security: unavailable';
+    const tier = s.securityScore >= 80 ? 'Good' : s.securityScore >= 60 ? 'Fair' : 'At Risk';
+    return `Security: ${s.securityScore} — ${tier}`;
+  };
 
   useEffect(() => {
     chrome.runtime.sendMessage({ type: 'GET_STATUS' }).then((res: any) => {
@@ -50,7 +57,7 @@ export function App() {
           <div class={`status-dot ${status.supabase}`} title={`Supabase: ${status.supabase}`} />
           <div class={`status-dot ${status.memoryMcp}`} title={`Memory MCP: ${status.memoryMcp}`} />
           <div class={`status-dot ${status.agentBus}`} title={`Agent Bus: ${status.agentBus}`} />
-          <div class={`status-dot ${status.anthropic}`} title={`Claude API: ${status.anthropic}`} />
+          <div class={`status-dot ${status.security}`} title={securityLabel(status)} />
         </div>
       </div>
 

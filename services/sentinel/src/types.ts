@@ -5,7 +5,7 @@ export type Urgency = 'critical' | 'high' | 'medium' | 'low';
 export type Severity = 'critical' | 'warning' | 'info';
 
 // notification_source enum values in Supabase (DO NOT add new values without altering enum)
-export type NotificationSource = 'task_queue' | 'home_assistant' | 'discord' | 'grafana' | 'services';
+export type NotificationSource = 'task_queue' | 'home_assistant' | 'discord' | 'grafana' | 'services' | 'agent_health';
 
 export type NotificationStatus = 'unread' | 'read' | 'dismissed';
 
@@ -47,6 +47,18 @@ export interface HistoryResponse {
   notifications: SentinelNotification[];
   total: number;
   offset: number;
+}
+
+export interface CollectorHealth {
+  status: 'ok' | 'error' | 'stale';
+  lastRun?: string;
+  message?: string;
+}
+
+export interface HealthResponse {
+  status: 'ok' | 'degraded';
+  uptime: number;
+  collectors: Record<string, CollectorHealth>;
 }
 
 // Map Supabase severity → urgency

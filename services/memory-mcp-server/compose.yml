@@ -55,17 +55,26 @@ services:
       - "traefik.http.services.memory-mcp.loadbalancer.server.port=3100"
 
   # ─── TEI Cross-Encoder Reranker ─────────────────────────────────────────────
-  # bge-reranker-v2-m3: lightweight cross-encoder, ~570MB, CPU-only, ~80ms latency
+  # bge-reranker-base: lightweight cross-encoder, ~330MB, CPU-only, ~100ms latency
+  # v2-m3 lacks ONNX files on HF → switched to -base with verified ONNX support
   # First start downloads model from HuggingFace into tei-model-cache volume
   tei-reranker:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
     container_name: az-tei-reranker
     restart: unless-stopped
-    command: --model-id BAAI/bge-reranker-v2-m3 --port 8080
+    command: --model-id BAAI/bge-reranker-base --port 8080
     volumes:
       - tei-model-cache:/data
     networks:
       - proxy
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
       interval: 30s
