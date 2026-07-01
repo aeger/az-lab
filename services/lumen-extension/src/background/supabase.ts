@@ -84,6 +84,26 @@ async function supabaseRead<T>(path: string): Promise<T> {
   return text ? JSON.parse(text) : ([] as unknown as T);
 }
 
+// Lightweight connectivity probe for the Supabase status dot. Does a cheap
+// single-row read (HEAD-style select) so the heartbeat can re-evaluate the dot
+// on every tick — without this, the dot is only ever set at startup and gets
+// stuck on a stale value (e.g. after an API-key rotation) until a browser restart.
+export async function supabaseHealthCheck(): Promise<boolean> {
+  try {
+    const config = await getConfig();
+    const res = await fetch(`${config.supabaseUrl}/rest/v1/memories?select=name&limit=1`, {
+      headers: {
+        apikey: config.supabaseAnonKey,
+        Authorization: `Bearer ${config.supabaseAnonKey}`,
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 // --- Memories ---
 
 export async function fetchMemories(type?: string, limit = 50): Promise<Memory[]> {
