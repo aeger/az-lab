@@ -11,7 +11,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.website.rule=Host(`www.az-lab.dev`) || Host(`az-lab.dev`)"
       - "traefik.http.routers.website.entrypoints=websecure"
-      - "traefik.http.routers.website.tls.certresolver=cloudflare"
+      - "traefik.http.routers.website.tls.certresolver=le"
       - "traefik.http.services.website.loadbalancer.server.port=8080"
       # Redirect bare domain to www
       - "traefik.http.middlewares.www-redirect.redirectregex.regex=^https://az-lab\\.dev/(.*)"
