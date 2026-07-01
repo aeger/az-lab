@@ -150,7 +150,8 @@ Six phases. Phase 1 is the funded core (Part B). Phases 2–6 cover the workstre
 - **Better metrics:** surface the Prometheus stack that already exists (node/blackbox/snmp/podman/cadvisor exporters + Grafana) directly in the dashboard: host CPU/mem/disk, container health, ZFS pool usage (nvme-fast is ~75% full per prior audit), **Claude programmatic spend vs. $100 bucket** (from Phase 1), agent liveness (from Phase 5).
 - **Modularity:** refactor dashboard widgets into self-contained modules with a documented data-source contract, so new tiles (metrics, agents, spend) drop in without touching core.
 - **Feature review:** audit existing dashboard tabs (Goals, Tasks, Scheduled, Agent terminal, Gmail widget) — keep/merge/retire; document each tile's purpose and data source.
-- **Advances:** Strategy 2 (observability), Strategy 4 (documentation/visibility). **Risk:** low-med (UI). **Rollback:** dashboard is git-tracked + image-built; revert + rebuild.
+- **Notification service — ntfy mobile push** *(design: `~/claude/context/notification-service-evaluation.md`)*: deploy `ntfy` as a single Podman container behind Traefik/LE (`ntfy.az-lab.dev`, DNS-only A record), filling the mobile-push gap — Discord is noisy, Sentinel is desktop-only, the dashboard is pull-only. Topics: `atlas-tasks`, `ha-alerts`, `grafana`, `wren-ops`, `adhoc`. Sentinel stays the alerting brain; ntfy is an added transport. **Deploy security-first given today's sweep:** `auth-default-access: deny-all` + per-topic tokens, and gate the public-exposure choice (option 5a public-with-auth) on the **RB5009 NAT audit** — do not add a public endpoint blind right after finding `grimoire` unprotected and the Agent Bus on `0.0.0.0`. iOS uses the ntfy.sh APNS relay (keep sensitive payloads on Android-only topics / E2EE). **Killer use case:** wire agent "Needs Jeff" flags and **Council "escalate to Jeff"** decisions (Phase 5/6) to ntfy **P5** push — that's the integration point with the Council. ~2h, sequence *after* the Sentinel cleanup. A council-session + notification audit tile lands here as a dashboard module.
+- **Advances:** Strategy 2 (observability), Strategy 4 (documentation/visibility), Jeff's low-volume/memory-friendly notification UX. **Risk:** low-med (UI + one new public-capable service — mitigated by strict auth + NAT audit). **Rollback:** dashboard is git-tracked + image-built; ntfy is a self-contained compose stack — revert + rebuild / stop the stack.
 
 ### Phase 3 — Infrastructure inventory & hygiene
 - **Reclaim** stopped VMs 103/104 (confirm unused → archive/delete, free 16 GB RAM / 128 GB disk) — **destructive, Jeff-gated.**
@@ -171,12 +172,18 @@ Six phases. Phase 1 is the funded core (Part B). Phases 2–6 cover the workstre
 - **Formalize the roster** (6 agents + Lumen) into a canonical `AGENTS.md` with surface, role, auth (post-Phase-1), and escalation path; reconcile the "not-agents" (Argus/Sentinel/Dispatch) as *services*.
 - **Fix the telemetry gap:** make every agent write to `agent_activity` (or a heartbeat) so liveness is observable; surface it in the dashboard (Phase 2).
 - **Model-routing review:** update `model_routing_primary` now that **Sonnet 5 / Opus 4.8 / Fable 5** exist — codify Sonnet 5 as the default agentic executor, Opus 4.8 for hard reasoning, NemoClaw for bulk/free, and (optionally) the **Advisor pattern** for multi-step agent loops.
-- **Revive paused governance objectives:** Council of Agents (multi-model consensus for Guardian), Transparency mandates (visible scratchpads) — both align with Strategies 3–4.
-- **Advances:** Vision core (multi-agent collaboration + governance), Strategy 4. **Risk:** low. **Rollback:** doc/config.
+- **Revive the Council of Agents** *(design: `~/claude/context/az-lab-council-ai-design.md`)* — the paused Strategy-2 objective. Mixture-of-Agents consensus: 5 members deliberate in two rounds (independent → informed revision), moderator (Guardian) synthesizes (unanimous/majority → execute; split → escalate to Jeff; denied → block). Uncorrelated errors across model families = a security primitive against prompt-injected task_queue requests. **Updates to the design before build:**
+  - **Refresh the stale model IDs:** the doc specs `claude-sonnet-4-6` ×3 + `codex-latest`. Use **Sonnet 5** (reasoner, devil's-advocate), **Opus 4.8** (safety reviewer — weight it higher), and pin a real Codex model.
+  - **Swap one Codex slot → NemoClaw** (local Nemotron): free, genuinely independent (non-Anthropic/non-OpenAI), advances Strategy 4 model-diversification and cuts cost. Net roster: 2 Claude + 1 Opus + 1 Codex + 1 NemoClaw.
+  - **Routing:** Claude/Opus members run through the **Phase-1 Max-plan OAuth broker** (draws the $100 bucket); Codex is **separate OpenAI billing**. Per-decision cost ~$0.025–0.10 Claude-side + Codex + free NemoClaw — cheap insurance for high-stakes gates.
+  - **Schema with RLS:** `council_sessions` + `council_votes` tables (from the doc) get RLS at migration per `auto_rls_enforcement`.
+  - **Escalation → ntfy P5** (Phase 2): "split — Jeff required" pushes to the phone, not just Discord.
+- **Transparency mandates** (visible scratchpads) — the other paused governance objective; aligns with Strategies 3–4.
+- **Advances:** Vision core (multi-agent collaboration + governance), Strategy 3 (the Council is the high-risk gate), Strategy 4. **Risk:** low (additive; council only fires on high-risk). **Rollback:** doc/config; council is opt-in per trigger.
 
 ### Phase 6 — Vision & goals execution
 Tackle the unstarted governance frontier (the bulk of the vision that's `planned`/0%):
-- **Strategy 3 (Action Gating):** implement the tiered-autonomy model (low→auto, medium→auto+log+review, high→gated) as enforced policy, not just doctrine. Ties to the Guardian/constitution machinery already live.
+- **Strategy 3 (Action Gating):** implement the tiered-autonomy model (low→auto, medium→auto+log+review, high→gated) as enforced policy, not just doctrine. Ties to the Guardian/constitution machinery already live — and **the Council of Agents (Phase 5) is the concrete "high-risk → gated" mechanism**: high-risk task_queue items (VM/container/firewall changes, secret access, bulk ops, unclassifiable requests) route to a council vote, which either approves with logged reasoning or escalates to Jeff (via ntfy P5). Action-gating policy + Council + ntfy escalation form one enforced high-risk pipeline.
 - **Strategy 5 (Architectural Isolation):** Supabase RLS + immutable audit logs (RLS enforcement rule already exists); network/hardware scoping; containerize/micro-VM hardening.
 - **P0 `rollback-first design`** and **paused P1 `Gmail OAuth long-term fix`** (7-day refresh-token expiry — chronic pain, now solvable with the same OAuth-broker pattern from Phase 1).
 - **Hardware objectives:** Pi Cluster Phase 1 (3-node Proxmox, 2× Pi 5), Wyoming Voice Satellite + Sense HAT Pi — as capacity/interest allows.
@@ -195,9 +202,11 @@ Tackle the unstarted governance frontier (the bulk of the vision that's `planned
 ### Decisions needed from Jeff
 1. **Phase 1 auth path:** OK to build the `claude-token-broker` (device-code login once, you approve the browser step), vs. installing Go for `ant`? (Broker recommended.)
 2. **VM reclaim (Phase 3):** confirm `svc-docker-01` (103) and `ubuntu-24-docker-base` (104) are dead → delete after snapshot?
-3. **Security quick-wins (Phase 4):** want me to apply the low-risk fixes (chmod the exposed key + Authelia configs, `grimoire` access-control, website cert-resolver) **now**, ahead of the phased work? These are High-severity and ~5 minutes.
+3. **Security quick-wins (Phase 4): ✅ DONE 2026-07-01** — SSH key + 12 world-readable secret/config files locked down; website cert-resolver fixed (valid LE cert serving). **Held:** `grimoire` access-control (pending: does Heather need external access?); Authelia SMTP secret **rotation** deferred to Phase 4.
 4. **2FA rollout (Phase 4):** enable TOTP on Authelia infra panels? (Requires you to enroll an authenticator.)
-5. **Sequencing:** run phases in order, or pull Security (Phase 4 quick-wins) forward immediately?
+5. **Sequencing:** run phases in order, or pull specific items forward?
+6. **Council roster (Phase 5):** confirm the refreshed 5-member roster — Sonnet 5 (reasoner + devil's-advocate), Opus 4.8 (safety, weighted), 1 Codex, **NemoClaw** (swapped in for the 2nd Codex)? Or keep 2 Codex and add NemoClaw as a 6th?
+7. **ntfy exposure (Phase 2):** public-with-auth (5a) or LAN+VPN (5b)? And is **iOS** in scope now (decides whether we need the ntfy.sh relay caveat)? Which events must **never** hit the phone (research digests, low-sev Sentinel)?
 
 ---
 
@@ -216,5 +225,9 @@ P0: `wren_constitution` (7 principles), `kill_switch_check`. P1: `priority_scale
 **Medium:** no 2FA in Authelia; website `cloudflare` cert-resolver broken; Agent Bus 0.0.0.0 binding; Authelia 9091 all-interfaces; RB5009 NAT unaudited.
 **Low:** unidentified listeners 44321-3/9882; orphaned ACME certs; unused `lan-auth`; ufw state unverified.
 
+## Appendix 4 — Design inputs (existing context docs folded in)
+- **`~/claude/context/az-lab-council-ai-design.md`** (2026-05-02) — Council of Agents / Mixture-of-Agents consensus for Guardian. Folded into **Phase 5** (roster refresh: Sonnet 5 / Opus 4.8 / Codex / NemoClaw; Max-plan routing; RLS schema) and **Phase 6** (Strategy 3 high-risk gate). Two-round deliberation, `council_sessions`/`council_votes` schema, moderator tally (unanimous/majority → execute; split → escalate; denied → block), ~$0.025–0.10/decision. Reviewer note: model IDs in the doc are stale (sonnet-4-6/codex-latest) — refresh before build.
+- **`~/claude/context/notification-service-evaluation.md`** (2026-05-28) — Self-hosted mobile-push evaluation → **ntfy** recommended. Folded into **Phase 2**. Single container behind Traefik/LE, topics + priorities + actions, ntfy.sh APNS relay for iOS. Reviewer note: deploy security-first (deny-all auth, per-topic tokens) and gate public exposure on the RB5009 NAT audit; wire agent/Council escalations to P5.
+
 ---
-*Generated by Wren on svc-podman-01, 2026-07-01. Inputs: live infra/agent/security sweep + Supabase goals/rules. Times Arizona MST. This document is a proposal — no changes in Parts C–F are made without the decisions in Part E.*
+*Generated by Wren on svc-podman-01, 2026-07-01. Inputs: live infra/agent/security sweep + Supabase goals/rules + two existing design docs (Council of Agents, ntfy notification eval — Appendix 4). Times Arizona MST. This document is a proposal — no changes in Parts C–F are made without the decisions in Part E. Security quick-wins (Decision 3) already applied 2026-07-01.*
