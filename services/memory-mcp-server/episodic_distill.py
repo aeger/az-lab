@@ -194,8 +194,28 @@ def summarize_cluster_heuristic(memories: list) -> str:
     parts = [f"{m['name']}: {m['content'][:200]}" for m in top]
     return " | ".join(parts)
 
+# Shared Max-plan call helper (Tier 0 OAuth / Max bucket -> Tier 1 API key).
+sys.path.insert(0, os.path.expanduser("~/claude/lib"))
+try:
+    from claude_call import call_claude as _shared_claude_call
+except Exception:  # pragma: no cover - resilience if lib path is missing
+    _shared_claude_call = None
+
+
 def _call_claude_haiku(prompt: str, max_tokens: int = 256) -> str | None:
-    """Call claude-haiku-4-5 via Anthropic Messages API. Returns text or None on failure."""
+    """Distill via Claude, routed through the shared Max-plan chain (Tier 0 OAuth ->
+    Tier 1 API key). Returns text, or None on failure (caller then uses the heuristic)."""
+    if _shared_claude_call is not None:
+        try:
+            res = _shared_claude_call(
+                [{"role": "user", "content": prompt}],
+                model=HAIKU_MODEL, max_tokens=max_tokens, allow_tiers=(0, 1))
+            return (res.get("content") or "").strip() or None
+        except Exception as e:
+            log.warning(f"shared claude_call failed: {e}")
+            return None
+
+    # Legacy fallback: direct Haiku via API key (only if the shared helper is unavailable).
     if not ANTHROPIC_API_KEY:
         return None
     try:

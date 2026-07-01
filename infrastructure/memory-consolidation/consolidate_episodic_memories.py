@@ -149,8 +149,26 @@ def mark_consolidated(service_key, memory_id, current_tags):
 
 # ── Claude abstraction ─────────────────────────────────────────────────────────
 
+# Shared Max-plan call helper (Tier 0 OAuth -> Tier 1 API key -> Tier 2 NemoClaw).
+sys.path.insert(0, os.path.expanduser("~/claude/lib"))
+try:
+    from claude_call import call_claude as _shared_claude_call
+except Exception:  # pragma: no cover - resilience if lib path is missing
+    _shared_claude_call = None
+
+
 def call_claude(api_key, prompt):
-    """Call the Claude API. Returns the response text."""
+    """Return Claude's response text, routed through the shared Max-plan-first chain
+    (Tier 0 OAuth / Max bucket -> Tier 1 API key -> Tier 2 NemoClaw). Falls back to a
+    direct API-key call only if the shared helper is unavailable."""
+    if _shared_claude_call is not None:
+        if api_key:
+            os.environ.setdefault("ANTHROPIC_API_KEY", api_key)
+        res = _shared_claude_call(
+            [{"role": "user", "content": prompt}], model=CLAUDE_MODEL, max_tokens=1024)
+        return res["content"]
+
+    # Legacy fallback: direct API-key call (only if the shared helper failed to import).
     body = json.dumps({
         "model": CLAUDE_MODEL,
         "max_tokens": 1024,
