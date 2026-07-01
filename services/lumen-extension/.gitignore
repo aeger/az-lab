@@ -1,3 +1,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
+
+# Local build secrets (VITE_AGENT_BUS_SECRET) — never commit
+.env
+.env.local
