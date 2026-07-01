@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Lumen — az-lab Agent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Browser-native agent for the az-lab agentic system. Eyes on the internet.",
   "permissions": [
     "storage",
