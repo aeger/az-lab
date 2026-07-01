@@ -30,7 +30,7 @@ services:
       - "traefik.http.routers.traefik.tls=true"
       - "traefik.http.routers.traefik.tls.certresolver=le"
       - "traefik.http.routers.traefik.service=api@internal"
-      - "traefik.http.middlewares.traefik-allow.ipallowlist.sourcerange=192.168.1.0/24,10.7.0.0/24,10.89.0.0/16"
+      - "traefik.http.middlewares.traefik-allow.ipallowlist.sourcerange=192.168.1.0/24,192.168.99.0/24,10.7.0.0/24,10.89.0.0/16"
       - "traefik.http.routers.traefik.middlewares=traefik-allow,authelia-auth@file,strip-www-auth@file"
 
     command:
