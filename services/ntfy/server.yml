@@ -1,0 +1,30 @@
+# ntfy server config — az-lab (svc-podman-01)
+# Posture (Jeff decisions 2026-07-01):
+#   - PUBLIC-with-auth: reachable on websecure with NO lan-allow middleware.
+#     Access control is enforced HERE (deny-all + per-topic tokens), same as Discord.
+#   - ANDROID-ONLY: no upstream-base-url — fully self-hosted, end-to-end. No ntfy.sh relay.
+
+base-url: "https://ntfy.az-lab.dev"
+listen-http: ":80"          # Traefik terminates TLS on websecure and proxies here
+behind-proxy: true
+
+# Message cache (SQLite) + attachments
+cache-file: "/var/cache/ntfy/cache.db"
+cache-duration: "12h"
+attachment-cache-dir: "/var/lib/ntfy/attachments"
+attachment-total-size-limit: "1G"
+attachment-file-size-limit: "15M"
+
+# Auth — locked from FIRST BOOT. No anonymous read or write anywhere.
+# Per-topic access is granted explicitly via `ntfy access` (see README).
+auth-file: "/var/lib/ntfy/auth.db"
+auth-default-access: "deny-all"
+enable-signup: false
+enable-login: true
+
+# ANDROID-ONLY: upstream relay intentionally omitted. Do NOT set
+# upstream-base-url unless iOS is added later (it routes title/body via ntfy.sh).
+
+# Anti-storm (per Jeff's low-volume UX). Tune per topic in Sentinel/agent-bus.
+visitor-request-limit-burst: 60
+visitor-request-limit-replenish: "10s"
