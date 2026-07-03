@@ -65,8 +65,9 @@ def get_credentials():
     api_key = env.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY", "")
     if not service_key:
         raise RuntimeError(f"SUPABASE_SECRET_KEY not found in {MEMORY_MCP_ENV} or environment")
-    if not api_key:
-        raise RuntimeError(f"ANTHROPIC_API_KEY not found in {MEMORY_MCP_ENV} or environment")
+    # api_key is optional: call_claude() routes Tier-0-first through the shared
+    # Max-plan chain, which needs no local API key. Tier 1 simply won't be
+    # available without one — the chain handles that.
     return service_key, api_key
 
 
@@ -104,8 +105,10 @@ def fetch_episodic_memories(service_key):
         "order": "access_count.desc",
         "limit": str(BATCH_LIMIT),
     })
-    # Exclude already-consolidated ones
-    return [r for r in rows if "consolidated=true" not in (r.get("tags") or [])]
+    # Exclude already-consolidated ones — recognize BOTH tag dialects: this script's
+    # legacy 'consolidated=true' and episodic_distill.py's standard 'consolidated'.
+    return [r for r in rows
+            if not {"consolidated=true", "consolidated"} & set(r.get("tags") or [])]
 
 
 def insert_semantic_memory(service_key, name, description, content, source_tags):
@@ -140,8 +143,9 @@ def add_zettelkasten_link(service_key, source_id, target_id):
 
 
 def mark_consolidated(service_key, memory_id, current_tags):
-    """Append 'consolidated=true' tag to a source episode."""
-    new_tags = list(set((current_tags or []) + ["consolidated=true"]))
+    """Mark a source episode done — writes the standard 'consolidated' tag
+    (shared with episodic_distill.py) so both jobs see each other's work."""
+    new_tags = list(set((current_tags or []) + ["consolidated"]))
     sb_request(service_key, "PATCH", "/rest/v1/memories",
                params={"id": f"eq.{memory_id}"},
                body={"tags": new_tags})

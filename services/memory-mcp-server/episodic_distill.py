@@ -202,6 +202,12 @@ except Exception:  # pragma: no cover - resilience if lib path is missing
     _shared_claude_call = None
 
 
+def _haiku_available() -> bool:
+    """Haiku path works whenever the shared Tier-0-first chain imported (no local
+    API key needed) — or, legacy-only, when a direct API key is present."""
+    return _shared_claude_call is not None or bool(ANTHROPIC_API_KEY)
+
+
 def _call_claude_haiku(prompt: str, max_tokens: int = 256) -> str | None:
     """Distill via Claude, routed through the shared Max-plan chain (Tier 0 OAuth ->
     Tier 1 API key). Returns text, or None on failure (caller then uses the heuristic)."""
@@ -242,7 +248,7 @@ def _call_claude_haiku(prompt: str, max_tokens: int = 256) -> str | None:
 
 def summarize_cluster_haiku(memories: list) -> str | None:
     """Distill a cluster of episodic memories using claude-haiku-4-5 (cost-efficient fallback)."""
-    if not ANTHROPIC_API_KEY:
+    if not _haiku_available():
         return None
     snippets = "\n".join([
         f"- [{m['name']}]: {m['content'][:300]}"
@@ -260,7 +266,7 @@ def summarize_cluster_haiku(memories: list) -> str | None:
 
 def summarize_project_cluster_haiku(memories: list) -> str | None:
     """Distill a cluster of project memories into a reference fact using claude-haiku-4-5."""
-    if not ANTHROPIC_API_KEY:
+    if not _haiku_available():
         return None
     snippets = "\n".join([
         f"- [{m['name']}]: {m['content'][:300]}"
@@ -499,7 +505,10 @@ def main():
     try:
         episodic_memories = supa_get("memories", {
             "type": "eq.episodic",
-            "tags": f"not.cs.{{{CONSOLIDATED_TAG}}}",
+            # Overlap-exclude BOTH tag dialects: this script's 'consolidated' and the
+            # legacy consolidate_episodic_memories.py 'consolidated=true' — the two
+            # jobs were blind to each other's done-markers (double-processing risk).
+            "tags": f"not.ov.{{{CONSOLIDATED_TAG},consolidated=true}}",
             "created_at": f"lt.{episodic_cutoff}",
             "select": "id,name,description,content,tags,access_count,embedding",
             "order": "created_at.asc",
@@ -528,7 +537,7 @@ def main():
     log.info(f"Found {len(episodic_memories)} pure episodic type memories, {len(memories)} high-access memories for consolidation (access_count>={MIN_ACCESS_COUNT})")
 
     use_nemoclaw = bool(NEMOCLAW_KEY)
-    use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
+    use_haiku = _haiku_available() and not use_nemoclaw
     use_llm = use_nemoclaw or use_haiku
     if use_nemoclaw:
         llm_status = f"NemoClaw[{TRIAGE_MODEL}]"
@@ -826,7 +835,7 @@ def main_weekly():
     start = datetime.now(timezone.utc)
 
     use_nemoclaw = bool(NEMOCLAW_KEY)
-    use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
+    use_haiku = _haiku_available() and not use_nemoclaw
     llm_status = f"NemoClaw[{TRIAGE_MODEL}]" if use_nemoclaw else ("claude-haiku-4-5" if use_haiku else "heuristic")
     log.info(f"Summarization mode: {llm_status}")
 
