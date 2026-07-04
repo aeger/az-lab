@@ -51,7 +51,9 @@ services:
       - immich-internal
 
   immich-postgres:
-    image: tensorchord/pgvecto-rs:pg14-v0.2.0
+    # Immich v3 dropped pgvecto.rs — the official image bundles VectorChord
+    # (new) + pgvecto.rs 0.2.0 (old) so immich-server can auto-migrate data.
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.3.0-pgvectors0.2.0
     container_name: immich-postgres
     restart: unless-stopped
     environment:

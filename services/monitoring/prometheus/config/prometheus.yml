@@ -11,6 +11,7 @@ scrape_configs:
   static_configs:
   - targets:
     - node_exporter:9100
+    - 192.168.1.182:9100
 - job_name: cadvisor
   static_configs:
   - targets:
@@ -50,7 +51,8 @@ scrape_configs:
     - http_2xx
   static_configs:
   - targets:
-    - https://grafana.az-lab.dev
+    - https://www.az-lab.dev
+    - https://auth.az-lab.dev
   relabel_configs:
   - source_labels:
     - __address__
@@ -64,10 +66,13 @@ scrape_configs:
   metrics_path: /probe
   params:
     module:
-    - http_2xx_insecure
+    - http_2xx
   static_configs:
   - targets:
-    - https://crs309.home.arpa
+    - https://home.az-lab.dev
+    - https://memory-mcp.az-lab.dev/health
+    - https://ha.az-lab.dev
+    - https://photos.az-lab.dev
   relabel_configs:
   - source_labels:
     - __address__
@@ -84,7 +89,8 @@ scrape_configs:
     - http_2xx_allow_401_403
   static_configs:
   - targets:
-    - https://traefik.az-lab.dev/dashboard/#/
+    - https://traefik.az-lab.dev/dashboard/
+    - https://grafana.az-lab.dev
   relabel_configs:
   - source_labels:
     - __address__
