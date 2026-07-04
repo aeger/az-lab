@@ -1,0 +1,18 @@
+# Authelia at the edge for the dashboard's sensitive surfaces.
+#
+# The dashboard router (compose labels) is lan-allow only, but the terminal,
+# RustDesk, and proxy-management APIs assume an Authelia session (they verify
+# it server-side via auth.az-lab.dev/api/state). This router closes the gap:
+# these paths now REQUIRE login before the app even sees the request.
+# Longer rule => higher computed priority than the base Host() router.
+http:
+  routers:
+    dashboard-protected:
+      rule: "Host(`home.az-lab.dev`) && (PathPrefix(`/lab/terminal`) || PathPrefix(`/lab/rustdesk`) || PathPrefix(`/lab/proxies`) || PathPrefix(`/api/terminal`) || PathPrefix(`/api/rustdesk`) || PathPrefix(`/api/proxies`))"
+      entryPoints:
+        - websecure
+      tls: {}
+      middlewares:
+        - lan-allow
+        - authelia-auth
+      service: dashboard@docker
