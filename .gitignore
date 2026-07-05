@@ -65,3 +65,6 @@ services/memory-mcp-server/oom
 services/lumen-extension/lumen-dist.zip
 services/lumen-extension/pub/lumen-dist.zip
 services/lumen-extension/pub/lumen-dist.zip.sha256
+
+# in-place edit backups (tool-generated)
+*.bak.azlab

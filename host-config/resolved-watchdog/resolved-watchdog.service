@@ -1,0 +1,8 @@
+[Unit]
+Description=systemd-resolved health watchdog (restart on wedged DNS)
+After=systemd-resolved.service
+Wants=systemd-resolved.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/resolved-watchdog.sh
