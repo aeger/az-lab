@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly rotation of append-forever lab logs
+
+[Timer]
+OnCalendar=Mon *-*-* 04:45:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

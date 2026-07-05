@@ -69,7 +69,7 @@ cmd=(
   -l "traefik.http.routers.traefik.tls.certresolver=le"
   -l "traefik.http.routers.traefik.service=api@internal"
   -l "traefik.http.middlewares.traefik-auth.basicauth.usersfile=/secrets/traefik.htpasswd"
-  -l "traefik.http.middlewares.traefik-allow.ipallowlist.sourcerange=192.168.1.0/24,10.7.0.0/24,10.89.0.0/16"
+  -l "traefik.http.middlewares.traefik-allow.ipallowlist.sourcerange=192.168.1.0/24,192.168.99.0/24,10.7.0.0/24,10.89.0.0/16"
   -l "traefik.http.routers.traefik.middlewares=traefik-allow,traefik-auth"
 
   docker.io/traefik:v3.1

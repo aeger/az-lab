@@ -118,6 +118,31 @@ s3 = boto3.client(
 # ── Supabase REST ────────────────────────────────────────────────────────────
 
 
+_raw_urlopen = urllib.request.urlopen
+
+
+def _urlopen_retry(req, timeout=10, *, retries=4, backoff=1.5):
+    """urlopen with retry on transient Supabase errors (429/5xx, network).
+    Absorbs boot-time 503 schema-cache reloads and brief auth blips."""
+    import time as _time
+    transient = {429, 500, 502, 503, 504}
+    last = None
+    for attempt in range(retries):
+        try:
+            return _raw_urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in transient and attempt < retries - 1:
+                _time.sleep(backoff * (attempt + 1)); continue
+            raise
+        except urllib.error.URLError as e:
+            last = e
+            if attempt < retries - 1:
+                _time.sleep(backoff * (attempt + 1)); continue
+            raise
+    raise last
+
+
 def supabase_get(path: str) -> Any:
     req = urllib.request.Request(
         f"{SUPABASE_URL}/rest/v1/{path}",
@@ -126,7 +151,7 @@ def supabase_get(path: str) -> Any:
             "Authorization": f"Bearer {SUPABASE_KEY}",
         },
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with _urlopen_retry(req, timeout=15) as resp:
         return json.loads(resp.read())
 
 

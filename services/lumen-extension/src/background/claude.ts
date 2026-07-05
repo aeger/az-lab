@@ -7,7 +7,9 @@
 import { getConfig, AGENT_DISPLAY_NAME, STORAGE_KEYS } from '../shared/config';
 import type { ChatMessage, PageContext } from '../shared/types';
 import { BROWSER_TOOLS, type BrowserActionName } from '../shared/browser-actions';
+import { DATA_TOOLS, isDataTool, type DataToolName } from '../shared/data-tools';
 import { runToolUse } from './actions';
+import { runDataTool } from './data-actions';
 
 const MAX_TOOL_TURNS = 10;
 
@@ -40,24 +42,24 @@ IMPORTANT — your actual capabilities in this chat (state these accurately, nev
   If the tool returns "error: no element matches selector", widen your selector or read the DOM first.
 - **What you CANNOT do:** you cannot see rendered visuals/layout, screenshots, images, or the
   browser console. The action tools above appear only when the "Allow actions" toggle is on.
-- You do NOT have live query tools in this chat panel. You cannot run DB queries, search memory,
-  or fetch the task list yourself from within a reply. The Lumen extension UI handles live data
-  in its own tabs:
-- The **Tasks** tab reads the \`task_queue\` Postgres table directly (statuses like ready,
-  in_progress, review_needed, blocked, paused, completed). That is where tasks live and are shown.
-- The **Memory** tab and context-menu "Save to Lumen memory" handle the shared Supabase
-  \`memories\` table (types: episodic, feedback, project, reference, semantic, user).
+- **Data tools (task queue + shared memory) — always on:** You have four live tools that run against
+  the az-lab Supabase via Hermes. Use them; never fabricate their results.
+  - create_task — hand work to another agent (default Wren for server/infra/code/deploy). When Jeff
+    asks you to have Wren do something server-side, create a task rather than saying you can't.
+  - list_tasks — read the \`task_queue\` (optionally filter by status; use 'active' for what's in
+    flight). This is how you answer "what's in the queue" or check a task's status — do NOT tell the
+    user to open the Tasks tab for something list_tasks can answer.
+  - search_memory — keyword-search the shared \`memories\` before answering, to recall facts,
+    decisions, references, or feedback.
+  - save_memory — store or update a durable memory when Jeff asks you to remember something.
 
-Hard rules — these prevent the failure Jeff has seen:
-1. NEVER output tool-call JSON, function-call syntax, or code blocks (e.g. {"query":"type:task"})
-   as your reply. You have no tool to execute them — emitting them just confuses the user. Answer
-   in plain language.
-2. Tasks are NOT memories. There is no \`type:task\` memory. Never search memory for tasks and
-   never claim "there are no tasks in the system" — you cannot see the task table from chat. If
-   asked about tasks, tell the user to open the **Tasks** tab (which queries \`task_queue\`), and
-   that there are typically hundreds of rows there.
-3. If you cannot directly do something from chat, say so plainly and point to the right tab or to
-   Wren — do NOT fabricate a result.
+Hard rules — these prevent failures Jeff has seen:
+1. To use a tool, emit a proper tool_use call — NEVER paste tool-call JSON, function syntax, or code
+   blocks (e.g. {"query":"type:task"}) into your text reply. If you are not calling a tool, answer in
+   plain language.
+2. Never fabricate a task list, a task status, or a memory result. If a tool returns nothing, say so.
+3. Tasks (\`task_queue\`) and memories (\`memories\` table) are separate stores: use list_tasks for
+   tasks, search_memory for memories. There is no \`type:task\` memory.
 
 Behavioral rules (loaded from feedback memories):
 {FEEDBACK_RULES}
@@ -115,7 +117,7 @@ async function callAgentBusChat(
   agentBusUrl: string,
   systemPrompt: string,
   messages: ApiMessage[],
-  tools?: typeof BROWSER_TOOLS,
+  tools?: readonly unknown[],
 ): Promise<{ content: string; blocks?: ContentBlock[]; stop_reason?: string }> {
   const response = await fetch(`${agentBusUrl}/chat`, {
     method: 'POST',
@@ -175,16 +177,17 @@ export async function chat(
   });
 
   try {
-    const tools = allowActions ? BROWSER_TOOLS : undefined;
+    // Data tools are always available; browser (DOM) tools only when "Allow actions" is on.
+    const tools = [...DATA_TOOLS, ...(allowActions ? BROWSER_TOOLS : [])];
     let data = await callAgentBusChat(config.agentBusUrl, systemPrompt, messages, tools);
 
-    // Tool-use loop — runs only when tools were exposed. Each iteration:
+    // Tool-use loop. Each iteration:
     // 1) append assistant's content blocks (text + tool_use) to messages
-    // 2) execute each tool_use through the permission gate
+    // 2) execute each tool_use — data tools run directly, browser tools go through the permission gate
     // 3) append a user turn containing tool_result blocks
     // 4) call /chat again. Bail out at MAX_TOOL_TURNS to prevent runaway loops.
     let turns = 0;
-    while (allowActions && data.stop_reason === 'tool_use' && data.blocks && turns < MAX_TOOL_TURNS) {
+    while (data.stop_reason === 'tool_use' && data.blocks && turns < MAX_TOOL_TURNS) {
       turns++;
       const assistantBlocks = data.blocks;
       messages.push({ role: 'assistant', content: assistantBlocks });
@@ -192,11 +195,9 @@ export async function chat(
       const toolUses = assistantBlocks.filter((b): b is ToolUseBlock => b.type === 'tool_use');
       const toolResults: ToolResultBlock[] = [];
       for (const tu of toolUses) {
-        const res = await runToolUse({
-          id: tu.id,
-          name: tu.name as BrowserActionName,
-          input: tu.input,
-        });
+        const res = isDataTool(tu.name)
+          ? await runDataTool({ id: tu.id, name: tu.name as DataToolName, input: tu.input })
+          : await runToolUse({ id: tu.id, name: tu.name as BrowserActionName, input: tu.input });
         toolResults.push({
           type: 'tool_result',
           tool_use_id: res.tool_use_id,
@@ -208,7 +209,7 @@ export async function chat(
       data = await callAgentBusChat(config.agentBusUrl, systemPrompt, messages, tools);
     }
 
-    if (allowActions && turns >= MAX_TOOL_TURNS && data.stop_reason === 'tool_use') {
+    if (turns >= MAX_TOOL_TURNS && data.stop_reason === 'tool_use') {
       data = { ...data, content: data.content + `\n\n[stopped after ${MAX_TOOL_TURNS} tool turns — ask user to continue]` };
     }
 

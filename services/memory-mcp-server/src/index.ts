@@ -1083,11 +1083,66 @@ function startVerificationAuditJob(supabase: any): void {
   setInterval(tick, 60 * 60 * 1000);
 }
 
+// ── Embedding backfill + conflict sweep (startup, then every 30 min) ─────────
+// Direct-SQL writers (cron triggers, agents using execute_sql) bypass the
+// remember tool, so their rows have embedding NULL — invisible to the pgvector
+// RRF lane and never passed through detectConflicts. This sweep closes both
+// gaps: embed via Ollama, then run the standard conflict pass.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function startEmbeddingBackfillJob(supabase: any): void {
+  const run = async () => {
+    try {
+      const { data: rows, error } = await supabase
+        .from("memories")
+        .select("id, name, type, description, content, tags")
+        .is("embedding", null)
+        .order("created_at", { ascending: false })
+        .limit(25);
+      if (error) {
+        console.warn("[backfill] query failed:", error.message);
+        return;
+      }
+      if (!rows?.length) return;
+
+      let embedded = 0;
+      const conflictNotes: string[] = [];
+      for (const m of rows) {
+        const vec = await embed(embedInput(m.name, m.description ?? "", m.content ?? ""));
+        if (!vec) {
+          console.warn("[backfill] Ollama unavailable — aborting sweep, will retry next cycle");
+          break;
+        }
+        const { error: upErr } = await supabase
+          .from("memories")
+          .update({ embedding: JSON.stringify(vec) })
+          .eq("id", m.id);
+        if (upErr) {
+          console.warn(`[backfill] update failed for "${m.name}":`, upErr.message);
+          continue;
+        }
+        embedded++;
+        const conflicts = await detectConflicts(m.id, m.content ?? "", m.type, m.tags ?? [], vec);
+        if (conflicts) conflictNotes.push(`"${m.name}" ↔ ${conflicts}`);
+      }
+      if (embedded > 0) {
+        console.log(
+          `[backfill] Embedded ${embedded}/${rows.length} memories` +
+          (conflictNotes.length ? ` — conflicts flagged: ${conflictNotes.join("; ")}` : "")
+        );
+      }
+    } catch (err: any) {
+      console.warn("[backfill] job error:", err.message);
+    }
+  };
+  run();
+  setInterval(run, 30 * 60 * 1000);
+}
+
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.10.1",
+    version: "5.11.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -2698,7 +2753,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 10; // +10: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant + check_stale_context + update_read_watermark; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.10.1", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.11.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -2769,12 +2824,13 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 9;
-  console.log(`Memory MCP Server v5.10.1 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v5.11.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
   startStalenessJob(supabase);
   startVerificationAuditJob(supabase);
+  startEmbeddingBackfillJob(supabase);
 });
 
 // ── Cross-agent memory sync (Supabase Realtime) ──────────────────────────────

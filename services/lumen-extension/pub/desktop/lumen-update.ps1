@@ -8,7 +8,7 @@
 
   Edge loads C:\lumen-latest as an UNPACKED extension. Edge only re-reads the
   files at browser launch (or a manual Reload in edge://extensions), so this
-  script refreshes the files and tells Jeff a restart is needed — it cannot
+  script refreshes the files and tells Jeff a restart is needed - it cannot
   force Edge to reload on its own.
 
   Runs unattended via Scheduled Task (see install-lumen-updater.ps1).
@@ -63,7 +63,7 @@ Set-Content -Path $StateFile -Value $remoteSha -NoNewline
 
 # 6. Tell Sentinel (shows in the feed + Discord ping via discord_notify)
 $payload = @{
-    title    = "Lumen updated to v$remoteVer — restart Edge"
+    title    = "Lumen updated to v$remoteVer - restart Edge"
     body     = "Local files at $Dst were refreshed to v$remoteVer. Restart Edge (or hit Reload in edge://extensions) to load the new build."
     severity = 'warning'
     category = 'lumen-update'

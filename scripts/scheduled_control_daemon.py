@@ -67,6 +67,31 @@ def _load_secret() -> str:
 SUPABASE_KEY = _load_secret()
 
 
+_raw_urlopen = urllib.request.urlopen
+
+
+def _urlopen_retry(req, timeout=10, *, retries=4, backoff=1.5):
+    """urlopen with retry on transient Supabase errors (429/5xx, network).
+    Absorbs boot-time 503 schema-cache reloads and brief auth blips."""
+    import time as _time
+    transient = {429, 500, 502, 503, 504}
+    last = None
+    for attempt in range(retries):
+        try:
+            return _raw_urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in transient and attempt < retries - 1:
+                _time.sleep(backoff * (attempt + 1)); continue
+            raise
+        except urllib.error.URLError as e:
+            last = e
+            if attempt < retries - 1:
+                _time.sleep(backoff * (attempt + 1)); continue
+            raise
+    raise last
+
+
 def rest_get(path: str) -> Any:
     req = urllib.request.Request(
         f"{SUPABASE_URL}/rest/v1/{path}",
@@ -75,7 +100,7 @@ def rest_get(path: str) -> Any:
             "Authorization": f"Bearer {SUPABASE_KEY}",
         },
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with _urlopen_retry(req, timeout=10) as resp:
         return json.loads(resp.read())
 
 
@@ -91,7 +116,7 @@ def rpc(name: str, params: dict) -> Any:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _urlopen_retry(req, timeout=10) as resp:
             body = resp.read()
             if not body:
                 return None  # void-returning function
@@ -125,7 +150,7 @@ def insert_audit(activity_id: str, name: str, action: str, before: dict | None,
         method="POST",
     )
     try:
-        urllib.request.urlopen(req, timeout=5).read()
+        _urlopen_retry(req, timeout=5).read()
     except Exception as e:
         log.warning(f"audit write failed for {name}/{action}: {e}")
 
@@ -388,7 +413,7 @@ def reconcile_cron(row: dict) -> dict | None:
                 },
                 method="PATCH",
             )
-            urllib.request.urlopen(req, timeout=8).read()
+            _urlopen_retry(req, timeout=8).read()
         except Exception as e:
             log.warning(f"source_ref.line update failed for {row['name']}: {e}")
 
@@ -456,7 +481,7 @@ def reconcile_task_queue_recurring(row: dict) -> dict | None:
         method="PATCH",
     )
     try:
-        urllib.request.urlopen(req, timeout=8).read()
+        _urlopen_retry(req, timeout=8).read()
     except Exception as e:
         return {
             "actions": ["task_queue-patch=fail"],
@@ -535,7 +560,7 @@ def auto_unpause(rows: list[dict]) -> None:
                 },
                 method="PATCH",
             )
-            urllib.request.urlopen(req, timeout=8).read()
+            _urlopen_retry(req, timeout=8).read()
             log.info(f"auto-unpaused {row['name']} (unpause_at elapsed)")
             insert_audit(row["id"], row["name"], "auto_unpaused", None, None,
                          notes=f"unpause_at={ua} reached")
@@ -663,6 +688,8 @@ def main() -> int:
     while True:
         try:
             tick()
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            log.warning(f"tick failed (transient): {e}")
         except Exception as e:
             log.exception(f"tick failed: {e}")
         time.sleep(POLL_INTERVAL)

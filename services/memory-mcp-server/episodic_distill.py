@@ -194,8 +194,34 @@ def summarize_cluster_heuristic(memories: list) -> str:
     parts = [f"{m['name']}: {m['content'][:200]}" for m in top]
     return " | ".join(parts)
 
+# Shared Max-plan call helper (Tier 0 OAuth / Max bucket -> Tier 1 API key).
+sys.path.insert(0, os.path.expanduser("~/claude/lib"))
+try:
+    from claude_call import call_claude as _shared_claude_call
+except Exception:  # pragma: no cover - resilience if lib path is missing
+    _shared_claude_call = None
+
+
+def _haiku_available() -> bool:
+    """Haiku path works whenever the shared Tier-0-first chain imported (no local
+    API key needed) — or, legacy-only, when a direct API key is present."""
+    return _shared_claude_call is not None or bool(ANTHROPIC_API_KEY)
+
+
 def _call_claude_haiku(prompt: str, max_tokens: int = 256) -> str | None:
-    """Call claude-haiku-4-5 via Anthropic Messages API. Returns text or None on failure."""
+    """Distill via Claude, routed through the shared Max-plan chain (Tier 0 OAuth ->
+    Tier 1 API key). Returns text, or None on failure (caller then uses the heuristic)."""
+    if _shared_claude_call is not None:
+        try:
+            res = _shared_claude_call(
+                [{"role": "user", "content": prompt}],
+                model=HAIKU_MODEL, max_tokens=max_tokens, allow_tiers=(0, 1))
+            return (res.get("content") or "").strip() or None
+        except Exception as e:
+            log.warning(f"shared claude_call failed: {e}")
+            return None
+
+    # Legacy fallback: direct Haiku via API key (only if the shared helper is unavailable).
     if not ANTHROPIC_API_KEY:
         return None
     try:
@@ -222,7 +248,7 @@ def _call_claude_haiku(prompt: str, max_tokens: int = 256) -> str | None:
 
 def summarize_cluster_haiku(memories: list) -> str | None:
     """Distill a cluster of episodic memories using claude-haiku-4-5 (cost-efficient fallback)."""
-    if not ANTHROPIC_API_KEY:
+    if not _haiku_available():
         return None
     snippets = "\n".join([
         f"- [{m['name']}]: {m['content'][:300]}"
@@ -240,7 +266,7 @@ def summarize_cluster_haiku(memories: list) -> str | None:
 
 def summarize_project_cluster_haiku(memories: list) -> str | None:
     """Distill a cluster of project memories into a reference fact using claude-haiku-4-5."""
-    if not ANTHROPIC_API_KEY:
+    if not _haiku_available():
         return None
     snippets = "\n".join([
         f"- [{m['name']}]: {m['content'][:300]}"
@@ -479,7 +505,10 @@ def main():
     try:
         episodic_memories = supa_get("memories", {
             "type": "eq.episodic",
-            "tags": f"not.cs.{{{CONSOLIDATED_TAG}}}",
+            # Overlap-exclude BOTH tag dialects: this script's 'consolidated' and the
+            # legacy consolidate_episodic_memories.py 'consolidated=true' — the two
+            # jobs were blind to each other's done-markers (double-processing risk).
+            "tags": f"not.ov.{{{CONSOLIDATED_TAG},consolidated=true}}",
             "created_at": f"lt.{episodic_cutoff}",
             "select": "id,name,description,content,tags,access_count,embedding",
             "order": "created_at.asc",
@@ -508,7 +537,7 @@ def main():
     log.info(f"Found {len(episodic_memories)} pure episodic type memories, {len(memories)} high-access memories for consolidation (access_count>={MIN_ACCESS_COUNT})")
 
     use_nemoclaw = bool(NEMOCLAW_KEY)
-    use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
+    use_haiku = _haiku_available() and not use_nemoclaw
     use_llm = use_nemoclaw or use_haiku
     if use_nemoclaw:
         llm_status = f"NemoClaw[{TRIAGE_MODEL}]"
@@ -806,7 +835,7 @@ def main_weekly():
     start = datetime.now(timezone.utc)
 
     use_nemoclaw = bool(NEMOCLAW_KEY)
-    use_haiku = bool(ANTHROPIC_API_KEY) and not use_nemoclaw
+    use_haiku = _haiku_available() and not use_nemoclaw
     llm_status = f"NemoClaw[{TRIAGE_MODEL}]" if use_nemoclaw else ("claude-haiku-4-5" if use_haiku else "heuristic")
     log.info(f"Summarization mode: {llm_status}")
 

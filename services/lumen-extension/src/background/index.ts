@@ -6,7 +6,7 @@ import type { AgentStatus, SoundPrefs, DEFAULT_SOUND_PREFS, SentinelNotification
 import { runStartup } from './startup';
 import { chat, loadChatHistory, ensureChatHistoryLoaded, getChatHistory } from './claude';
 import { mcpHealthCheck } from './mcp-client';
-import { searchMemoriesKeyword, fetchPendingTasks, fetchTasks, createTask, upsertMemory } from './supabase';
+import { searchMemoriesKeyword, fetchPendingTasks, fetchTasks, createTask, upsertMemory, supabaseHealthCheck } from './supabase';
 import { busHealthCheck, busGetSecurity } from './agent-bus';
 import { fetchSentinelNotifications, markSentinelRead, markAllSentinelRead } from './sentinel';
 import { resolvePermission, getActionLog, clearSessionPermissions } from './actions';
@@ -66,13 +66,15 @@ chrome.runtime.onStartup.addListener(async () => {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARMS.heartbeat) {
     // Lightweight connectivity check
-    const [mcpOk, busOk, security] = await Promise.allSettled([
+    const [mcpOk, busOk, supaOk, security] = await Promise.allSettled([
       mcpHealthCheck(),
       busHealthCheck(),
+      supabaseHealthCheck(),
       busGetSecurity(),
     ]);
     agentStatus.memoryMcp = (mcpOk.status === 'fulfilled' && mcpOk.value) ? 'connected' : 'disconnected';
     agentStatus.agentBus = (busOk.status === 'fulfilled' && busOk.value) ? 'connected' : 'disconnected';
+    agentStatus.supabase = (supaOk.status === 'fulfilled' && supaOk.value) ? 'connected' : 'disconnected';
     if (security.status === 'fulfilled') {
       agentStatus.security = security.value.level;
       agentStatus.securityScore = security.value.score;

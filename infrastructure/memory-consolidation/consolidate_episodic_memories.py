@@ -65,8 +65,9 @@ def get_credentials():
     api_key = env.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY", "")
     if not service_key:
         raise RuntimeError(f"SUPABASE_SECRET_KEY not found in {MEMORY_MCP_ENV} or environment")
-    if not api_key:
-        raise RuntimeError(f"ANTHROPIC_API_KEY not found in {MEMORY_MCP_ENV} or environment")
+    # api_key is optional: call_claude() routes Tier-0-first through the shared
+    # Max-plan chain, which needs no local API key. Tier 1 simply won't be
+    # available without one — the chain handles that.
     return service_key, api_key
 
 
@@ -104,8 +105,10 @@ def fetch_episodic_memories(service_key):
         "order": "access_count.desc",
         "limit": str(BATCH_LIMIT),
     })
-    # Exclude already-consolidated ones
-    return [r for r in rows if "consolidated=true" not in (r.get("tags") or [])]
+    # Exclude already-consolidated ones — recognize BOTH tag dialects: this script's
+    # legacy 'consolidated=true' and episodic_distill.py's standard 'consolidated'.
+    return [r for r in rows
+            if not {"consolidated=true", "consolidated"} & set(r.get("tags") or [])]
 
 
 def insert_semantic_memory(service_key, name, description, content, source_tags):
@@ -140,8 +143,9 @@ def add_zettelkasten_link(service_key, source_id, target_id):
 
 
 def mark_consolidated(service_key, memory_id, current_tags):
-    """Append 'consolidated=true' tag to a source episode."""
-    new_tags = list(set((current_tags or []) + ["consolidated=true"]))
+    """Mark a source episode done — writes the standard 'consolidated' tag
+    (shared with episodic_distill.py) so both jobs see each other's work."""
+    new_tags = list(set((current_tags or []) + ["consolidated"]))
     sb_request(service_key, "PATCH", "/rest/v1/memories",
                params={"id": f"eq.{memory_id}"},
                body={"tags": new_tags})
@@ -149,8 +153,26 @@ def mark_consolidated(service_key, memory_id, current_tags):
 
 # ── Claude abstraction ─────────────────────────────────────────────────────────
 
+# Shared Max-plan call helper (Tier 0 OAuth -> Tier 1 API key -> Tier 2 NemoClaw).
+sys.path.insert(0, os.path.expanduser("~/claude/lib"))
+try:
+    from claude_call import call_claude as _shared_claude_call
+except Exception:  # pragma: no cover - resilience if lib path is missing
+    _shared_claude_call = None
+
+
 def call_claude(api_key, prompt):
-    """Call the Claude API. Returns the response text."""
+    """Return Claude's response text, routed through the shared Max-plan-first chain
+    (Tier 0 OAuth / Max bucket -> Tier 1 API key -> Tier 2 NemoClaw). Falls back to a
+    direct API-key call only if the shared helper is unavailable."""
+    if _shared_claude_call is not None:
+        if api_key:
+            os.environ.setdefault("ANTHROPIC_API_KEY", api_key)
+        res = _shared_claude_call(
+            [{"role": "user", "content": prompt}], model=CLAUDE_MODEL, max_tokens=1024)
+        return res["content"]
+
+    # Legacy fallback: direct API-key call (only if the shared helper failed to import).
     body = json.dumps({
         "model": CLAUDE_MODEL,
         "max_tokens": 1024,

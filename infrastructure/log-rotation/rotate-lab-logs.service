@@ -1,0 +1,6 @@
+[Unit]
+Description=Rotate size-capped lab logs (spend jsonl + memory-job logs)
+
+[Service]
+Type=oneshot
+ExecStart=%h/azlab/infrastructure/log-rotation/rotate-lab-logs.sh

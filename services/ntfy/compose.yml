@@ -1,0 +1,36 @@
+name: ntfy
+
+# Self-hosted mobile push (ntfy). Single container, behind Traefik + LE.
+# PUBLIC-with-auth: NO lan-allow middleware — access control is enforced by
+# ntfy itself (server.yml: auth-default-access: deny-all + per-topic tokens),
+# matching the public `website` router posture. See README.md for the runbook.
+
+services:
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: ntfy
+    command: ["serve"]
+    restart: unless-stopped
+    environment:
+      - TZ=America/Phoenix
+    volumes:
+      - ./server.yml:/etc/ntfy/server.yml:ro
+      - ntfy-cache:/var/cache/ntfy
+      - ntfy-data:/var/lib/ntfy
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ntfy.rule=Host(`ntfy.az-lab.dev`)"
+      - "traefik.http.routers.ntfy.entrypoints=websecure"
+      - "traefik.http.routers.ntfy.tls.certresolver=le"
+      - "traefik.http.services.ntfy.loadbalancer.server.port=80"
+      # PUBLIC — deliberately no lan-allow@file. Auth is handled inside ntfy.
+
+volumes:
+  ntfy-cache:
+  ntfy-data:
+
+networks:
+  proxy:
+    external: true
