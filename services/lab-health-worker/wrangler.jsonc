@@ -1,0 +1,18 @@
+{
+  // az-lab pull-based health monitor. Cron polls Supabase lab_health_snapshot()
+  // and alerts Discord on state changes (KV de-dupes so no repeat spam).
+  // Log Drains are Team-plan only, so this queries for signals instead.
+  "name": "lab-health-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "account_id": "157265a71e207b62e3e2d9f36dcd3f3d",
+  "observability": { "enabled": true },
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "kv_namespaces": [
+    { "binding": "HEALTH_KV", "id": "c592c060461e4e29aad4feecc1306b75" }
+  ],
+  "vars": {
+    "SUPABASE_URL": "https://ogqjjlbupqnvlcyrfnxi.supabase.co"
+  }
+  // Secrets (wrangler secret put): SUPABASE_SERVICE_KEY, DISCORD_WEBHOOK, CHECK_SECRET
+}
