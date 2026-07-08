@@ -3,7 +3,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { createHmac } from "crypto";
+import { createHash, createHmac } from "crypto";
 import WebSocket from "ws";
 import express, { Request, Response } from "express";
 import { z } from "zod";
@@ -356,6 +356,13 @@ async function embed(text: string): Promise<number[] | null> {
 
 function embedInput(name: string, description: string, content: string): string {
   return `${name}: ${description}\n\n${content}`.slice(0, 4000);
+}
+
+// Rec #3 (2026-07-08 self-improvement research): SHA-256 of the exact embed input.
+// Stored on memories.content_hash so remember can skip the Ollama embed call when a
+// re-write/re-index is byte-identical to what was last embedded.
+function contentHashOf(embedText: string): string {
+  return createHash("sha256").update(embedText).digest("hex");
 }
 
 // ── TEI Cross-Encoder Reranking (primary) ─────────────────────────────────────
@@ -945,6 +952,24 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 040 skipped:", err.message);
   }
+
+  // Migration 055: content_hash column + index (2026-07-08 research REC #3 — embedding cache).
+  // Lets remember skip the Ollama embed call when a re-write is byte-identical.
+  try {
+    const { data, error } = await supabase.rpc("apply_content_hash_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 055 RPC not yet registered — apply migrations/055_content_hash_embedding_cache.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 055 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 055 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 055 skipped:", err.message);
+  }
 }
 
 // ── Staleness maintenance job (runs once at startup, then every 24h) ─────────
@@ -1142,7 +1167,7 @@ function startEmbeddingBackfillJob(supabase: any): void {
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.11.0",
+    version: "5.12.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -1184,11 +1209,20 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       // Fetch existing same-name memory (with content for NOOP check + concurrent write detection)
       const { data: existing } = await supabase
         .from("memories")
-        .select("id, content, agent_id, updated_at, version")
+        .select("id, content, agent_id, updated_at, version, content_hash")
         .eq("name", name)
         .maybeSingle();
 
-      const embedding = await embed(embedInput(name, description, content));
+      // Rec #3 (2026-07-08): content-hash embedding cache. If the same-name row already
+      // holds the identical embed input, the embedding is unchanged — skip the Ollama
+      // call and the write entirely.
+      const embedText = embedInput(name, description, content);
+      const embedHash = contentHashOf(embedText);
+      if (existing && existing.content_hash && existing.content_hash === embedHash) {
+        return { content: [{ type: "text" as const, text: `NOOP: Memory "${name}" is byte-identical (SHA-256 match) to the stored version — embedding reused, no write.` }] };
+      }
+
+      const embedding = await embed(embedText);
       const embedNote = embedding ? "" : " (no embedding — Ollama unavailable)";
 
       // ── Same-name path ──────────────────────────────────────────────────────
@@ -1224,7 +1258,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         }
 
         const update: Record<string, unknown> = { type, description, content, tags: memTags, source: src };
-        if (embedding) update.embedding = JSON.stringify(embedding);
+        if (embedding) { update.embedding = JSON.stringify(embedding); update.content_hash = embedHash; }
         if (importance_score !== undefined) update.importance_score = importance_score;
         if (confidence !== undefined) update.confidence = confidence;
         const derivedWriter = deriveWriterAgent(agent_id, src);
@@ -1312,6 +1346,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
             console.log(`[mem0] UPDATE "${d.target_name}": ${d.rationale}`);
             const upd: Record<string, unknown> = { description, content, tags: memTags, source: src };
             upd.embedding = JSON.stringify(embedding);
+            upd.content_hash = embedHash;
             if (importance_score !== undefined) upd.importance_score = importance_score;
             const mem0Writer = deriveWriterAgent(agent_id, src);
             if (mem0Writer) upd.writer_agent = mem0Writer;
@@ -1330,7 +1365,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
 
       // ── INSERT new memory ───────────────────────────────────────────────────
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
-      if (embedding) insert.embedding = JSON.stringify(embedding);
+      if (embedding) { insert.embedding = JSON.stringify(embedding); insert.content_hash = embedHash; }
       if (importance_score !== undefined) insert.importance_score = importance_score;
       if (confidence !== undefined) insert.confidence = confidence;
       const insertWriter = deriveWriterAgent(agent_id, src);
@@ -2753,7 +2788,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 10; // +10: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant + check_stale_context + update_read_watermark; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.11.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.12.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
@@ -2824,7 +2859,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 
 app.listen(PORT, "0.0.0.0", async () => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 9;
-  console.log(`Memory MCP Server v5.11.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  console.log(`Memory MCP Server v5.12.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
