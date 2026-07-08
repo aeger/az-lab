@@ -491,8 +491,8 @@ def requeue_recurring(task: dict) -> bool:
     new_ctx["recurring_parent_id"] = task["id"]
 
     new_task = {
-        "title": task.get("title", ""),
-        "description": task.get("description"),
+        "title": task.get("title") or "(recurring task)",
+        "description": task.get("description") or task.get("title") or "(recurring re-queue — original description missing)",
         "priority": task.get("priority", 2),
         "target": task.get("target"),
         "tags": task.get("tags") or [],
@@ -1188,7 +1188,9 @@ def auto_queue_due_goals():
 
     for g in goals or []:
         goal_id = g["id"]
-        title = g.get("title", goal_id[:8])
+        # `or`, not the 2-arg get default: a present-but-NULL title (common in
+        # goals rows) must still fall back, else description below resolves to None.
+        title = g.get("title") or goal_id[:8]
 
         # Cooldown: don't requeue same goal within 6h
         if g.get("last_queued_at"):

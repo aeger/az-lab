@@ -51,6 +51,7 @@ ctx = {
 }
 task = {
     'title': 'Process session transcript',
+    'description': 'Session transcript handoff from Wren ($SESSION_DATE) — review the transcript in context and extract any memories, decisions, or follow-up items. (task_queue.description is NOT NULL — this field is required.)',
     'target': 'cowork',
     'source': 'claude-code',
     'priority': 2,
@@ -65,11 +66,26 @@ if [[ -z "$PAYLOAD" ]]; then
   exit 0
 fi
 
-curl -sf -X POST "${SUPABASE_URL}/rest/v1/task_queue" \
-  -H "apikey: ${SERVICE_KEY}" \
-  -H "Authorization: Bearer ${SERVICE_KEY}" \
+# Prefer the validating task-queue Worker (enforces title/description + schema,
+# retries -> DLQ). Fall back to a direct Supabase insert if the Worker is
+# unreachable so a transcript is never lost during migration. Failures are
+# logged to stderr (journald), NOT silently swallowed.
+WORKER_URL="https://az-task-queue-worker.almty1.workers.dev/enqueue"
+INGEST_SECRET=$(cat "$HOME/.cloudflare/ingest-secret" 2>/dev/null)
+
+HTTP=$(curl -s -m 6 -o /dev/null -w '%{http_code}' -X POST "$WORKER_URL" \
+  -H "x-ingest-secret: ${INGEST_SECRET}" \
   -H "Content-Type: application/json" \
-  -d "$PAYLOAD" \
-  &>/dev/null &
+  -d "$PAYLOAD" 2>/dev/null)
+
+if [[ "$HTTP" != "202" ]]; then
+  echo "transcript-on-stop: worker enqueue failed (HTTP ${HTTP:-000}); falling back to direct insert" >&2
+  curl -s -m 8 -X POST "${SUPABASE_URL}/rest/v1/task_queue" \
+    -H "apikey: ${SERVICE_KEY}" \
+    -H "Authorization: Bearer ${SERVICE_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD" >/dev/null 2>&1 \
+    || echo "transcript-on-stop: fallback direct insert ALSO failed" >&2
+fi
 
 exit 0
