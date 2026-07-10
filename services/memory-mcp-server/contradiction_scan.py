@@ -64,6 +64,20 @@ def run_scan(client):
     return r.json()
 
 
+def run_temporal_supersession(client):
+    """Mark superseded rows for unambiguous same-name/same-writer live duplicate
+    sets (migration 056). Soft + reversible via supersede_memory(). Runs in the
+    daily batch — async of the write-time near-duplicate gate."""
+    r = client.post(
+        f"{SUPABASE_URL}/rest/v1/rpc/detect_temporal_supersession",
+        json={"p_max_groups": int(os.environ.get("TEMPORAL_MAX_GROUPS", "50"))},
+        headers=sb_headers(),
+        timeout=120,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def notify_sentinel(client, summary):
     """Surface high-confidence finds on the dashboard notifications page."""
     high = summary.get("new_high_confidence", 0)
@@ -104,6 +118,14 @@ def main():
         log.info("scan summary: %s", json.dumps(summary))
         if summary.get("new_high_confidence", 0) > 0:
             notify_sentinel(client, summary)
+
+        # Temporal supersession — mark superseded rows for unambiguous
+        # same-name/same-writer live duplicate sets (async of the near-dup gate).
+        try:
+            ts = run_temporal_supersession(client)
+            log.info("temporal supersession: %s", json.dumps(ts))
+        except Exception as e:  # never let supersession fail the whole scan
+            log.error("temporal supersession failed: %s", e)
     return 0
 
 
