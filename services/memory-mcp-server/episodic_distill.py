@@ -114,6 +114,32 @@ def supa_patch(path: str, params: dict, data: dict):
     r = httpx.patch(f"{SUPABASE_URL}/rest/v1/{path}", headers=headers, params=params, json=data, timeout=30)
     r.raise_for_status()
 
+def upsert_memory_by_name(payload: dict) -> str | None:
+    """Insert a memory, or UPDATE the existing active row with the same name in
+    place. The distillation writers re-emit stable names (e.g. 'weekly-ref:...',
+    'ref:...', 'semantic:...') on every run; a blind POST created a NEW active row
+    each time, so a name accumulated one duplicate per run (the MEMORY.md churn
+    root cause). This mirrors the MCP `remember` tool's name-keyed update-in-place
+    and is enforced at the DB layer by the partial unique index
+    `memories(name) WHERE is_active`. Returns the row id."""
+    name = payload["name"]
+    existing = supa_get("memories", {
+        "name": f"eq.{name}", "is_active": "eq.true",
+        "select": "id", "order": "created_at.desc", "limit": "1",
+    })
+    if existing:
+        mid = existing[0]["id"]
+        patch = {k: payload[k] for k in
+                 ("type", "description", "content", "tags", "source", "importance_score")
+                 if k in payload}
+        patch["updated_at"] = datetime.now(timezone.utc).isoformat()
+        supa_patch("memories", {"id": f"eq.{mid}"}, patch)
+        return mid
+    result = supa_post("memories", payload)
+    if isinstance(result, list) and result:
+        return result[0].get("id")
+    return None
+
 # ── Clustering ────────────────────────────────────────────────────────────────
 def cosine_sim(a: list, b: list) -> float:
     va, vb = np.array(a), np.array(b)
@@ -286,7 +312,7 @@ def summarize_project_cluster_haiku(memories: list) -> str | None:
 # ── Memory write (direct Supabase — MCP server speaks JSON-RPC, not REST) ─────
 def write_semantic_memory(name: str, description: str, content: str, tags: list) -> str | None:
     try:
-        result = supa_post("memories", {
+        return upsert_memory_by_name({
             "type": "semantic",
             "name": name,
             "description": description,
@@ -295,8 +321,6 @@ def write_semantic_memory(name: str, description: str, content: str, tags: list)
             "source": "claude-code",
             "importance_score": 0.75,
         })
-        if isinstance(result, list) and result:
-            return result[0].get("id")
     except Exception as e:
         log.error(f"Supabase write failed: {e}")
     return None
@@ -399,7 +423,7 @@ def summarize_project_cluster(memories: list) -> str | None:
 
 def write_reference_memory(name: str, description: str, content: str, tags: list) -> str | None:
     try:
-        result = supa_post("memories", {
+        return upsert_memory_by_name({
             "type": "reference",
             "name": name,
             "description": description,
@@ -408,8 +432,6 @@ def write_reference_memory(name: str, description: str, content: str, tags: list
             "source": "claude-code",
             "importance_score": 0.80,
         })
-        if isinstance(result, list) and result:
-            return result[0].get("id")
     except Exception as e:
         log.error(f"Supabase reference write failed: {e}")
     return None
@@ -736,7 +758,7 @@ def fetch_project_30day_memories() -> list:
 
 def write_consolidation_memory(name: str, description: str, content: str, tags: list) -> str | None:
     try:
-        result = supa_post("memories", {
+        return upsert_memory_by_name({
             "type": "reference",
             "name": name,
             "description": description,
@@ -745,8 +767,6 @@ def write_consolidation_memory(name: str, description: str, content: str, tags: 
             "source": "consolidation",
             "importance_score": 0.80,
         })
-        if isinstance(result, list) and result:
-            return result[0].get("id")
     except Exception as e:
         log.error(f"[Phase 3] Supabase write failed: {e}")
     return None
