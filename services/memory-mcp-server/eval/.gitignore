@@ -1,0 +1,5 @@
+# ephemeral run outputs and pycache; keep code + README + curated datasets
+results/
+datasets/smoke.json
+__pycache__/
+*.pyc

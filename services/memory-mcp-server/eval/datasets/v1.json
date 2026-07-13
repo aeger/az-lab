@@ -1,0 +1,41 @@
+{
+  "model": "nvidia/nemotron-3-super-120b-a12b",
+  "seed": 7,
+  "items": [
+    {
+      "gold_id": "ed370aaf-1498-40a6-8530-c55bc6abddff",
+      "gold_name": "Cowork SSH Access to svc-podman-01",
+      "gold_type": "reference",
+      "question": "What SSH command, including the identity file and user@host, is used to connect from the Cowork Windows desktop to svc-podman-01?",
+      "key_facts": "ssh -i ~/.ssh/id_ed25519_claude_desktop almty1@192.168.1.181"
+    },
+    {
+      "gold_id": "ef04c183-f35e-48a3-a577-639ab61aebba",
+      "gold_name": "energy-monitoring-research",
+      "gold_type": "reference",
+      "question": "What specific steps and resources are required to flash the Emporia Vue 3 for fully local Home Assistant integration, according to the memory?",
+      "key_facts": "Flash ESPHome via the `emporia-vue-local/esphome` repository using the digiblur.com guide from March 2025; this requires opening the case and using a serial/USB-TTL connection the first time, after which OTA updates are possible."
+    },
+    {
+      "gold_id": "e30b4d94-3640-4634-8828-d161aaea26a3",
+      "gold_name": "HA VM SSH Access",
+      "gold_type": "reference",
+      "question": "What is the exact SSH command (including the identity file, port, user, and IP address) used to access the Home Assistant VM via the Advanced SSH add-on?",
+      "key_facts": "ssh -i ~/.ssh/github -p 22222 root@192.168.1.161"
+    },
+    {
+      "gold_id": "6953ab52-b46c-49f9-95dc-39d0a86bcffb",
+      "gold_name": "Research recommendation drift \u2014 verify current state first",
+      "gold_type": "feedback",
+      "question": "According to the memory, what version of memory-mcp-server introduced hybrid retrieval RRF into production, and approximately when was that version released?",
+      "key_facts": "Hybrid retrieval RRF has been in production since version v5.6.0 of memory-mcp-server, which was released around 2026-04-28."
+    },
+    {
+      "gold_id": "957cb02e-3bb9-49f0-a865-7d796f14501a",
+      "gold_name": "MCP + A2A protocol stack \u2014 2026 standard",
+      "gold_type": "project",
+      "question": "As of Q1 2026, what was the number of monthly SDK downloads for MCP?",
+      "key_facts": "MCP crossed 97M monthly SDK downloads as of Q1 2026."
+    }
+  ]
+}
