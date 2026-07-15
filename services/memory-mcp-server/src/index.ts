@@ -898,7 +898,8 @@ async function applyStartupMigrations(): Promise<void> {
   }
 
   // Migration 027: staleness_candidate column + flag_stale_memories() + hybrid_recall returns staleness_candidate
-  // Detects hot-to-cold staleness: memories with high historical access that went quiet for 21+ days.
+  // Migration 057 replaced 027's predicate: staleness keys off VERIFICATION age, not access recency.
+  // Flags project/reference rows with access_count >= 10 unverified for 14+ days (expires_at, when set, wins).
   // hybrid_recall now returns staleness_candidate so agents can trigger re-verification.
   try {
     const { data, error } = await supabase.rpc("apply_staleness_candidate_if_missing");
@@ -1020,17 +1021,26 @@ function startStalenessJob(supabase: any): void {
 
       const { data: top } = await supabase
         .from("memories")
-        .select("name, importance_score, last_accessed")
+        .select("name, importance_score, verified_at, created_at")
         .eq("staleness_candidate", true)
         .order("importance_score", { ascending: false })
         .limit(5);
       const summary = (top || [])
-        .map((m: any) => `• ${m.name} (importance ${(m.importance_score ?? 0).toFixed(2)})`)
+        .map((m: any) => {
+          const since = m.verified_at ?? m.created_at;
+          const days = since
+            ? Math.floor((Date.now() - new Date(since).getTime()) / 86_400_000)
+            : null;
+          const age = days === null
+            ? "never verified"
+            : `${m.verified_at ? "unverified" : "never verified, created"} ${days}d`;
+          return `• ${m.name} (importance ${(m.importance_score ?? 0).toFixed(2)}, ${age})`;
+        })
         .join("\n");
       const { error: insertErr } = await supabase.from("task_queue").insert({
-        title: `Review ${stalePending} stale high-importance memories`,
+        title: `Re-verify ${stalePending} unverified hot memories`,
         description:
-          `${stalePending} memories with importance>0.7 have gone cold (21+ days no access). Review top candidates and refresh, archive, or update:\n\n${summary}\n\nUse SELECT * FROM memories WHERE staleness_candidate=true to see all.`,
+          `${stalePending} frequently-recalled memories (access_count >= 10) have gone 14+ days without re-verification, so recall is serving them at full trust with nobody having vouched for them. These are NOT "cold" — most are hot; staleness keys off verification age, not access recency (migration 057).\n\nFor each: re-read it, check its claims against live state, correct or annotate what drifted, then call update_memory_verified (which clears the flag). Do not archive on age alone.\n\nTop by importance:\n\n${summary}\n\nUse SELECT * FROM memories WHERE staleness_candidate=true to see all.`,
         priority: 2,
         status: "pending",
         source: "system",
