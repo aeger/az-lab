@@ -720,8 +720,14 @@ def main():
     p2_created, p2_processed = run_project_consolidation(use_nemoclaw, use_haiku)
     elapsed2 = (datetime.now(timezone.utc) - start).total_seconds() - elapsed1
 
-    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     log.info(f"=== Phase 2 complete: {p2_created}/{p2_processed} clusters → reference memories ({elapsed2:.1f}s) ===")
+
+    # ── Phase 4: Staleness sweep ─────────────────────────────────────────────
+    # (Phase 3 is the weekly 30-day consolidation, run from --weekly.)
+    log.info("=== Phase 4: Staleness sweep started ===")
+    stale_changed, stale_total = run_staleness_sweep()
+
+    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     log.info(f"=== Total: {p0_created + created_semantic + p2_created} new memories created in {elapsed:.1f}s ===")
 
     total_created = p0_created + created_semantic + p2_created
@@ -730,10 +736,39 @@ def main():
         ep_note = f"{created_semantic} semantic from high-access" if created_semantic > 0 else ""
         pr_note = f"{p2_created} reference from project" if p2_created > 0 else ""
         parts = [p for p in [p0_note, ep_note, pr_note] if p]
+        if stale_changed:
+            parts.append(f"{stale_changed} staleness flag change(s), {stale_total} flagged")
         send_discord(
             f"🧠 Memory consolidation: {', '.join(parts)} "
             f"({llm_status}, {elapsed:.0f}s)"
         )
+
+
+def run_staleness_sweep() -> tuple[int, int]:
+    """Re-flag staleness_candidate from verification age (migration 057).
+
+    Delegates the whole rule to flag_stale_memories() so this job and the 24h
+    startStalenessJob in src/index.ts cannot drift apart. Returns
+    (rows_changed, total_currently_flagged).
+
+    A flagged memory is served at a reduced confidence and labelled +stale on
+    recall; an agent clears it by re-reading and calling update_memory_verified.
+    """
+    try:
+        result = supa_post("rpc/flag_stale_memories", {})
+        changed = result if isinstance(result, int) else 0
+    except Exception as e:
+        log.warning(f"[Phase 4] staleness sweep failed: {e}")
+        return 0, 0
+
+    try:
+        flagged = supa_get("memories", {"staleness_candidate": "eq.true", "select": "name"})
+        total = len(flagged)
+    except Exception:
+        total = 0
+
+    log.info(f"=== Phase 4 complete: {changed} flag change(s), {total} memories now flagged stale ===")
+    return changed, total
 
 
 # ── Phase 3: Weekly 30-day project consolidation → reference/consolidation ────

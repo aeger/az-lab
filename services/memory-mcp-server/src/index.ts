@@ -184,6 +184,24 @@ const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "";
 const RERANK_URL = process.env.RERANK_URL || "http://192.168.1.183:8000";
 const RERANK_MODEL = process.env.RERANK_MODEL || "nvidia/nemotron-3-super-120b-a12b";
 const RERANK_TOP_K = parseInt(process.env.RERANK_TOP_K || "5", 10);
+// Multiplier applied to a staleness_candidate row's confidence at recall time.
+const STALE_CONFIDENCE_FACTOR = parseFloat(process.env.STALE_CONFIDENCE_FACTOR || "0.75");
+
+// Per-class re-verification TTL, in days (migration 057). Only 'working' gets a
+// default: it is short-term scratch context that is wrong within the week.
+// The durable classes carry no blanket TTL — they fall through to the sweep's
+// 14-day project/reference rule, or take an explicit ttl_days from the writer.
+const CLASS_DEFAULT_TTL_DAYS: Record<string, number | undefined> = {
+  working: 7,
+  episodic: undefined,
+  semantic: undefined,
+  procedural: undefined,
+};
+
+function ttlToExpiresAt(days?: number): string | undefined {
+  if (days === undefined || !Number.isFinite(days) || days <= 0) return undefined;
+  return new Date(Date.now() + days * 86400000).toISOString();
+}
 
 type Mem0Action = "ADD" | "UPDATE" | "DELETE" | "NOOP";
 
@@ -1189,8 +1207,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       agent_scope: z.array(z.string()).optional().describe("Which agents can see this memory. Default ['shared'] = all agents. E.g. ['wren','iris'] = only Wren and Iris. Requires migration 012."),
       confidence: z.number().min(0).max(1).optional().describe("Confidence 0-1 (default 0.8). Use < 0.5 for speculative or unverified facts. Memories below min_confidence threshold are excluded from recall when filtered."),
       memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Memory class: semantic (durable facts/prefs, default), episodic (event log), procedural (how-to/skill), working (short-term context). Defaults to 'semantic' for all existing types."),
+      ttl_days: z.number().min(1).optional().describe("Re-verification TTL in days. Set this on records that track LIVE infrastructure state (versions, IPs, deployed config) — they go stale in days, unlike incident write-ups which never do. After this many days the nightly sweep flags the memory +stale and recall discounts its confidence until an agent re-verifies it. Overrides the default 14-day rule. Omit for durable facts."),
     },
-    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence, memory_class }) => {
+    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence, memory_class, ttl_days }) => {
       // Security gate — scan all text fields before touching the DB
       const scanTargets: Array<[string, string]> = [
         ["name", name], ["description", description], ["content", content],
@@ -1271,6 +1290,12 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (visibility) update.visibility = visibility;
         if (agent_scope) update.agent_scope = agent_scope;
         if (memory_class) update.memory_class = memory_class;
+        if (ttl_days !== undefined) update.expires_at = ttlToExpiresAt(ttl_days);
+        // Reaching this path means the content materially changed (the NOOP guard
+        // above rejects near-identical rewrites), so the writer has just vouched
+        // for it — restart the verification clock instead of leaving the row +stale.
+        update.verified_at = new Date().toISOString();
+        update.staleness_candidate = false;
         update.version = (existing.version ?? 1) + 1;
         const { data: updatedRows, error } = await supabase
           .from("memories")
@@ -1376,6 +1401,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       // Default memory_class so p_memory_class filtering in hybrid_recall
       // doesn't silently drop new rows (Rec #4, 2026-05-29 audit).
       insert.memory_class = memory_class || "semantic";
+      const insertTtl = ttlToExpiresAt(ttl_days ?? CLASS_DEFAULT_TTL_DAYS[insert.memory_class as string]);
+      if (insertTtl) insert.expires_at = insertTtl;
       // Collaborative Memory provenance: track contributing agent (REC3, arXiv 2505.18279)
       insert.provenance = agent_id ? { contributing_agent: agent_id } : {};
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
@@ -1510,14 +1537,28 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
             // Attach verified_at to each result so the display can show verification age.
             const verifiedRows = await supabase
               .from("memories")
-              .select("id, verified_at")
+              .select("id, verified_at, staleness_candidate")
               .in("id", filtered.map((m: any) => m.id));
             const verifiedMap: Record<string, string | null> = {};
+            const staleMap: Record<string, boolean> = {};
             for (const row of (verifiedRows.data || []) as any[]) {
               verifiedMap[row.id] = row.verified_at;
+              staleMap[row.id] = row.staleness_candidate === true;
             }
             for (const m of filtered as any[]) {
               m.verified_at = verifiedMap[m.id] ?? null;
+              m.staleness_candidate = staleMap[m.id] ?? m.staleness_candidate === true;
+            }
+
+            // Staleness confidence haircut (migration 057). A flagged row is one whose
+            // verification clock has expired, so it must not be served at the same trust
+            // as a re-verified one — stale-but-confident is the failure mode we care about.
+            // Applied here rather than in hybrid_recall so the raw stored confidence is
+            // preserved and only the served value is discounted.
+            for (const m of filtered as any[]) {
+              if (m.staleness_candidate) {
+                m.confidence = (m.confidence ?? 0.8) * STALE_CONFIDENCE_FACTOR;
+              }
             }
 
             // Skill-memory auto-linking: fire-and-forget, threshold 0.75 cosine
@@ -1608,12 +1649,15 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
               const confidenceStr = m.confidence !== undefined && m.confidence < 0.8 ? ` conf:${m.confidence.toFixed(2)}` : "";
               const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
               const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
-              const staleFlag = m.staleness_candidate ? " [stale?]" : "";
+              // +stale means the verification clock expired and confidence above is
+              // already discounted by STALE_CONFIDENCE_FACTOR — re-verify before trusting,
+              // then call update_memory_verified to clear the flag.
+              const staleFlag = m.staleness_candidate ? " +stale" : "";
               let verifyStr = "";
               if (m.verified_at) {
                 const ageDays = (Date.now() - new Date(m.verified_at).getTime()) / 86400000;
                 verifyStr = ` verified:${ageDays.toFixed(0)}d`;
-              } else if ((m.access_count || 0) >= 10 && (m.importance_score || 0) >= 0.7) {
+              } else if (m.staleness_candidate || ((m.access_count || 0) >= 10 && (m.importance_score || 0) >= 0.7)) {
                 verifyStr = " verified:never";
               }
               return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${confidenceStr}${trust}${conflictFlag}${staleFlag}${verifyStr}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
