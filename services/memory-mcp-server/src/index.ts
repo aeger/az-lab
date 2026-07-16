@@ -376,6 +376,14 @@ function embedInput(name: string, description: string, content: string): string 
   return `${name}: ${description}\n\n${content}`.slice(0, 4000);
 }
 
+// Episode embed input (migration 059, MemRL pattern): summary + outcome + learnings
+// are the retrieval-relevant fields — actions/input are noise for "what happened
+// last time I did something like this?" queries.
+function episodeEmbedInput(summary?: string | null, outcome?: string | null, learnings?: string | null): string {
+  return [summary, outcome && `Outcome: ${outcome}`, learnings && `Learnings: ${learnings}`]
+    .filter(Boolean).join("\n").slice(0, 4000);
+}
+
 // Rec #3 (2026-07-08 self-improvement research): SHA-256 of the exact embed input.
 // Stored on memories.content_hash so remember can skip the Ollama embed call when a
 // re-write/re-index is byte-identical to what was last embedded.
@@ -786,23 +794,10 @@ async function applyStartupMigrations(): Promise<void> {
     console.warn("Migration 020 skipped:", err.message);
   }
 
-  // Migration 021: Skills decay scoring — last_used, success_rate, updated match_skills RPC
-  // Apply migrations/021_skills_decay_scoring.sql via Supabase SQL editor if needed.
-  try {
-    const { data, error } = await supabase.rpc("apply_skills_decay_scoring_if_missing");
-    if (error) {
-      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
-          error.message?.includes("not found in the schema cache")) {
-        console.log("Migration 021 RPC not yet registered — apply migrations/021_skills_decay_scoring.sql in Supabase SQL editor.");
-      } else {
-        console.warn("Migration 021 warning:", error.message);
-      }
-    } else {
-      console.log("Migration 021 result:", data);
-    }
-  } catch (err: any) {
-    console.warn("Migration 021 skipped:", err.message);
-  }
+  // Migration 021 (skills decay scoring) was never applied and is SUPERSEDED by
+  // migration 058 (skills outcome tracking: success_count/fail_count/last_outcome/
+  // last_used_at, applied 2026-07-16). Do NOT apply 021 — its last_used/success_rate
+  // columns conflict with the 058 write paths.
 
   // Migration 022: Skill-memory auto-linking — skill_memory_links table + link_memories_to_skills()
   // Apply migrations/022_skill_memory_links.sql via Supabase SQL editor if needed.
@@ -1186,6 +1181,40 @@ function startEmbeddingBackfillJob(supabase: any): void {
     } catch (err: any) {
       console.warn("[backfill] job error:", err.message);
     }
+
+    // ── Episodes lane (migration 059) — embed agent_episodes for semantic recall.
+    // Same sweep pattern; covers pre-059 rows and any write where Ollama was down.
+    try {
+      const { data: eps, error: epErr } = await supabase
+        .from("agent_episodes")
+        .select("id, summary, outcome, learnings")
+        .is("embedding", null)
+        .or("summary.not.is.null,learnings.not.is.null,outcome.not.is.null")
+        .order("created_at", { ascending: false })
+        .limit(50);
+      if (epErr) {
+        console.warn("[backfill:episodes] query failed:", epErr.message);
+        return;
+      }
+      if (!eps?.length) return;
+      let epEmbedded = 0;
+      for (const ep of eps) {
+        const vec = await embed(episodeEmbedInput(ep.summary, ep.outcome, ep.learnings));
+        if (!vec) {
+          console.warn("[backfill:episodes] Ollama unavailable — aborting sweep, will retry next cycle");
+          break;
+        }
+        const { error: upErr } = await supabase
+          .from("agent_episodes")
+          .update({ embedding: JSON.stringify(vec) })
+          .eq("id", ep.id);
+        if (upErr) { console.warn(`[backfill:episodes] update failed for ${ep.id}:`, upErr.message); continue; }
+        epEmbedded++;
+      }
+      if (epEmbedded > 0) console.log(`[backfill:episodes] Embedded ${epEmbedded}/${eps.length} episodes`);
+    } catch (err: any) {
+      console.warn("[backfill:episodes] job error:", err.message);
+    }
   };
   run();
   setInterval(run, 30 * 60 * 1000);
@@ -1195,7 +1224,7 @@ function startEmbeddingBackfillJob(supabase: any): void {
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.12.0",
+    version: "5.13.0",
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -2207,9 +2236,10 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       steps: z.array(z.string()).optional().describe("Key steps taken (ordered) — used to generate skill content"),
       agent_id: z.string().optional().describe("Agent completing the task (e.g. 'wren', 'iris')"),
       skill_name: z.string().optional().describe("Override auto-generated skill name slug (kebab-case)"),
-      success: z.boolean().optional().describe("Whether the task succeeded (true) or failed (false). Updates success_rate on the named skill if provided."),
+      success: z.boolean().optional().describe("Whether the task succeeded (true) or failed (false). Increments success_count/fail_count on the named skill if provided."),
+      outcome_note: z.string().optional().describe("Short note on the outcome — stored as skills.last_outcome for the named skill"),
     },
-    async ({ task_summary, tool_count, steps, agent_id, skill_name, success }) => {
+    async ({ task_summary, tool_count, steps, agent_id, skill_name, success, outcome_note }) => {
       const src = callerIdentity || agent_id || "claude-code";
 
       // Log task completion to agent_activity regardless of tool_count
@@ -2220,15 +2250,18 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         metadata: { tool_count, skill_captured: tool_count >= 5, success },
       });
 
-      // ── Update skill success_rate if skill_name + success provided ──────────
+      // ── Skill outcome telemetry (migration 058, CODESKILL pattern) ──────────
+      // Counts over a Bayesian rate: transparent, auditable, rate derives on read.
       if (skill_name !== undefined && success !== undefined) {
-        const { data: existingSkill } = await supabase.from("skills").select("id, use_count, success_rate").eq("name", skill_name).maybeSingle();
+        const { data: existingSkill } = await supabase.from("skills").select("id, success_count, fail_count").eq("name", skill_name).maybeSingle();
         if (existingSkill) {
-          const n = Math.max((existingSkill.use_count || 1), 1);
-          const oldRate = existingSkill.success_rate ?? 0.5;
-          // Bayesian incremental mean: new_rate = old_rate + (outcome - old_rate) / n
-          const newRate = Math.max(0, Math.min(1, oldRate + ((success ? 1.0 : 0.0) - oldRate) / n));
-          await supabase.from("skills").update({ success_rate: newRate }).eq("id", existingSkill.id);
+          const { error: outcomeErr } = await supabase.from("skills").update({
+            success_count: (existingSkill.success_count || 0) + (success ? 1 : 0),
+            fail_count: (existingSkill.fail_count || 0) + (success ? 0 : 1),
+            last_outcome: (outcome_note || `${success ? "success" : "failure"}: ${task_summary}`).slice(0, 500),
+            last_used_at: new Date().toISOString(),
+          }).eq("id", existingSkill.id);
+          if (outcomeErr) console.warn(`[skills] outcome update failed for "${skill_name}":`, outcomeErr.message);
         }
       }
 
@@ -2311,7 +2344,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (name) {
         const { data, error } = await supabase.from("skills").select("*").eq("name", name).maybeSingle();
         if (error || !data) return { content: [{ type: "text" as const, text: `Skill "${name}" not found.` }] };
-        await supabase.from("skills").update({ use_count: (data.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", data.id);
+        await supabase.from("skills").update({ use_count: (data.use_count || 0) + 1, last_used_at: new Date().toISOString() }).eq("id", data.id);
         return { content: [{ type: "text" as const, text: `# ${data.title}\n_${data.description}_\n\n${data.content}` }] };
       }
 
@@ -2320,7 +2353,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (queryEmbedding) {
           const { data, error } = await supabase.rpc("match_skills", { query_embedding: JSON.stringify(queryEmbedding), match_count: maxResults });
           if (!error && data?.length > 0) {
-            for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", s.id);
+            for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used_at: new Date().toISOString() }).eq("id", s.id);
             const results = data.map((s: any) => `# ${s.title} (${(s.similarity * 100).toFixed(0)}% match)\n_${s.description}_\n\n${s.content}`);
             return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
           }
@@ -2329,7 +2362,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const { data, error } = await supabase.from("skills").select("*")
           .or(`name.ilike.%${query}%,title.ilike.%${query}%,description.ilike.%${query}%`).limit(maxResults);
         if (error || !data?.length) return { content: [{ type: "text" as const, text: "No matching skills found." }] };
-        for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", s.id);
+        for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used_at: new Date().toISOString() }).eq("id", s.id);
         const results = data.map((s: any) => `# ${s.title}\n_${s.description}_\n\n${s.content}`);
         return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
       }
@@ -2752,6 +2785,13 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (learnings) updates.learnings = learnings;
         if (memories_consulted) updates.memories_consulted = memories_consulted;
         if (status && status !== "in_progress") updates.ended_at = new Date().toISOString();
+        // Re-embed when semantic fields change (migration 059) — merge with stored
+        // values so a learnings-only update doesn't drop summary/outcome from the vector
+        if (summary || outcome || learnings) {
+          const { data: cur } = await supabase.from("agent_episodes").select("summary, outcome, learnings").eq("id", episode_id).maybeSingle();
+          const vec = await embed(episodeEmbedInput(summary ?? cur?.summary, outcome ?? cur?.outcome, learnings ?? cur?.learnings));
+          if (vec) updates.embedding = JSON.stringify(vec);
+        }
         const { error } = await supabase.from("agent_episodes").update(updates).eq("id", episode_id);
         if (error) return { content: [{ type: "text" as const, text: `Failed to update episode: ${error.message}` }] };
         return { content: [{ type: "text" as const, text: `Episode ${episode_id} updated (status: ${status || "unchanged"})` }] };
@@ -2770,6 +2810,12 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (learnings) row.learnings = learnings;
       if (memories_consulted) row.memories_consulted = memories_consulted;
       if (status && status !== "in_progress") row.ended_at = new Date().toISOString();
+      // Embed semantic fields at write time (migration 059) — makes the episode
+      // recallable via recall_episodes(query). Backfill job covers Ollama outages.
+      if (summary || outcome || learnings) {
+        const vec = await embed(episodeEmbedInput(summary, outcome, learnings));
+        if (vec) row.embedding = JSON.stringify(vec);
+      }
       const { data, error } = await supabase.from("agent_episodes").insert(row).select("id").single();
       if (error) return { content: [{ type: "text" as const, text: `Failed to record episode: ${error.message}` }] };
       return { content: [{ type: "text" as const, text: `Episode recorded: ${data.id} (agent: ${agent}, status: ${row.status})` }] };
@@ -2779,24 +2825,47 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
   // ── Tool: recall_episodes ──────────────────────────────────────────────────
   server.tool(
     "recall_episodes",
-    "Recall recent agent episodes to learn from past task outcomes. Surfaces prior runs matching agent or status filters.",
+    "Recall agent episodes to learn from past task outcomes. Pass a query for semantic search (MemRL pattern — 'what happened last time I did X?'), or use agent/status filters for recency-ordered results. Call at task start to pull similar prior runs with their outcomes and learnings.",
     {
+      query: z.string().optional().describe("Semantic search over episode summaries/outcomes/learnings — describe the task you're about to do. Omit for recency-ordered listing."),
       agent: z.string().optional().describe("Filter by agent name"),
       status: z.enum(["in_progress", "completed", "failed", "partial"]).optional().describe("Filter by status"),
       limit: z.number().optional().describe("Max episodes to return (default 5)"),
       with_learnings_only: z.boolean().optional().describe("Only return episodes that have learnings captured"),
     },
-    async ({ agent, status, limit, with_learnings_only }) => {
-      let q = supabase
-        .from("agent_episodes")
-        .select("id, agent, task_id, started_at, ended_at, status, summary, input_summary, outcome, learnings, memories_consulted")
-        .order("created_at", { ascending: false })
-        .limit(limit || 5);
-      if (agent) q = q.eq("agent", agent);
-      if (status) q = q.eq("status", status);
-      if (with_learnings_only) q = q.not("learnings", "is", null);
-      const { data, error } = await q;
-      if (error) return { content: [{ type: "text" as const, text: `Episode recall failed: ${error.message}` }] };
+    async ({ query, agent, status, limit, with_learnings_only }) => {
+      let data: any[] | null = null;
+      let semantic = false;
+      // Semantic lane (migration 059): embed the query, cosine-match via match_episodes
+      if (query) {
+        const qVec = await embed(query);
+        if (qVec) {
+          const { data: matched, error: rpcErr } = await supabase.rpc("match_episodes", {
+            query_embedding: JSON.stringify(qVec),
+            match_count: limit || 5,
+            filter_agent: agent ?? null,
+            filter_status: status ?? null,
+          });
+          if (rpcErr) console.warn("[recall_episodes] match_episodes failed, falling back to filters:", rpcErr.message);
+          else if (matched?.length) {
+            data = with_learnings_only ? matched.filter((ep: any) => ep.learnings) : matched;
+            semantic = true;
+          }
+        }
+      }
+      if (!data) {
+        let q = supabase
+          .from("agent_episodes")
+          .select("id, agent, task_id, started_at, ended_at, status, summary, input_summary, outcome, learnings, memories_consulted")
+          .order("created_at", { ascending: false })
+          .limit(limit || 5);
+        if (agent) q = q.eq("agent", agent);
+        if (status) q = q.eq("status", status);
+        if (with_learnings_only) q = q.not("learnings", "is", null);
+        const { data: rows, error } = await q;
+        if (error) return { content: [{ type: "text" as const, text: `Episode recall failed: ${error.message}` }] };
+        data = rows;
+      }
       if (!data?.length) return { content: [{ type: "text" as const, text: "No episodes found matching criteria." }] };
       const lines = data.map((ep) => {
         const dur = ep.ended_at && ep.started_at
@@ -2804,15 +2873,16 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
           : "";
         const taskRef = ep.task_id ? ` task:${ep.task_id.slice(0, 8)}` : "";
         const memCount = ep.memories_consulted?.length ? ` mems:${ep.memories_consulted.length}` : "";
+        const sim = typeof ep.similarity === "number" ? ` sim:${ep.similarity.toFixed(2)}` : "";
         return [
-          `## ${ep.agent} — ${ep.status}${dur}${taskRef}${memCount}`,
+          `## ${ep.agent} — ${ep.status}${dur}${taskRef}${memCount}${sim}`,
           ep.input_summary ? `**Input:** ${ep.input_summary}` : null,
           ep.summary ? `**Summary:** ${ep.summary}` : null,
           ep.outcome ? `**Outcome:** ${ep.outcome}` : null,
           ep.learnings ? `**Learnings:** ${ep.learnings}` : null,
         ].filter(Boolean).join("\n");
       });
-      return { content: [{ type: "text" as const, text: `${data.length} episode(s):\n\n${lines.join("\n\n---\n\n")}` }] };
+      return { content: [{ type: "text" as const, text: `${data.length} episode(s)${semantic ? " (semantic match)" : ""}:\n\n${lines.join("\n\n---\n\n")}` }] };
     }
   );
 
@@ -2842,7 +2912,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 10; // +10: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant + check_stale_context + update_read_watermark; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.12.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: "5.13.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
