@@ -2,6 +2,9 @@
 """
 Episodic → Semantic → Procedural auto-distillation pipeline.
 
+Phase 0: Consolidates pure memory_class=episodic rows (any access count, older
+than 6h) into semantic memories.
+
 Phase 1: Queries episodic memories with access_count >= 3 (not yet consolidated),
 clusters by semantic similarity, distills each cluster into a stable
 semantic fact, and inserts as type=semantic with Zettelkasten links
@@ -10,6 +13,15 @@ back to the source episodes.
 Phase 2: Queries project memories 7-14 days old with access_count >= 2 (not yet
 consolidated), distills each cluster into a reference memory (permanent
 operational knowledge).
+
+Phase 3: Weekly 30-day consolidation (only runs under --weekly).
+
+Phase 4: Staleness sweep — delegates to the flag_stale_memories() DB function,
+the single shared rule also driven every 24h by startStalenessJob in src/index.ts.
+(Migration 057's comments called this "Phase 3"; that was wrong — corrected in 060.)
+
+Phase numbering is non-contiguous on a normal nightly run: 0, 1, 2, 4 execute and
+3 is weekly-only. That is intentional, not a gap.
 
 Based on ElephantBroker 3-session promotion threshold and CraniMem
 scheduled consolidation replay pattern.

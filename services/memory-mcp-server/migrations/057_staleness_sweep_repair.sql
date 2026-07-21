@@ -1,5 +1,13 @@
 -- Migration 057: repair flag_stale_memories() + wire the expires_at TTL lane
 --
+-- ⚠ SUPERSEDED IN PART BY MIGRATION 060 (2026-07-21). Two corrections:
+--   1. The `access_count >= 10` conjunct below left the predicate near-dead —
+--      0 of 763 rows satisfied it together with the 14-day rule. 060 drops it.
+--   2. The comments below say this function is called by episodic_distill.py
+--      "Phase 3". That is WRONG — it is Phase 4. Phase 3 is the weekly 30-day
+--      consolidation (episodic_distill.py:726, run from --weekly). The task
+--      definition's "Phase 4" was the correct one.
+--
 -- WHY (audited live 2026-07-15, 757 memories):
 --   staleness_candidate was 0/757 — not because the lane was missing, but because
 --   the migration 027 predicate is structurally unsatisfiable:

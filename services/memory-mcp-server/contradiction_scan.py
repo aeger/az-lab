@@ -78,6 +78,22 @@ def run_temporal_supersession(client):
     return r.json()
 
 
+def mark_consistency_checked(client):
+    """Stamp consistency_checked_at on rows that came through the scan clean
+    (migration 062). Deliberately NOT verified_at — the scan compares memories to
+    each other, never to a live source, so it cannot vouch for a memory being
+    still-true. Stamping verified_at here would reset the staleness clock on the
+    whole corpus overnight and undo migration 060."""
+    r = client.post(
+        f"{SUPABASE_URL}/rest/v1/rpc/mark_consistency_checked",
+        json={},
+        headers=sb_headers(),
+        timeout=60,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
 def notify_sentinel(client, summary):
     """Surface high-confidence finds on the dashboard notifications page."""
     high = summary.get("new_high_confidence", 0)
@@ -126,6 +142,13 @@ def main():
             log.info("temporal supersession: %s", json.dumps(ts))
         except Exception as e:  # never let supersession fail the whole scan
             log.error("temporal supersession failed: %s", e)
+
+        # Record which rows passed this scan clean (peer-consistency only).
+        try:
+            n = mark_consistency_checked(client)
+            log.info("consistency_checked_at stamped on %s memories", n)
+        except Exception as e:  # advisory signal — must not fail the scan
+            log.error("mark_consistency_checked failed: %s", e)
     return 0
 
 
