@@ -14,7 +14,13 @@ Calls the scan_memory_contradictions() DB function (migration 052), which:
 
 Results land in memory_conflicts (detected_by='contradiction-scan'); high-confidence
 finds raise a sentinel notification so they surface on the dashboard notifications
-page. Resolution stays manual/agent-driven via resolve_conflict() / list_conflicts.
+page.
+
+Resolution is no longer manual. Since migration 063 this script also calls
+sweep_conflicts() right after detection, so every conflict it writes is
+deterministically resolved in the same run (see run_conflict_sweep below).
+resolve_conflict() / list_conflicts remain available for the residue the
+auto-resolver deliberately declines to judge.
 
 Schedule: memory-contradiction-scan.timer (daily 03:30 UTC).
 """
@@ -73,6 +79,33 @@ def run_temporal_supersession(client):
         json={"p_max_groups": int(os.environ.get("TEMPORAL_MAX_GROUPS", "50"))},
         headers=sb_headers(),
         timeout=120,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def run_conflict_sweep(client):
+    """Deterministically resolve the open conflict queue (migration 063).
+
+    Runs AFTER detection so a conflict cannot outlive the scan cycle that found
+    it — before this existed, detection wrote rows and nothing ever closed them,
+    and the queue had grown to 268 open rows (all conflict_type='stale').
+
+    No LLM on this path (arXiv:2606.01435). Value conflicts pick a winner by
+    max(version, content_timestamp) and route through supersede_memory(), which
+    PRESERVES the loser as an audit row (arXiv:2606.06240). conflict_type=
+    'stale' is propagation leakage rather than a rival value, so it is repaired
+    by re-pointing the citation at the supersession head and de-weighting the
+    stale edge — never by inventing a supersedes relationship.
+    """
+    r = client.post(
+        f"{SUPABASE_URL}/rest/v1/rpc/sweep_conflicts",
+        json={
+            "p_limit": int(os.environ.get("CONFLICT_SWEEP_LIMIT", "200")),
+            "p_actor": "contradiction-scan",
+        },
+        headers=sb_headers(),
+        timeout=180,
     )
     r.raise_for_status()
     return r.json()
@@ -142,6 +175,15 @@ def main():
             log.info("temporal supersession: %s", json.dumps(ts))
         except Exception as e:  # never let supersession fail the whole scan
             log.error("temporal supersession failed: %s", e)
+
+        # Close the loop: deterministically resolve what detection just wrote,
+        # plus any residue from earlier runs. Same cadence as detection by
+        # construction — same process, same timer.
+        try:
+            sweep = run_conflict_sweep(client)
+            log.info("conflict sweep: %s", json.dumps(sweep))
+        except Exception as e:  # resolution must never fail the detection scan
+            log.error("conflict sweep failed: %s", e)
 
         # Record which rows passed this scan clean (peer-consistency only).
         try:
