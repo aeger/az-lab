@@ -1,0 +1,356 @@
+[
+  {
+    "question": "How do goals turn into queued work for the agents?",
+    "topic_hint": "goals milestones task queue",
+    "gold_memory_ids": [
+      "a43f82f6-e438-4d35-acef-2a58ac6f4a13",
+      "fdd51ca9-d237-4bf1-9c03-17930d36f69d"
+    ],
+    "category": "multi_hop",
+    "notes": "goals milestones auto-queue into task_queue"
+  },
+  {
+    "question": "How does Home Assistant authenticate agents and what voice hardware talks to it?",
+    "topic_hint": "home assistant auth voice satellite",
+    "gold_memory_ids": [
+      "b15589c3-22b1-4523-8378-6d05c24d5018",
+      "869f86e2-43eb-4c92-b1d9-fc77ab8f2964"
+    ],
+    "category": "multi_hop",
+    "notes": null
+  },
+  {
+    "question": "How does the memory MCP server store data and where are the credentials for it kept?",
+    "topic_hint": "memory mcp storage credentials",
+    "gold_memory_ids": [
+      "7bc3cf6b-49be-430d-846a-41786e08884f",
+      "86e91faf-8458-45df-a4c6-93649580a58e"
+    ],
+    "category": "multi_hop",
+    "notes": null
+  },
+  {
+    "question": "If I deploy a new service to the mono repo, how do I both wire its systemd unit and give it a DNS name?",
+    "topic_hint": "deploy service systemd dns",
+    "gold_memory_ids": [
+      "d151141b-355a-42aa-8e44-947a64720861",
+      "e763a820-79fd-4c0a-a5e0-1733af8e716b",
+      "ef45c450-83e6-4a59-b85c-5eb414c62939"
+    ],
+    "category": "multi_hop",
+    "notes": "repo layout + systemd + cloudflare dns"
+  },
+  {
+    "question": "What browser extensions exist in az-lab and what does each one do?",
+    "topic_hint": "lumen sentinel edge extensions",
+    "gold_memory_ids": [
+      "73f121d6-a0b0-493e-a7b7-83136e5a306d",
+      "54072f1d-fe2a-46df-a482-688b792404ca"
+    ],
+    "category": "multi_hop",
+    "notes": "Lumen vs Sentinel disambiguation."
+  },
+  {
+    "question": "What hardware expansion plans exist for the lab and what storage do they involve?",
+    "topic_hint": "pi cluster das storage plans",
+    "gold_memory_ids": [
+      "c0315bfb-3d23-440d-8160-67576a9f7c08",
+      "50cd4e27-30d8-47f7-ac39-4e14fb539eab"
+    ],
+    "category": "multi_hop",
+    "notes": null
+  },
+  {
+    "question": "Which agent should handle a Windows workstation task, and what is that agent named?",
+    "topic_hint": "agent roles windows routing",
+    "gold_memory_ids": [
+      "573ffa89-c900-4659-a38e-ff2ff2509727",
+      "982d12ce-4b75-48ed-9d6d-e9bdc25c3628"
+    ],
+    "category": "multi_hop",
+    "notes": "Requires agent-name mapping plus routing rule."
+  },
+  {
+    "question": "Which dashboards and widgets show lab telemetry, and where do they get their data?",
+    "topic_hint": "grafana dashboard widgets telemetry",
+    "gold_memory_ids": [
+      "6b012ec8-8ecb-46a9-b190-40202346252a",
+      "cb16be58-ac0b-4c64-bad4-10591453b3c2"
+    ],
+    "category": "multi_hop",
+    "notes": null
+  },
+  {
+    "question": "How are the podman compose stacks managed under systemd?",
+    "topic_hint": "systemd compose stack template",
+    "gold_memory_ids": [
+      "e763a820-79fd-4c0a-a5e0-1733af8e716b"
+    ],
+    "category": "single_hop",
+    "notes": "compose-stack@.service template unit"
+  },
+  {
+    "question": "How do I administer the AMP game server?",
+    "topic_hint": "amp game server operations",
+    "gold_memory_ids": [
+      "7ab742fe-dff4-4063-8238-698568bd3ff9"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "How do I connect to the Home Assistant VM over SSH?",
+    "topic_hint": "home assistant ssh port",
+    "gold_memory_ids": [
+      "e30b4d94-3640-4634-8828-d161aaea26a3"
+    ],
+    "category": "single_hop",
+    "notes": "port 22222"
+  },
+  {
+    "question": "How do I SSH into the Proxmox MS-01 host?",
+    "topic_hint": "proxmox ssh access",
+    "gold_memory_ids": [
+      "f0f434cc-26d5-4536-9f36-bd15e7caabc9"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "How does the cross-Claude task queue work?",
+    "topic_hint": "task queue supabase polling",
+    "gold_memory_ids": [
+      "fdd51ca9-d237-4bf1-9c03-17930d36f69d"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "How must SFP7 on the CRS309 be configured for the U7 Pro XGS access point?",
+    "topic_hint": "crs309 sfp7 vlan tagging",
+    "gold_memory_ids": [
+      "474ab1b4-9581-4a84-87f9-35773736ef1f"
+    ],
+    "category": "single_hop",
+    "notes": "Classic gotcha: untagged in VLAN10, not tagged."
+  },
+  {
+    "question": "How should I handle junk versus important email during triage?",
+    "topic_hint": "email triage rules",
+    "gold_memory_ids": [
+      "c78dc95b-16bf-4071-a499-915bcf78e62d"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "Should I ask Jeff for confirmation before doing what he already told me to do?",
+    "topic_hint": "confirmation prompt policy",
+    "gold_memory_ids": [
+      "6d64def1-d857-4ef0-880d-f080c7106ed3"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "What are the SSH details for the MikroTik router and switch?",
+    "topic_hint": "mikrotik ssh access",
+    "gold_memory_ids": [
+      "1e0b775c-d5ce-4669-8c2d-efcdbf7d846e"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "What are the two Cox Business static IPs used for?",
+    "topic_hint": "cox static ip allocation",
+    "gold_memory_ids": [
+      "5f251bc7-5087-4677-887e-f2a2350ba58b"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "What credentials do the sentinel collectors use?",
+    "topic_hint": "sentinel collector credentials",
+    "gold_memory_ids": [
+      "925a1b01-45b0-4f8d-b33b-a9c3fd8b7b91"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "What does the agent bus do and what port does it listen on?",
+    "topic_hint": "agent bus port role",
+    "gold_memory_ids": [
+      "4aa68cea-2a5b-48f5-bfd4-ecbd19c9fa88"
+    ],
+    "category": "single_hop",
+    "notes": "port 8765"
+  },
+  {
+    "question": "What is Jeff's professional background before the homelab?",
+    "topic_hint": "jeff career background",
+    "gold_memory_ids": [
+      "2984b6b1-1b54-4359-9ee9-9bdf266f46be"
+    ],
+    "category": "single_hop",
+    "notes": "Navy corpsman, Pyxis L3 support"
+  },
+  {
+    "question": "What is the git branching policy across az-lab repos?",
+    "topic_hint": "main beta branching policy",
+    "gold_memory_ids": [
+      "f3271ff7-433b-45e0-af44-5542f290c883"
+    ],
+    "category": "single_hop",
+    "notes": "beta = working, main = stable"
+  },
+  {
+    "question": "What is the layout of the azlab mono repo?",
+    "topic_hint": "azlab mono repo structure",
+    "gold_memory_ids": [
+      "d151141b-355a-42aa-8e44-947a64720861"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "What model and API does NemoClaw use for inference?",
+    "topic_hint": "nemoclaw nvidia nim model",
+    "gold_memory_ids": [
+      "91bd8563-9ffd-471f-a40e-9a352e90283d"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "What should an agent do when a task is blocked?",
+    "topic_hint": "task failure escalation protocol",
+    "gold_memory_ids": [
+      "6df81511-0e62-47e1-b12d-5133395a8dfa"
+    ],
+    "category": "single_hop",
+    "notes": "3-tier escalation"
+  },
+  {
+    "question": "Where should documents and written notes be saved?",
+    "topic_hint": "obsidian vault docs destination",
+    "gold_memory_ids": [
+      "c89612af-f43a-46f4-9a56-3d8ea7873ec0"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "Which directory is the az-lab dashboard built from?",
+    "topic_hint": "dashboard build source path",
+    "gold_memory_ids": [
+      "3519b754-5b45-4129-8b91-5d7ddf2a36c4",
+      "61a80efd-0dcd-4eb1-bcca-d9753566a5fd"
+    ],
+    "category": "single_hop",
+    "notes": "~/dashboard/ not ~/azlab/services/dashboard/"
+  },
+  {
+    "question": "Which Discord channel do Grimoire updates for Heather go to?",
+    "topic_hint": "heather discord channel id",
+    "gold_memory_ids": [
+      "7a826868-b9fc-4d53-bf89-9d5bf9135a6f"
+    ],
+    "category": "single_hop",
+    "notes": null
+  },
+  {
+    "question": "Which host actually runs Homebridge and how do I reach it?",
+    "topic_hint": "homebridge lxc host",
+    "gold_memory_ids": [
+      "de90c4c2-62ef-4739-8bc5-756655114043"
+    ],
+    "category": "single_hop",
+    "notes": "LXC 102, no direct SSH"
+  },
+  {
+    "question": "Why must az-lab Cloudflare A records stay DNS-only rather than proxied?",
+    "topic_hint": "cloudflare dns only acme",
+    "gold_memory_ids": [
+      "ef45c450-83e6-4a59-b85c-5eb414c62939"
+    ],
+    "category": "single_hop",
+    "notes": "proxied breaks ACME DNS-01"
+  },
+  {
+    "question": "Are MCP and tool permissions auto-approved, and has that policy changed?",
+    "topic_hint": "mcp permission auto approve",
+    "gold_memory_ids": [
+      "b12cbe6b-4032-463d-aca5-ce4bcae398e0"
+    ],
+    "category": "temporal",
+    "notes": null
+  },
+  {
+    "question": "Does Jeff want me to babysit Traefik version updates?",
+    "topic_hint": "traefik update babysitting",
+    "gold_memory_ids": [
+      "9ae7227c-dc6a-46dd-a904-7637ed8b8ef1"
+    ],
+    "category": "temporal",
+    "notes": null
+  },
+  {
+    "question": "Is the R2 backup outage still unresolved?",
+    "topic_hint": "r2 backup outage status",
+    "gold_memory_ids": [
+      "87e2b8af-b142-4750-8c36-d30e8f0292f1"
+    ],
+    "category": "temporal",
+    "notes": "Resolved 2026-07-10; the newer resolution must outrank the outage report."
+  },
+  {
+    "question": "What is the correct way to sweep stale podman container updates?",
+    "topic_hint": "podman container update sweep",
+    "gold_memory_ids": [
+      "3ad1ed49-e646-4853-981b-bd317496269c",
+      "8bfad5ec-f9f2-43f1-8962-f88176c2bc90"
+    ],
+    "category": "temporal",
+    "notes": "2026-07-20 method supersedes the 2026-06-23 recreate fix."
+  },
+  {
+    "question": "What is the current state of the NPM install on 192.168.1.183?",
+    "topic_hint": "nginx proxy manager 183",
+    "gold_memory_ids": [
+      "cd17886e-dc2a-467f-9508-2aae63b04ad0",
+      "91bd8563-9ffd-471f-a40e-9a352e90283d"
+    ],
+    "category": "temporal",
+    "notes": "That IP is now nemoclaw-01 — tests whether the newer role wins."
+  },
+  {
+    "question": "What is the CURRENT version and migration ceiling of memory-mcp-server?",
+    "topic_hint": "memory mcp current version",
+    "gold_memory_ids": [
+      "7bc3cf6b-49be-430d-846a-41786e08884f"
+    ],
+    "category": "temporal",
+    "notes": "Known-stale record; guards supersession behaviour from migrations 056/060/061."
+  },
+  {
+    "question": "What is the newest Discord channel setup for Claude Code notifications?",
+    "topic_hint": "discord claude code channel",
+    "gold_memory_ids": [
+      "2333928f-098a-4d3b-a3d0-1deff826cb01"
+    ],
+    "category": "temporal",
+    "notes": null
+  },
+  {
+    "question": "Why did AMP return 504 through Traefik most recently?",
+    "topic_hint": "traefik amp stale backend 504",
+    "gold_memory_ids": [
+      "12ad8973-5fdc-4120-acae-ed625dba58ba"
+    ],
+    "category": "temporal",
+    "notes": "Most recent incident must win over older traefik notes."
+  }
+]
