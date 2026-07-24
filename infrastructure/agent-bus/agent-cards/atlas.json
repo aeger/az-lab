@@ -1,14 +1,14 @@
 {
   "name": "atlas",
   "displayName": "Atlas",
-  "description": "Claude Desktop agent on Windows workstation. Local desktop access, browser automation, Windows tool integration, and phone-to-desktop task dispatch.",
+  "description": "Claude Desktop agent on Windows workstation — covers both the chat and code surfaces (absorbed the retired Forge agent 2026-07-24). Local desktop access, browser automation, Windows tool integration, phone-to-desktop task dispatch, and local code editing/git/build on the Windows dev machine.",
   "url": "local://atlas",
   "version": "1.0.0",
   "protocolVersion": "0.3",
   "defaultInputModes": ["application/json", "text/plain"],
   "defaultOutputModes": ["application/json", "text/plain"],
   "supportsAuthenticatedExtendedCard": false,
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5",
   "runtime": "claude-desktop",
   "host": "windows-workstation",
   "skills": [
@@ -46,11 +46,41 @@
       "description": "Reach svc-podman-01 and other lab hosts via SSH from Windows",
       "inputModes": ["application/json", "text/plain"],
       "outputModes": ["text/plain"]
+    },
+    {
+      "id": "code_editing",
+      "name": "Code Editing",
+      "description": "Edit and refactor code files on the Windows dev machine",
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["application/json", "text/plain"]
+    },
+    {
+      "id": "git_workflow",
+      "name": "Git Workflow",
+      "description": "Git operations: commit, branch, merge, PR creation",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "local_dev_environment",
+      "name": "Local Dev Environment",
+      "description": "Manage Windows dev environment, WSL, and local tools",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "local_build_and_test",
+      "name": "Local Build and Test",
+      "description": "Run builds and test suites on the Windows dev machine",
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
     }
   ],
   "accepted_tasks": [
     "local_file_management", "browser_interaction", "windows_automation",
-    "dispatch_phone_tasks", "infrastructure_via_ssh", "research_with_browser"
+    "dispatch_phone_tasks", "infrastructure_via_ssh", "research_with_browser",
+    "code_editing", "refactoring", "local_dev_environment", "git_workflow",
+    "windows_side_debugging", "local_build_and_test"
   ],
   "contact": {
     "discord_channel": "general",

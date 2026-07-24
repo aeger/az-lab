@@ -502,7 +502,10 @@ const SOURCE_TRUST: Record<string, string> = {
 // silent-pollution gap flagged by 2606.24535 — without this, scheduled
 // triggers (ai-memory-research-trigger, etc.) write rows with no agent
 // attribution.
-const KNOWN_AGENTS = ["wren", "iris", "atlas", "forge", "volt", "hermes", "lumen"];
+// "forge" retired 2026-07-24: Atlas now covers both the Claude Desktop chat and
+// code surfaces (see the "Agent Names" memory). Historical rows keep the value;
+// it is no longer derivable for new writes.
+const KNOWN_AGENTS = ["wren", "iris", "atlas", "volt", "hermes", "lumen"];
 const KNOWN_AGENTS_SET = new Set(KNOWN_AGENTS);
 function deriveWriterAgent(explicit: string | undefined, src: string): string | undefined {
   if (explicit && KNOWN_AGENTS_SET.has(explicit.toLowerCase())) return explicit.toLowerCase();
@@ -1033,9 +1036,9 @@ function startStalenessJob(supabase: any): void {
         })
         .join("\n");
       const { error: insertErr } = await supabase.from("task_queue").insert({
-        title: `Re-verify ${stalePending} unverified hot memories`,
+        title: `Re-verify ${stalePending} unverified memories`,
         description:
-          `${stalePending} frequently-recalled memories (access_count >= 10) have gone 14+ days without re-verification, so recall is serving them at full trust with nobody having vouched for them. These are NOT "cold" — most are hot; staleness keys off verification age, not access recency (migration 057).\n\nFor each: re-read it, check its claims against live state, correct or annotate what drifted, then call update_memory_verified (which clears the flag). Do not archive on age alone.\n\nTop by importance:\n\n${summary}\n\nUse SELECT * FROM memories WHERE staleness_candidate=true to see all.`,
+          `${stalePending} project/reference memories have gone 14+ days without anyone vouching for them (staleness keys off verification age, not access recency — migration 057). Recall already serves them at ${STALE_CONFIDENCE_FACTOR}x confidence with a +stale label, so this is a correctness backlog, not an outage.\n\nDo NOT assume these are hot. Migration 060 dropped the old \`access_count >= 10\` gate, so this set is essentially every project/reference row older than 14 days — median access_count is 0. access_count is now only a review-ORDERING term.\n\nWork it in pages off the review queue, not all at once:\n  SELECT * FROM stale_memories_review_queue WHERE review_rank BETWEEN 1 AND 25;\n(ordering: expired-TTL first, then hot-and-stale, then oldest-unverified)\n\nFor each: re-read it, check its claims against live state, correct or annotate what drifted, then call update_memory_verified (which clears the flag). Only stamp what you actually checked — blanket-stamping destroys the signal this column exists to carry. Do not archive on age alone.\n\nNote: dated point-in-time log entries (daily research, triage, incident write-ups) are immutable historical records; they cannot drift and are not worth re-verifying individually.\n\nTop by importance:\n\n${summary}`,
         priority: 2,
         status: "pending",
         source: "system",
@@ -1241,7 +1244,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       tags: z.array(z.string()).optional().describe("Tags for categorization and search"),
       source: z.string().optional().describe("Who is writing: claude-code, claude-ai, manual"),
       importance_score: z.number().min(0).max(1).optional().describe("Importance 0-1 (default 0.5). Higher = decays slower and ranks higher in recall. Use 0.8+ for critical long-term facts, 0.2 for ephemeral context."),
-      agent_id: z.string().optional().describe("Agent that owns this memory: wren, iris, atlas, forge, volt. Used with visibility=private for agent-scoped memories."),
+      agent_id: z.string().optional().describe("Agent that owns this memory: wren, iris, atlas, volt. Defaults to the agent derived from the caller/source. Used with visibility=private for agent-scoped memories."),
       visibility: z.enum(["shared", "private"]).optional().describe("shared (default): visible to all agents. private: visible only to agent_id owner."),
       agent_scope: z.array(z.string()).optional().describe("Which agents can see this memory. Default ['shared'] = all agents. E.g. ['wren','iris'] = only Wren and Iris. Requires migration 012."),
       confidence: z.number().min(0).max(1).optional().describe("Confidence 0-1 (default 0.8). Use < 0.5 for speculative or unverified facts. Memories below min_confidence threshold are excluded from recall when filtered."),
@@ -1320,10 +1323,12 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (importance_score !== undefined) update.importance_score = importance_score;
         if (confidence !== undefined) update.confidence = confidence;
         const derivedWriter = deriveWriterAgent(agent_id, src);
-        if (agent_id) {
-          update.agent_id = agent_id;
+        // Same agent_id fallback as the INSERT path below — see comment there.
+        const updateOwner = agent_id ?? derivedWriter;
+        if (updateOwner) {
+          update.agent_id = updateOwner;
           // Update provenance with contributing_agent (REC3, arXiv 2505.18279)
-          update.provenance = { contributing_agent: agent_id };
+          update.provenance = { contributing_agent: updateOwner };
         }
         if (derivedWriter) update.writer_agent = derivedWriter;
         if (visibility) update.visibility = visibility;
@@ -1433,7 +1438,13 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (importance_score !== undefined) insert.importance_score = importance_score;
       if (confidence !== undefined) insert.confidence = confidence;
       const insertWriter = deriveWriterAgent(agent_id, src);
-      if (agent_id) insert.agent_id = agent_id;
+      // agent_id defaults to the derived writer. Without this fallback only
+      // callers that pass agent_id explicitly get scoped — which nobody does —
+      // so agent_id drifted to 338/813 null after the 2026-06-02 backfill.
+      // hybrid_recall filters on agent_id, so a null row falls outside every
+      // agent-scoped query the moment private memories exist.
+      const insertOwner = agent_id ?? insertWriter;
+      if (insertOwner) insert.agent_id = insertOwner;
       if (insertWriter) insert.writer_agent = insertWriter;
       if (visibility) insert.visibility = visibility;
       if (agent_scope) insert.agent_scope = agent_scope;
@@ -1443,7 +1454,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       const insertTtl = ttlToExpiresAt(ttl_days ?? CLASS_DEFAULT_TTL_DAYS[insert.memory_class as string]);
       if (insertTtl) insert.expires_at = insertTtl;
       // Collaborative Memory provenance: track contributing agent (REC3, arXiv 2505.18279)
-      insert.provenance = agent_id ? { contributing_agent: agent_id } : {};
+      insert.provenance = insertOwner ? { contributing_agent: insertOwner } : {};
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
@@ -2762,7 +2773,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
     "record_episode",
     "Record or update an agent episode (task execution log). Captures input, actions, outcome, and learnings for episodic self-improvement (MemRL/CoALA pattern).",
     {
-      agent: z.string().describe("Agent name: wren, iris, atlas, forge, volt"),
+      agent: z.string().describe("Agent name: wren, iris, atlas, volt"),
       task_id: z.string().uuid().optional().describe("task_queue UUID this episode corresponds to"),
       status: z.enum(["in_progress", "completed", "failed", "partial"]).optional().describe("Episode status (default: in_progress)"),
       summary: z.string().optional().describe("1-2 sentence summary of what was done"),
