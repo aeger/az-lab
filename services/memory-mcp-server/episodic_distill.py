@@ -247,13 +247,17 @@ def _haiku_available() -> bool:
 
 
 def _call_claude_haiku(prompt: str, max_tokens: int = 256) -> str | None:
-    """Distill via Claude, routed through the shared Max-plan chain (Tier 0 OAuth ->
-    Tier 1 API key). Returns text, or None on failure (caller then uses the heuristic)."""
+    """Distill via Claude on the Max subscription (Tier 0 only). Returns text, or
+    None on failure — the caller then falls back to NemoClaw or the heuristic.
+
+    Deliberately NOT allowed to reach the billable Tier 1 API key: this is an
+    unattended background job, and a silent charge is worse than a cheaper
+    distillation."""
     if _shared_claude_call is not None:
         try:
             res = _shared_claude_call(
                 [{"role": "user", "content": prompt}],
-                model=HAIKU_MODEL, max_tokens=max_tokens, allow_tiers=(0, 1))
+                model=HAIKU_MODEL, max_tokens=max_tokens, allow_tiers=(0,))
             return (res.get("content") or "").strip() or None
         except Exception as e:
             log.warning(f"shared claude_call failed: {e}")
