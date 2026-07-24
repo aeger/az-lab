@@ -13,7 +13,7 @@ export const DEFAULT_CONFIG = {
   agentBusUrl: 'http://192.168.1.181:8765',
   sentinelApiUrl: 'https://sentinel-api.az-lab.dev',
   sentinelApiKey: 'sentinel-c81bbb17bb17df0f46787983da69bcb40c7779a9e1292376',
-  anthropicModel: 'claude-sonnet-4-6',
+  anthropicModel: 'claude-sonnet-5',
 } as const;
 
 // Storage keys

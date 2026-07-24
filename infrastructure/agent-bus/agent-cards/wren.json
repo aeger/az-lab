@@ -8,7 +8,7 @@
   "defaultInputModes": ["application/json", "text/plain"],
   "defaultOutputModes": ["application/json", "text/plain"],
   "supportsAuthenticatedExtendedCard": false,
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5",
   "runtime": "claude-code",
   "host": "svc-podman-01",
   "skills": [

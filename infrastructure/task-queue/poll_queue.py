@@ -37,9 +37,9 @@ CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
 HOSTNAME = socket.gethostname()
 
 # Model tiering — route tasks to the right model based on priority and tags
-MODEL_DEFAULT = "claude-sonnet-4-6"          # medium/high (priority 1-2)
+MODEL_DEFAULT = "claude-sonnet-5"            # medium/high (priority 1-2)
 MODEL_HAIKU   = "claude-haiku-4-5-20251001"  # low priority (3+) or tagged "haiku"/"quick"
-MODEL_OPUS    = "claude-opus-4-7"            # CRIT (priority 0), default heavy-reasoning path
+MODEL_OPUS    = "claude-opus-5"              # CRIT (priority 0), default heavy-reasoning path
 MODEL_GEMINI3 = "gemini-3-deep-think"        # CRIT with "gemini"/"deepthink" tag
 
 # Google Generative AI API (Gemini 3 Deep Think)
