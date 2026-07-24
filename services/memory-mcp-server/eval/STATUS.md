@@ -48,6 +48,18 @@ measurement arm of the "make Claude an active participant in its memory" thread.
 |---|---|---|---|
 | 2026-07-13 | memory_eval | v1 | none 0.00 · semantic 0.60 · hybrid 0.20 · oracle 0.60 (N=5) |
 | 2026-07-13 | scenario_eval | hb1/hb2 | grader unreliable → scores void; retrieval missed gold |
+| 2026-07-24 | retrieval_regression | baseline-ndcg-20260724 | N=56 · recall@5 0.500 · recall@10 0.643 · MRR 0.327 · **nDCG@10 0.374** |
+
+## 2026-07-24 update (research rec 2 — close the retrieval-gate gap)
+- **nDCG@5/@10 added** to `retrieval_regression.py` (migration 072). recall@k is blind to
+  rank inside k and MRR only credits the best hit; nDCG catches order-only regressions
+  (gold demoted but still top-k). `--compare` now trips on recall@5 **or** nDCG@10 slipping.
+- **Probe set 38 → 56.** `build_probes.py` mines high-`recall_count` memories (the rows the
+  fleet actually leans on) into category `mined_high_recall`, filtered to distinctive,
+  non-dated, unique-question facts so the gate stays discriminating (mined recall@5 0.56 ≈
+  curated single_hop 0.45 — not trivially easy). Reported per-category so mined can never
+  mask a curated regression.
+- Baseline recorded above — the number future RRF/trust/A-MAC weight changes must hold.
 
 ## How to run
 ```bash

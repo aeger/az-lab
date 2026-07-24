@@ -27,6 +27,7 @@ USAGE
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -115,8 +116,20 @@ def retrieve(question: str, topic_hint: str, k: int) -> list:
     return [r["id"] for r in res][:k]
 
 
+def ndcg_at(returned: list, gold: set, cut: int) -> float:
+    """Binary-relevance nDCG@cut. Credits EVERY gold hit, position-discounted —
+    so an order change that keeps gold in the top-k but demotes it still moves the
+    number (recall@k is blind to rank inside k; MRR only credits the best hit).
+    IDCG = the ideal ordering (all reachable gold packed at the top)."""
+    dcg = sum(1.0 / math.log2(i + 2) for i, mid in enumerate(returned[:cut]) if mid in gold)
+    ideal_hits = min(len(gold), cut)
+    idcg = sum(1.0 / math.log2(i + 2) for i in range(ideal_hits))
+    return (dcg / idcg) if idcg else 0.0
+
+
 def score(rows: list, k: int, verbose: bool):
     results, hits1, hits5, hits10, rr_total = [], 0, 0, 0, 0.0
+    ndcg5_total, ndcg10_total = 0.0, 0.0
 
     for q in rows:
         gold = set(q["gold_memory_ids"] or [])
@@ -134,14 +147,17 @@ def score(rows: list, k: int, verbose: bool):
             hits1 += rank <= 1
             hits5 += rank <= 5
             hits10 += rank <= 10
+        nd5, nd10 = ndcg_at(returned, gold, 5), ndcg_at(returned, gold, 10)
+        ndcg5_total += nd5
+        ndcg10_total += nd10
 
         results.append({
             "query_id": q["id"], "gold_rank": rank, "hit_at_5": bool(rank and rank <= 5),
-            "returned_ids": returned, "latency_ms": latency,
+            "returned_ids": returned, "latency_ms": latency, "ndcg_at_10": round(nd10, 4),
         })
         if verbose:
             mark = f"@{rank}" if rank else "MISS"
-            print(f"  [{q['category']:<10}] {mark:<6} {q['question'][:68]}")
+            print(f"  [{q['category']:<10}] {mark:<6} nDCG@10={nd10:.2f}  {q['question'][:56]}")
 
     n = len(rows)
     return results, {
@@ -150,6 +166,8 @@ def score(rows: list, k: int, verbose: bool):
         "recall_at_5": hits5 / n,
         "recall_at_10": hits10 / n,
         "mrr": rr_total / n,
+        "ndcg_at_5": ndcg5_total / n,
+        "ndcg_at_10": ndcg10_total / n,
     }
 
 
@@ -195,21 +213,26 @@ def cmd_run(args):
     print(f"  recall@5   {m['recall_at_5']:.3f}")
     print(f"  recall@10  {m['recall_at_10']:.3f}")
     print(f"  MRR        {m['mrr']:.3f}")
+    print(f"  nDCG@5     {m['ndcg_at_5']:.3f}")
+    print(f"  nDCG@10    {m['ndcg_at_10']:.3f}")
     print("  by category (recall@5):")
     for c, v in sorted(by_category(rows, results).items()):
         print(f"    {c:<12} {v['hit5']}/{v['n']}  ({v['hit5']/v['n']:.2f})")
 
     if args.compare:
-        prev = sb_get("eval_runs", {"select": "tag,recall_at_5,mrr", "tag": f"eq.{args.compare}",
+        prev = sb_get("eval_runs", {"select": "tag,recall_at_5,mrr,ndcg_at_10", "tag": f"eq.{args.compare}",
                                     "order": "created_at.desc", "limit": "1"})
         if not prev:
             print(f"\n  (no prior run tagged '{args.compare}' to compare against)")
         else:
             p = prev[0]
             d5, dm = m["recall_at_5"] - p["recall_at_5"], m["mrr"] - p["mrr"]
-            print(f"\n  vs {args.compare}:  recall@5 {d5:+.3f}   MRR {dm:+.3f}")
-            if d5 < -args.tolerance:
-                print(f"  REGRESSION: recall@5 dropped more than {args.tolerance}", file=sys.stderr)
+            dn = m["ndcg_at_10"] - (p.get("ndcg_at_10") or 0.0)
+            print(f"\n  vs {args.compare}:  recall@5 {d5:+.3f}   MRR {dm:+.3f}   nDCG@10 {dn:+.3f}")
+            # gate on recall@5 OR nDCG@10 slipping past tolerance — an order-only
+            # regression (gold demoted but still in top-k) trips nDCG while recall holds.
+            if d5 < -args.tolerance or dn < -args.tolerance:
+                print(f"  REGRESSION: recall@5 or nDCG@10 dropped more than {args.tolerance}", file=sys.stderr)
                 return 1
 
     if args.fail_under_recall5 is not None and m["recall_at_5"] < args.fail_under_recall5:
@@ -221,8 +244,8 @@ def cmd_run(args):
 def cmd_trend(args):
     for r in sb_get("eval_run_trend", {"select": "*", "limit": str(args.limit)}):
         print(f"{str(r['created_at'])[:19]}  {r['tag']:<16} "
-              f"recall@5={r['recall_at_5']}  MRR={r['mrr']}  "
-              f"Δr5={r['d_recall_at_5']}  Δmrr={r['d_mrr']}")
+              f"recall@5={r['recall_at_5']}  MRR={r['mrr']}  nDCG@10={r.get('ndcg_at_10')}  "
+              f"Δr5={r['d_recall_at_5']}  Δmrr={r['d_mrr']}  Δndcg={r.get('d_ndcg_at_10')}")
     return 0
 
 

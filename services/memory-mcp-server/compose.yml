@@ -19,6 +19,14 @@ services:
       - PORT=3100
       - OLLAMA_URL=http://ollama:11434
       - EMBED_MODEL=nomic-embed-text
+      # Embedding backend selector (2026-07-24 research rec 1 — kill the Ollama
+      # silent-wedge failure mode from 2026-07-15). Default 'ollama' keeps current
+      # behaviour; flip to 'tei' ONLY after the gated cutover in
+      # docs/EMBEDDING_TEI_MIGRATION.md (needs a full corpus re-embed + a green
+      # retrieval_regression.py run). TEI has a real /health readiness gate, so a
+      # wedge surfaces instead of silently attaching stale/NULL embeddings for 38h.
+      - EMBED_BACKEND=${EMBED_BACKEND:-ollama}
+      - TEI_EMBED_URL=${TEI_EMBED_URL:-http://tei-embed:8081}
       # Mem0 LLM classification (optional — heuristic mode if unset)
       # Set to NemoClaw NIM API for LLM-based ADD/UPDATE/DELETE/NOOP decisions
       - LLM_URL=${LLM_URL:-}
@@ -82,8 +90,44 @@ services:
       retries: 3
       start_period: 120s
 
+  # ─── TEI Embedding server (2026-07-24 research rec 1) ────────────────────────
+  # Serves nomic-embed-text-v1.5 (768d — DIMENSION-IDENTICAL to the current Ollama
+  # nomic-embed-text and the vector(768) column, so no pgvector schema change).
+  # Purpose: replace the Ollama embed dependency, whose container silently wedged
+  # ~38h on 2026-07-15 (podman ps "Up" while every embed failed). TEI exposes a real
+  # /health readiness gate, so a wedge is detectable instead of silently degrading.
+  #
+  # DEPLOYED-BUT-DORMANT: nothing reads this until memory-mcp's EMBED_BACKEND=tei.
+  # That flip requires the gated cutover in docs/EMBEDDING_TEI_MIGRATION.md (full
+  # corpus re-embed + prefix parity + a green retrieval_regression.py run) — do NOT
+  # flip it here. Starting this container early just warms the model cache.
+  tei-embed:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    container_name: az-tei-embed
+    restart: unless-stopped
+    command: --model-id nomic-ai/nomic-embed-text-v1.5 --port 8081
+    volumes:
+      - tei-embed-cache:/data
+    networks:
+      - proxy
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
 volumes:
   tei-model-cache:
+  tei-embed-cache:
 
 networks:
   proxy:
