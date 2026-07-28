@@ -187,6 +187,113 @@ const RERANK_TOP_K = parseInt(process.env.RERANK_TOP_K || "5", 10);
 // Multiplier applied to a staleness_candidate row's confidence at recall time.
 const STALE_CONFIDENCE_FACTOR = parseFloat(process.env.STALE_CONFIDENCE_FACTOR || "0.75");
 
+// ── Adaptive recall router (2026-07-26 research, tier 1) ────────────────────
+// Off by default. Set RECALL_ROUTER=1 to enable.
+const RECALL_ROUTER = process.env.RECALL_ROUTER === "1";
+
+/**
+ * Pick recall_mode / rerank / pool width from the SHAPE of the query.
+ *
+ * WHY: recall_mode has existed since the 5-lane work and is caller-selected, but no
+ * caller has ever selected it — every recall in az-lab pays the full 6-lane RRF plus
+ * a TEI cross-encoder rerank, including "192.168.1.181" and "hybrid_recall", where
+ * the embedding lane contributes nothing a BM25/trigram match would not already have
+ * found and the reranker is being asked to semantically re-order exact-token hits.
+ *
+ * FAIL-OPEN IS THE WHOLE DESIGN. A misroute is not a slow query, it is a silent
+ * recall MISS — the caller gets fewer/worse memories and has no way to tell that a
+ * heuristic chose that for them. So every branch that is not positively identified
+ * falls through to hybrid + rerank, which is exactly today's behaviour. The router
+ * can only ever make a query CHEAPER when it is confident, never narrower when it
+ * is guessing.
+ */
+type RecallRoute = {
+  mode: "hybrid" | "semantic" | "lexical";
+  rerank: boolean;
+  poolMultiplier: number;
+  reason: string;
+};
+
+const STOPWORDS = new Set([
+  "a", "an", "the", "is", "are", "was", "were", "be", "been", "do", "does", "did",
+  "of", "for", "to", "in", "on", "at", "and", "or", "but", "with", "from", "by",
+  "it", "its", "this", "that", "these", "those", "i", "we", "you", "my", "our",
+]);
+const QUESTION_WORDS = new Set([
+  "what", "why", "how", "when", "where", "which", "who", "whom", "whose", "should", "can",
+]);
+
+/** IP/CIDR, hostname/FQDN, snake_case/kebab ident, version string, error code, path. */
+const EXACT_TOKEN_RE = [
+  /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/,        // 192.168.1.181, 10.0.0.0/8
+  /^[a-z0-9-]+(\.[a-z0-9-]+){1,}$/i,            // svc-podman-01.az-lab.dev, memories.name
+  /^[a-z0-9]+(_[a-z0-9]+)+$/i,                  // hybrid_recall, eval_run_trend
+  /^v?\d+\.\d+(\.\d+)?$/,                       // 5.13.0, v3.6
+  /^[A-Z][A-Z0-9_]{2,}$/,                       // ENOENT, RECALL_ROUTER
+  /^\d{3}$/,                                    // 504, 422
+  /^\//,                                        // /home/almty1/azlab
+];
+
+function routeRecall(query: string, topicHint?: string): RecallRoute {
+  const HYBRID: RecallRoute = {
+    mode: "hybrid", rerank: true, poolMultiplier: 2, reason: "default (fail-open)",
+  };
+  const q = (query || "").trim();
+  if (!q) return { ...HYBRID, reason: "empty query — fail-open" };
+
+  const tokens = q.split(/\s+/).filter(Boolean);
+  const lower = tokens.map((t) => t.toLowerCase());
+  const hasStopword = lower.some((t) => STOPWORDS.has(t));
+  const hasQuestionWord = lower.some((t) => QUESTION_WORDS.has(t));
+  // Multi-clause: punctuation that joins independent thoughts, not decoration.
+  const multiClause = /[,;?]|\band\b|\bor\b|\bbut\b/i.test(q);
+
+  // 1. Exact-token shape → lexical, no rerank. The embedding lane cannot beat an
+  //    exact BM25/trigram match on an identifier, and a cross-encoder asked to
+  //    re-rank exact hits mostly adds latency and occasionally demotes the right one.
+  if (tokens.length <= 4 && !hasStopword && !hasQuestionWord) {
+    const exact = tokens.filter((t) =>
+      EXACT_TOKEN_RE.some((re) => re.test(t.replace(/[.,;:?!]+$/, ""))));
+    if (exact.length > 0 && exact.length === tokens.length) {
+      return {
+        mode: "lexical", rerank: false, poolMultiplier: 2,
+        reason: `exact-token (${tokens.length} tok, all identifier-shaped)`,
+      };
+    }
+  }
+
+  // 2. Short factual NL → hybrid, no rerank. Both lanes still run (cheap, and the
+  //    hint lane carries the ranking); skipping only the cross-encoder, which has
+  //    little to reorder when the query is this specific.
+  if (tokens.length <= 8 && hasStopword && !multiClause && !hasQuestionWord) {
+    return {
+      mode: "hybrid", rerank: false, poolMultiplier: 2,
+      reason: `short factual NL (${tokens.length} tok)`,
+    };
+  }
+
+  // 3. Verbose / multi-clause / question-word NL → hybrid + rerank + wider pool.
+  //    This is where the cross-encoder earns its latency: the 2026-07-28 depth
+  //    sweep measured nDCG@10 0.456 -> 0.617 going from no-rerank to depth 20.
+  //
+  //    MEASURED 2026-07-28, poolMultiplier 4 BUYS NOTHING: the router A/B
+  //    (`retrieval_regression.py router`) moved nDCG@10 0.6929 -> 0.6932 (+0.0003)
+  //    for +0.6% p50. That is structural, not noise — rerankPool is hard-capped at
+  //    20 by TEI's max_client_batch_size, and finalLimit collapses to
+  //    min(RERANK_TOP_K, limit) once rerank fires, so candidates 21-40 can neither
+  //    be reranked nor returned. A wider pool is only worth paying for AFTER the
+  //    rerank request is chunked. Left at 4 as specified, but do not read it as
+  //    a tuned value.
+  if (tokens.length > 8 || multiClause || hasQuestionWord) {
+    return {
+      mode: "hybrid", rerank: true, poolMultiplier: 4,
+      reason: `verbose/interrogative NL (${tokens.length} tok${multiClause ? ", multi-clause" : ""}${hasQuestionWord ? ", question-word" : ""})`,
+    };
+  }
+
+  return HYBRID;
+}
+
 // Per-class re-verification TTL, in days (migration 057). Only 'working' gets a
 // default: it is short-term scratch context that is wrong within the week.
 // The durable classes carry no blanket TTL — they fall through to the sweep's
@@ -1517,11 +1624,24 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Filter by memory class. episodic=event log, semantic=durable facts (default for most), procedural=skills/how-to, working=short-term context."),
     },
     async ({ query, topic_hint, type, tags, limit, semantic, recall_mode, agent_id, agent_scope, min_confidence, memory_class }) => {
+      // Adaptive router (RECALL_ROUTER=1). Only consulted when the caller expressed
+      // NO preference — an explicit recall_mode, or the legacy `semantic` boolean,
+      // always wins. A caller that asked for a mode gets that mode.
+      const callerChoseMode = recall_mode !== undefined || semantic !== undefined;
+      const route = (RECALL_ROUTER && !callerChoseMode && query)
+        ? routeRecall(query, topic_hint)
+        : null;
+
       const maxResults = limit || 10;
 
       // recall_mode supersedes the legacy `semantic` boolean. Default to 'hybrid'.
       const effectiveMode: "hybrid" | "semantic" | "lexical" =
-        recall_mode ?? (semantic === false ? "lexical" : "hybrid");
+        recall_mode ?? route?.mode ?? (semantic === false ? "lexical" : "hybrid");
+
+      if (route) {
+        console.log(`[recall-router] mode=${route.mode} rerank=${route.rerank} `
+          + `pool=x${route.poolMultiplier} — ${route.reason} — query="${query!.slice(0, 80)}"`);
+      }
 
       // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled.
       // hybrid_recall with null embedding degrades gracefully to BM25-only (tsvector ts_rank),
@@ -1546,7 +1666,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
           p_query_text: lexicalQueryText,
           p_query_embedding: queryEmbedding ? JSON.stringify(queryEmbedding) : null,
           p_match_threshold: queryEmbedding ? 0.3 : 0.0,
-          p_match_count: maxResults * 2, // wider pool, filter below
+          p_match_count: maxResults * (route?.poolMultiplier ?? 2), // wider pool, filter below
           p_filter_type: type || null,
         };
         if (agent_id) rpcParams.p_agent_id = agent_id;
@@ -1563,9 +1683,13 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
           let filtered = data as any[];
           if (tags?.length) filtered = filtered.filter((m) => tags.some((t) => m.tags?.includes(t)));
           // Reranking: TEI cross-encoder (primary, local) → Nemotron LLM (fallback)
+          // Rerank depth stays capped at 20 regardless of a wider RRF pool: TEI
+          // enforces max_client_batch_size=32 and 422s the WHOLE request above it,
+          // which makes rerankWithTEI return null and silently fall through to the
+          // un-reranked order. Raising this needs request chunking first.
           const rerankPool = filtered.slice(0, 20);
           let rerankLabel = "";
-          if (rerankPool.length > 1) {
+          if (rerankPool.length > 1 && (route?.rerank ?? true)) {
             const teiResult = await rerankWithTEI(query, rerankPool);
             if (teiResult) {
               filtered = [...teiResult, ...filtered.slice(20)];

@@ -19,6 +19,9 @@ WHAT THIS IS NOT:
 METRICS
   recall@k  fraction of queries where ANY gold memory appeared in the top k
   MRR       mean of 1/rank over the best-ranked gold hit (0 for a miss)
+  FCFR      false-carry-forward rate (migration 084): fraction of 'forgetting'
+            probes where a SUPERSEDED memory came back in the top-10. The only
+            metric here that measures an absence. Lower is better; 0.0 is target.
 
 USAGE
   python3 retrieval_regression.py run --tag pre-065
@@ -31,6 +34,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import time
@@ -152,9 +156,12 @@ def sb_rpc(fn: str, body: dict) -> list:
     return r.json()
 
 
+FORGETTING_CATEGORY = "forgetting"
+
+
 def load_queries() -> list:
     rows = sb_get("eval_queries", {
-        "select": "id,question,topic_hint,gold_memory_ids,category",
+        "select": "id,question,topic_hint,gold_memory_ids,forbidden_memory_ids,category",
         "active": "is.true",
         "order": "category,created_at",
     })
@@ -188,12 +195,33 @@ def ndcg_at(returned: list, gold: set, cut: int) -> float:
 
 
 def score(rows: list, k: int, verbose: bool):
+    """Score every probe, but aggregate the POSITIVE metrics over the non-forgetting
+    population only.
+
+    WHY THE SPLIT DENOMINATOR (migration 084): recall@k / MRR / nDCG are means over
+    the probe set, so the population IS part of the metric definition. The nightly
+    gate (cmd_gate) fires when nDCG@10 falls >5% below the trailing 7-run median —
+    folding 9 brand-new probes into that mean would shift it discontinuously at the
+    084 boundary and fire an alert attributable to nothing but the schema change.
+    That is precisely the unattributable-alarm failure the --max-fail-pct guard
+    exists to prevent, so the same reasoning applies here.
+
+    Forgetting probes are still fully scored and still written to eval_run_results
+    (their gold_rank and returned_ids are real and worth having); they just do not
+    enter the positive aggregate. They get their own metric — FCFR — with its own
+    denominator, which keeps both numbers interpretable on their own terms."""
     results, hits1, hits5, hits10, rr_total = [], 0, 0, 0, 0.0
     ndcg5_total, ndcg10_total = 0.0, 0.0
     failures = 0
+    n_positive = 0
+    n_forgetting = 0
+    carry_forward_hits = 0
+    violations = []
 
     for q in rows:
         gold = set(q["gold_memory_ids"] or [])
+        forbidden = set(q.get("forbidden_memory_ids") or [])
+        is_forgetting = q["category"] == FORGETTING_CATEGORY
         t0 = time.time()
         try:
             returned = retrieve(q["question"], q.get("topic_hint"), k)
@@ -204,33 +232,60 @@ def score(rows: list, k: int, verbose: bool):
         latency = int((time.time() - t0) * 1000)
 
         rank = next((i + 1 for i, mid in enumerate(returned) if mid in gold), None)
-        if rank:
-            rr_total += 1.0 / rank
-            hits1 += rank <= 1
-            hits5 += rank <= 5
-            hits10 += rank <= 10
         nd5, nd10 = ndcg_at(returned, gold, 5), ndcg_at(returned, gold, 10)
-        ndcg5_total += nd5
-        ndcg10_total += nd10
+
+        if not is_forgetting:
+            n_positive += 1
+            if rank:
+                rr_total += 1.0 / rank
+                hits1 += rank <= 1
+                hits5 += rank <= 5
+                hits10 += rank <= 10
+            ndcg5_total += nd5
+            ndcg10_total += nd10
+
+        # Negative golds. Scored on the top-10 regardless of k so the number means
+        # the same thing across runs with different retrieval depths.
+        carried = [m for m in returned[:10] if m in forbidden]
+        if forbidden:
+            n_forgetting += 1
+            if carried:
+                carry_forward_hits += 1
+                violations.append((q, carried, returned))
 
         results.append({
             "query_id": q["id"], "gold_rank": rank, "hit_at_5": bool(rank and rank <= 5),
             "returned_ids": returned, "latency_ms": latency, "ndcg_at_10": round(nd10, 4),
         })
         if verbose:
-            mark = f"@{rank}" if rank else "MISS"
-            print(f"  [{q['category']:<10}] {mark:<6} nDCG@10={nd10:.2f}  {q['question'][:56]}")
+            if is_forgetting:
+                mark = f"CARRY x{len(carried)}" if carried else "clean"
+                print(f"  [{q['category']:<10}] {mark:<12} {q['question'][:56]}")
+            else:
+                mark = f"@{rank}" if rank else "MISS"
+                print(f"  [{q['category']:<10}] {mark:<6} nDCG@10={nd10:.2f}  {q['question'][:56]}")
 
-    n = len(rows)
-    return results, {
-        "n_queries": n,
-        "recall_at_1": hits1 / n,
-        "recall_at_5": hits5 / n,
-        "recall_at_10": hits10 / n,
-        "mrr": rr_total / n,
-        "ndcg_at_5": ndcg5_total / n,
-        "ndcg_at_10": ndcg10_total / n,
-    }, failures
+    # A run with zero positive probes would be a corpus/config error, not a 0.0 score.
+    if n_positive == 0:
+        die("no non-forgetting probes active — refusing to record a run with an "
+            "undefined positive-metric denominator")
+
+    metrics = {
+        "n_queries": n_positive,
+        "recall_at_1": hits1 / n_positive,
+        "recall_at_5": hits5 / n_positive,
+        "recall_at_10": hits10 / n_positive,
+        "mrr": rr_total / n_positive,
+        "ndcg_at_5": ndcg5_total / n_positive,
+        "ndcg_at_10": ndcg10_total / n_positive,
+    }
+    # NULL rather than 0.0 when nothing declares negative golds — 0.0 would read as
+    # "measured, perfect" when the truth is "not measured".
+    metrics["false_carry_forward_rate"] = (
+        carry_forward_hits / n_forgetting if n_forgetting else None
+    )
+    return results, metrics, failures, {"n": n_forgetting, "hits": carry_forward_hits,
+                                        "violations": violations}
 
 
 def by_category(rows, results):
@@ -260,7 +315,7 @@ def cmd_run(args):
 
         print(f"Running {len(rows)} eval queries (k={args.k}) against hybrid_recall …")
         try:
-            results, m, failures = score(rows, args.k, args.verbose)
+            results, m, failures, fcf = score(rows, args.k, args.verbose)
         finally:
             repaired = sb_rpc("eval_access_snapshot_restore", {})
             print(f"access stats restored ({repaired} rows perturbed by this run)")
@@ -286,16 +341,33 @@ def cmd_run(args):
     sb_post("eval_run_results", [{"run_id": run["id"], **r} for r in results])
 
     print(f"\n=== {args.tag} ===")
-    print(f"  n          {m['n_queries']}")
+    print(f"  n          {m['n_queries']}  (positive-gold probes; "
+          f"{fcf['n']} forgetting probes scored separately)")
     print(f"  recall@1   {m['recall_at_1']:.3f}")
     print(f"  recall@5   {m['recall_at_5']:.3f}")
     print(f"  recall@10  {m['recall_at_10']:.3f}")
     print(f"  MRR        {m['mrr']:.3f}")
     print(f"  nDCG@5     {m['ndcg_at_5']:.3f}")
     print(f"  nDCG@10    {m['ndcg_at_10']:.3f}")
+    if m["false_carry_forward_rate"] is None:
+        print("  FCFR       n/a (no probes declare forbidden_memory_ids)")
+    else:
+        print(f"  FCFR       {m['false_carry_forward_rate']:.3f}  "
+              f"({fcf['hits']}/{fcf['n']} probes returned a superseded memory)")
     print("  by category (recall@5):")
     for c, v in sorted(by_category(rows, results).items()):
-        print(f"    {c:<12} {v['hit5']}/{v['n']}  ({v['hit5']/v['n']:.2f})")
+        label = f"{c} *" if c == FORGETTING_CATEGORY else c
+        print(f"    {label:<14} {v['hit5']}/{v['n']}  ({v['hit5']/v['n']:.2f})")
+    if any(q["category"] == FORGETTING_CATEGORY for q in rows):
+        print(f"    (* forgetting probes are excluded from the aggregate above; "
+              f"see FCFR)")
+
+    # Name the offenders. An FCFR of 0.111 is not actionable; "probe X returned the
+    # v5.9.0 row at rank 3" is.
+    for q, carried, returned in fcf["violations"]:
+        ranks = ", ".join(f"{m_id[:8]}@{returned.index(m_id) + 1}" for m_id in carried)
+        print(f"  ! CARRY-FORWARD  {q['question'][:60]}")
+        print(f"      superseded rows returned: {ranks}")
 
     if args.compare:
         prev = sb_get("eval_runs", {"select": "tag,recall_at_5,mrr,ndcg_at_10", "tag": f"eq.{args.compare}",
@@ -315,6 +387,14 @@ def cmd_run(args):
 
     if args.fail_under_recall5 is not None and m["recall_at_5"] < args.fail_under_recall5:
         print(f"  FAIL: recall@5 {m['recall_at_5']:.3f} < floor {args.fail_under_recall5}", file=sys.stderr)
+        return 1
+
+    fcfr = m["false_carry_forward_rate"]
+    if args.max_fcfr is not None and fcfr is not None and fcfr > args.max_fcfr:
+        print(f"  FAIL: false-carry-forward rate {fcfr:.3f} > ceiling {args.max_fcfr} — "
+              f"superseded memories are being served. Check the is_active filter on "
+              f"every hybrid_recall lane (migration 048b), supersession heuristic (073), "
+              f"and trust-tier weighting.", file=sys.stderr)
         return 1
     return 0
 
@@ -395,7 +475,10 @@ def cmd_sweep(args):
     Depth 0 is the control: no rerank, pure RRF/A-MAC order (what the nightly gate
     measures today, and what the eval harness has always measured)."""
     depths = [int(d) for d in args.depths.split(",")]
-    rows = load_queries()
+    # Forgetting probes measure an absence and carry no meaningful positive gold for
+    # a depth sweep; including them would also make these numbers incomparable to the
+    # 2026-07-28 sweep recorded before migration 084.
+    rows = [q for q in load_queries() if q["category"] != FORGETTING_CATEGORY]
     print(f"sweeping depths {depths} over {len(rows)} queries "
           f"(reranker: {RERANKER_URL})\n")
 
@@ -472,6 +555,177 @@ def cmd_sweep(args):
     return 0
 
 
+STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "do", "does", "did",
+    "of", "for", "to", "in", "on", "at", "and", "or", "but", "with", "from", "by",
+    "it", "its", "this", "that", "these", "those", "i", "we", "you", "my", "our",
+}
+QUESTION_WORDS = {
+    "what", "why", "how", "when", "where", "which", "who", "whom", "whose", "should", "can",
+}
+EXACT_TOKEN_RES = [
+    re.compile(r"^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$"),
+    re.compile(r"^[a-z0-9-]+(\.[a-z0-9-]+){1,}$", re.I),
+    re.compile(r"^[a-z0-9]+(_[a-z0-9]+)+$", re.I),
+    re.compile(r"^v?\d+\.\d+(\.\d+)?$"),
+    re.compile(r"^[A-Z][A-Z0-9_]{2,}$"),
+    re.compile(r"^\d{3}$"),
+    re.compile(r"^/"),
+]
+
+
+def route_recall(query: str) -> dict:
+    """MUST STAY BYTE-EQUIVALENT TO routeRecall() IN src/index.ts.
+
+    Replicated here for the same reason tei_rerank is: measuring the router through
+    the MCP server would cost a deploy per iteration, and the thing being validated
+    is a pure function of the query string. The hazard is identical too — if this
+    drifts from the TypeScript, this harness validates a router production does not
+    run. Change both or neither."""
+    q = (query or "").strip()
+    default = {"mode": "hybrid", "rerank": True, "pool": 2, "reason": "default (fail-open)"}
+    if not q:
+        return {**default, "reason": "empty query — fail-open"}
+
+    tokens = [t for t in q.split() if t]
+    lower = [t.lower() for t in tokens]
+    has_stopword = any(t in STOPWORDS for t in lower)
+    has_question_word = any(t in QUESTION_WORDS for t in lower)
+    multi_clause = bool(re.search(r"[,;?]|\band\b|\bor\b|\bbut\b", q, re.I))
+
+    if len(tokens) <= 4 and not has_stopword and not has_question_word:
+        exact = [t for t in tokens
+                 if any(r.match(re.sub(r"[.,;:?!]+$", "", t)) for r in EXACT_TOKEN_RES)]
+        if exact and len(exact) == len(tokens):
+            return {"mode": "lexical", "rerank": False, "pool": 2,
+                    "reason": f"exact-token ({len(tokens)} tok)"}
+
+    if len(tokens) <= 8 and has_stopword and not multi_clause and not has_question_word:
+        return {"mode": "hybrid", "rerank": False, "pool": 2,
+                "reason": f"short factual NL ({len(tokens)} tok)"}
+
+    if len(tokens) > 8 or multi_clause or has_question_word:
+        return {"mode": "hybrid", "rerank": True, "pool": 4,
+                "reason": f"verbose/interrogative NL ({len(tokens)} tok)"}
+
+    return default
+
+
+def retrieve_routed(question: str, topic_hint: str, k: int, route: dict) -> list:
+    """Replicates the MCP recall path for a given route: mode selects which lanes
+    hybrid_recall sees (lexical => null embedding; semantic => blank query_text and
+    no topic_hint), pool widens p_match_count, rerank runs TEI over the top 20."""
+    wants_vector = route["mode"] != "lexical"
+    wants_lexical = route["mode"] != "semantic"
+
+    emb = embed(question) if wants_vector else None
+    body = {
+        "p_query_text": question if wants_lexical else " ",
+        "p_query_embedding": json.dumps(emb) if emb else None,
+        "p_match_threshold": 0.3 if emb else 0.0,
+        "p_match_count": k * route["pool"],
+    }
+    if wants_lexical and topic_hint:
+        body["p_topic_hint"] = topic_hint
+    rows = sb_rpc("hybrid_recall", body)
+
+    if route["rerank"] and len(rows) > 1:
+        pool = rows[:20]
+        rows = tei_rerank(question, pool) + rows[20:]
+    return [r["id"] for r in rows][:k]
+
+
+def cmd_router(args):
+    """A/B the adaptive recall router (2026-07-26 research, tier 1).
+
+    Arm OFF reproduces today's production behaviour: hybrid, pool x2, rerank always.
+    Arm ON routes per query. Accept the router ONLY if nDCG@10 holds and latency drops
+    — a router that trades recall for speed is a silent regression, which is why the
+    decision line below prints both and refuses to summarise them into one score."""
+    rows = [q for q in load_queries() if q["category"] != FORGETTING_CATEGORY]
+    off_route = {"mode": "hybrid", "rerank": True, "pool": 2, "reason": "flag-off control"}
+
+    # Show the routing distribution before spending any latency on it — if the probe
+    # set does not contain the query shapes the router discriminates on, the A/B
+    # cannot show a difference and that is a fact about the PROBE SET, not the router.
+    dist = {}
+    for q in rows:
+        r = route_recall(q["question"])
+        key = f"{r['mode']}/rerank={r['rerank']}/pool=x{r['pool']}"
+        dist[key] = dist.get(key, 0) + 1
+    print("routing distribution over probe set:")
+    for key, n in sorted(dist.items(), key=lambda kv: -kv[1]):
+        print(f"  {n:>3}  {key}")
+    print()
+
+    results = {}
+    with eval_lock("router A/B"):
+        snapped = sb_rpc("eval_access_snapshot_take", {})
+        print(f"access-stat snapshot taken ({snapped} rows) — A/B will be non-mutating\n")
+        try:
+            for arm in ("off", "on"):
+                hits5 = 0
+                nd10_t = 0.0
+                lats = []
+                for q in rows:
+                    route = off_route if arm == "off" else route_recall(q["question"])
+                    gold = set(q["gold_memory_ids"] or [])
+                    t0 = time.time()
+                    try:
+                        returned = retrieve_routed(q["question"], q.get("topic_hint"),
+                                                   args.k, route)
+                    except Exception as e:
+                        print(f"  ! arm={arm} {q['id']}: {e}", file=sys.stderr)
+                        returned = []
+                    lats.append((time.time() - t0) * 1000)
+                    rank = next((i + 1 for i, m in enumerate(returned) if m in gold), None)
+                    if rank:
+                        hits5 += rank <= 5
+                    nd10_t += ndcg_at(returned, gold, 10)
+                lats.sort()
+                results[arm] = {
+                    "recall_at_5": hits5 / len(rows),
+                    "ndcg_at_10": nd10_t / len(rows),
+                    "p50_ms": lats[len(lats) // 2],
+                    "p95_ms": lats[int(len(lats) * 0.95) - 1],
+                    "total_s": sum(lats) / 1000.0,
+                }
+                r = results[arm]
+                print(f"  RECALL_ROUTER={'1' if arm == 'on' else '0'}: "
+                      f"recall@5 {r['recall_at_5']:.3f}  nDCG@10 {r['ndcg_at_10']:.4f}  "
+                      f"p50 {r['p50_ms']:.0f}ms  p95 {r['p95_ms']:.0f}ms  "
+                      f"total {r['total_s']:.1f}s")
+        finally:
+            repaired = sb_rpc("eval_access_snapshot_restore", {})
+            print(f"\naccess stats restored ({repaired} rows perturbed by this A/B)")
+
+    off, on = results["off"], results["on"]
+    d_ndcg = on["ndcg_at_10"] - off["ndcg_at_10"]
+    d_ndcg_pct = (d_ndcg / off["ndcg_at_10"] * 100) if off["ndcg_at_10"] else 0.0
+    d_p50_pct = (on["p50_ms"] - off["p50_ms"]) / off["p50_ms"] * 100 if off["p50_ms"] else 0.0
+
+    print("\n=== router A/B verdict ===")
+    print(f"  nDCG@10  {off['ndcg_at_10']:.4f} -> {on['ndcg_at_10']:.4f}  "
+          f"({d_ndcg:+.4f}, {d_ndcg_pct:+.1f}%)")
+    print(f"  recall@5 {off['recall_at_5']:.3f} -> {on['recall_at_5']:.3f}")
+    print(f"  p50      {off['p50_ms']:.0f}ms -> {on['p50_ms']:.0f}ms ({d_p50_pct:+.1f}%)")
+    print(f"  p95      {off['p95_ms']:.0f}ms -> {on['p95_ms']:.0f}ms")
+
+    quality_holds = d_ndcg >= -args.tolerance
+    latency_drops = on["p50_ms"] < off["p50_ms"]
+    if quality_holds and latency_drops:
+        print("\n  SHIP: quality held and latency dropped.")
+        return 0
+    if not quality_holds:
+        print(f"\n  DO NOT SHIP: nDCG@10 fell {d_ndcg:+.4f} (tolerance -{args.tolerance}). "
+              f"A misroute is a silent recall miss.", file=sys.stderr)
+        return 1
+    print("\n  DO NOT SHIP (no benefit): quality held but latency did not drop. "
+          "Leave RECALL_ROUTER=0 — untaken complexity is cheaper than taken complexity.",
+          file=sys.stderr)
+    return 1
+
+
 def cmd_gate(args):
     """Regression gate over the trailing median (2026-07-28 research tier 1).
 
@@ -480,7 +734,8 @@ def cmd_gate(args):
     single run alarms on noise; gating on the median of the last N absorbs it and
     still catches a real step change. Fires on nDCG@10 specifically because it is the
     metric that moves when ranking degrades without gold falling out of top-k."""
-    sel = {"select": "id,tag,created_at,ndcg_at_10,recall_at_5,n_queries,git_sha",
+    sel = {"select": "id,tag,created_at,ndcg_at_10,recall_at_5,n_queries,git_sha,"
+                     "false_carry_forward_rate",
            "order": "created_at.desc", "limit": "1"}
     if args.tag:
         sel["tag"] = f"eq.{args.tag}"
@@ -525,10 +780,27 @@ def cmd_gate(args):
         return 1
 
     print("  OK — within tolerance")
+
+    # FCFR is gated separately from nDCG, not folded into it. A superseded memory
+    # reaching the top-10 is a correctness failure at ANY level — there is no
+    # trailing median to be "within tolerance" of, so it gets an absolute ceiling.
+    fcfr = cur.get("false_carry_forward_rate")
+    if fcfr is not None:
+        print(f"  false-carry-forward {fcfr:.3f} (ceiling {args.max_fcfr})")
+        if fcfr > args.max_fcfr:
+            discord(f"🔻 **Superseded memories are being served** — eval `{cur['tag']}`\n"
+                    f"false-carry-forward rate **{fcfr:.3f}** > ceiling {args.max_fcfr}. "
+                    f"A retired fact reached the top-10, so agents can answer from it.\n"
+                    f"Check: `is_active` filter on all six `hybrid_recall` lanes "
+                    f"(migration 048b), supersession heuristic (073), trust-tier weight.")
+            print("  FCFR CEILING BREACHED — alerting Discord", file=sys.stderr)
+            return 1
+
     if args.notify_ok:
+        fcfr_txt = f", FCFR {fcfr:.3f}" if fcfr is not None else ""
         discord(f"✅ Nightly memory eval `{cur['tag']}`: nDCG@10 {cur['ndcg_at_10']:.4f} "
                 f"({delta_pct:+.1f}% vs median), recall@5 {cur['recall_at_5']:.3f}, "
-                f"n={cur['n_queries']}")
+                f"n={cur['n_queries']}{fcfr_txt}")
     return 0
 
 
@@ -542,6 +814,10 @@ def main():
     r.add_argument("--compare", help="prior run tag to diff against")
     r.add_argument("--tolerance", type=float, default=0.02, help="allowed recall@5 drop vs --compare")
     r.add_argument("--fail-under-recall5", type=float, default=None, help="hard floor for CI")
+    r.add_argument("--max-fcfr", type=float, default=None,
+                   help="hard ceiling on the false-carry-forward rate (migration 084). "
+                        "Fails the run when superseded memories reach the top-10. "
+                        "Not on by default — establish a baseline before gating.")
     r.add_argument("--git-sha", default=os.environ.get("GIT_SHA"))
     r.add_argument("--notes")
     r.add_argument("--max-fail-pct", type=float, default=0.05,
@@ -563,12 +839,22 @@ def main():
     s.add_argument("--record", action="store_true", help="write each depth to eval_runs")
     s.set_defaults(func=cmd_sweep)
 
+    rt = sub.add_parser("router", help="A/B the adaptive recall router (RECALL_ROUTER)")
+    rt.add_argument("--k", type=int, default=10)
+    rt.add_argument("--tolerance", type=float, default=0.02,
+                    help="max allowed nDCG@10 drop for the router to be shippable")
+    rt.set_defaults(func=cmd_router)
+
     g = sub.add_parser("gate", help="alert if the latest run's nDCG@10 fell below the trailing median")
     g.add_argument("--tag", help="gate this tag's latest run (default: latest run overall)")
     g.add_argument("--window", type=int, default=7, help="trailing runs in the median (default 7)")
     g.add_argument("--drop-pct", type=float, default=5.0, help="alert when nDCG@10 falls this %% below the median")
     g.add_argument("--min-history", type=int, default=3,
                    help="skip gating until this many prior scored runs exist")
+    g.add_argument("--max-fcfr", type=float, default=0.0,
+                   help="absolute ceiling on false-carry-forward rate (default 0.0 — "
+                        "any superseded memory in the top-10 alerts). Not medianed: "
+                        "serving a retired fact is wrong at any baseline.")
     g.add_argument("--notify-ok", action="store_true", help="also post a Discord line when green")
     g.set_defaults(func=cmd_gate)
 
