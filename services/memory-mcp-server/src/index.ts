@@ -1134,10 +1134,14 @@ function startStalenessJob(supabase: any): void {
       // list name already-verified memories while the count came off the derived
       // view — the two halves of one task brief disagreeing. is_stale_now is the
       // PostgREST computed column over memory_is_stale(), so it can't drift.
+      // is_point_in_time=false mirrors the view's migration-087 exclusion:
+      // memory_is_stale() alone doesn't know about that flag, so without this
+      // filter the top-5 would name immutable logs the count no longer includes.
       const { data: top } = await supabase
         .from("memories")
         .select("name, importance_score, verified_at, created_at")
         .eq("is_stale_now", true)
+        .eq("is_point_in_time", false)
         .not("is_active", "is", false)
         .order("importance_score", { ascending: false })
         .limit(5);
@@ -1154,9 +1158,9 @@ function startStalenessJob(supabase: any): void {
         })
         .join("\n");
       const { error: insertErr } = await supabase.from("task_queue").insert({
-        title: `Re-verify ${stalePending} unverified memories`,
+        title: `Re-verify ${stalePending} unverified standing-claim memories`,
         description:
-          `${stalePending} project/reference memories have gone 14+ days without anyone vouching for them (staleness keys off verification age, not access recency — migration 057). Recall already serves them at ${STALE_CONFIDENCE_FACTOR}x confidence with a +stale label, so this is a correctness backlog, not an outage.\n\nDo NOT assume these are hot. Migration 060 dropped the old \`access_count >= 10\` gate, so this set is essentially every project/reference row older than 14 days — median access_count is 0. access_count is now only a review-ORDERING term.\n\nWork it in pages off the review queue, not all at once:\n  SELECT * FROM stale_memories_review_queue WHERE review_rank BETWEEN 1 AND 25;\n(ordering: expired-TTL first, then hot-and-stale, then oldest-unverified)\n\nFor each: re-read it, check its claims against live state, correct or annotate what drifted, then stamp verified_at — either update_memory_verified(memory_id) or a direct UPDATE works, since migration 085 made queue membership derive from verified_at rather than from the nightly staleness_candidate flag. Only stamp what you actually checked — blanket-stamping destroys the signal this column exists to carry. Do not archive on age alone.\n\nNote: dated point-in-time log entries (daily research, triage, incident write-ups) are immutable historical records; they cannot drift and are not worth re-verifying individually.\n\nTop by importance:\n\n${summary}`,
+          `${stalePending} project/reference memories that make STANDING claims about live state have gone 14+ days without anyone vouching for them (staleness keys off verification age, not access recency — migration 057). Recall already serves them at ${STALE_CONFIDENCE_FACTOR}x confidence with a +stale label, so this is a correctness backlog, not an outage.\n\nMigration 087 re-scoped this queue: immutable point-in-time logs (daily research, triage/closeout, dreaming, tech-breakthrough, weekly audits) carry \`is_point_in_time = true\` and are excluded, because their truth cannot drift and stamping them would destroy the signal verified_at exists to carry. That is why this number is now small and actually workable — 389 -> 62 at cutover. Headline metrics: SELECT * FROM memory_review_headline;\n\nDo NOT assume these are hot. Migration 060 dropped the old \`access_count >= 10\` gate, so median access_count is 0. access_count is now only a review-ORDERING term.\n\nWork it in pages off the review queue:\n  SELECT * FROM stale_memories_review_queue WHERE review_rank BETWEEN 1 AND 25;\n(ordering: expired-TTL first, then hot-and-stale, then oldest-unverified)\n\nFor each: re-read it, check its claims against live state, correct or annotate what drifted, then stamp verified_at — either update_memory_verified(memory_id) or a direct UPDATE works, since migration 085 made queue membership derive from verified_at. Only stamp what you actually checked — blanket-stamping destroys the signal. Do not archive on age alone.\n\nThe residue is one-off dated work/incident records that were deliberately NOT auto-excluded, because several assert live config (e.g. ha_vm_ram_bump_*, cadvisor-cpu-cap-*) and a name-regex would have silently exempted them from review forever. Disposition each one once: if it is purely historical narrative, set \`is_point_in_time = true\` and it leaves permanently; if it asserts live state, verify and stamp it.\n\nTop by importance:\n\n${summary}`,
         priority: 2,
         status: "pending",
         source: "system",
@@ -1368,8 +1372,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       confidence: z.number().min(0).max(1).optional().describe("Confidence 0-1 (default 0.8). Use < 0.5 for speculative or unverified facts. Memories below min_confidence threshold are excluded from recall when filtered."),
       memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Memory class: semantic (durable facts/prefs, default), episodic (event log), procedural (how-to/skill), working (short-term context). Defaults to 'semantic' for all existing types."),
       ttl_days: z.number().min(1).optional().describe("Re-verification TTL in days. Set this on records that track LIVE infrastructure state (versions, IPs, deployed config) — they go stale in days, unlike incident write-ups which never do. After this many days the nightly sweep flags the memory +stale and recall discounts its confidence until an agent re-verifies it. Overrides the default 14-day rule. Omit for durable facts."),
+      is_point_in_time: z.boolean().optional().describe("True = immutable point-in-time record (dated digest, triage/closeout, incident write-up). Excluded from the stale-review queue, because its truth cannot drift and re-verifying it is meaningless. Recurring log-series names (daily research, dreaming, tech-breakthrough, weekly audits) are auto-detected server-side, so only set this for one-off dated records. NEVER set it on a memory asserting live lab state — that would silently exempt it from review forever; use ttl_days for those instead."),
     },
-    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence, memory_class, ttl_days }) => {
+    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence, memory_class, ttl_days, is_point_in_time }) => {
       // Security gate — scan all text fields before touching the DB
       const scanTargets: Array<[string, string]> = [
         ["name", name], ["description", description], ["content", content],
@@ -1453,6 +1458,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (agent_scope) update.agent_scope = agent_scope;
         if (memory_class) update.memory_class = memory_class;
         if (ttl_days !== undefined) update.expires_at = ttlToExpiresAt(ttl_days);
+        if (is_point_in_time !== undefined) update.is_point_in_time = is_point_in_time;
         // Reaching this path means the content materially changed (the NOOP guard
         // above rejects near-identical rewrites), so the writer has just vouched
         // for it — restart the verification clock instead of leaving the row +stale.
@@ -1571,6 +1577,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       insert.memory_class = memory_class || "semantic";
       const insertTtl = ttlToExpiresAt(ttl_days ?? CLASS_DEFAULT_TTL_DAYS[insert.memory_class as string]);
       if (insertTtl) insert.expires_at = insertTtl;
+      // Migration 087: only send an explicit value. Omitting it lets the
+      // memories_set_point_in_time_bi trigger auto-flag recurring log series.
+      if (is_point_in_time !== undefined) insert.is_point_in_time = is_point_in_time;
       // Collaborative Memory provenance: track contributing agent (REC3, arXiv 2505.18279)
       insert.provenance = insertOwner ? { contributing_agent: insertOwner } : {};
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
