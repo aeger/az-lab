@@ -26,6 +26,8 @@ USAGE
   python3 retrieval_regression.py run --tag ci --fail-under-recall5 0.60
 """
 import argparse
+import contextlib
+import fcntl
 import json
 import math
 import os
@@ -67,11 +69,68 @@ def die(msg):
     sys.exit(2)
 
 
-def embed(text: str) -> list:
-    r = httpx.post(f"{OLLAMA_URL}/api/embeddings",
-                   json={"model": EMBED_MODEL, "prompt": text}, timeout=30)
-    r.raise_for_status()
-    return r.json()["embedding"]
+def embed(text: str, attempts: int = 4) -> list:
+    """Embed with bounded retry.
+
+    Ollama refuses connections for a few seconds when it swaps a model or restarts.
+    Without a retry those queries raise, score() counts them as MISSES, and the run
+    records a score that measures Ollama's uptime rather than retrieval quality.
+    Hit for real on 2026-07-28: 18 of 56 queries took [Errno 111] Connection refused
+    mid-run and the run landed in eval_runs at recall@5 0.482 — an 0.089 "regression"
+    that was entirely an artefact. Retrying is not politeness, it is the difference
+    between a gate that means something and one that cries wolf."""
+    last = None
+    for i in range(attempts):
+        try:
+            r = httpx.post(f"{OLLAMA_URL}/api/embeddings",
+                           json={"model": EMBED_MODEL, "prompt": text}, timeout=30)
+            r.raise_for_status()
+            return r.json()["embedding"]
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(1.5 * (2 ** i))  # 1.5s, 3s, 6s
+    raise last
+
+
+@contextlib.contextmanager
+def eval_lock(what: str, wait_s: int = 1800):
+    """Serialise every harness invocation against every other one.
+
+    eval_access_snapshot_take() TRUNCATEs and re-INSERTs a SINGLE shared table
+    (migration 071). Two overlapping runs therefore share one snapshot: the second
+    take() captures access counts the first has already perturbed, and whichever
+    restores last writes those polluted values back as truth.
+
+    nightly_eval.sh already took a flock, but that only guards ITSELF — a manual
+    `retrieval_regression.py run`, a sweep, or a second agent invoking the harness
+    directly all bypassed it. On 2026-07-28 a sibling task-queue agent ran an eval
+    (tag pre-076-078) 58 seconds before this one, concurrently, through exactly that
+    hole. The lock belongs in the harness, where every path must pass through it.
+
+    Waits rather than exits: a queued run finishes late, a skipped run leaves a hole
+    in the trend line the gate medians over."""
+    path = "/tmp/memory-eval-harness.lock"
+    fh = open(path, "w")
+    t0 = time.time()
+    try:
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() - t0 > wait_s:
+                    die(f"{what}: another eval held {path} for >{wait_s}s — aborting "
+                        f"rather than corrupting its access snapshot")
+                if time.time() - t0 < 1.5:
+                    print(f"  … another eval is running; waiting for {path}")
+                time.sleep(3)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 
 def sb_get(path: str, params: dict) -> list:
@@ -131,6 +190,7 @@ def ndcg_at(returned: list, gold: set, cut: int) -> float:
 def score(rows: list, k: int, verbose: bool):
     results, hits1, hits5, hits10, rr_total = [], 0, 0, 0, 0.0
     ndcg5_total, ndcg10_total = 0.0, 0.0
+    failures = 0
 
     for q in rows:
         gold = set(q["gold_memory_ids"] or [])
@@ -140,6 +200,7 @@ def score(rows: list, k: int, verbose: bool):
         except Exception as e:  # a failed retrieval is a miss, not a crash
             print(f"  ! retrieval failed for {q['id']}: {e}", file=sys.stderr)
             returned = []
+            failures += 1
         latency = int((time.time() - t0) * 1000)
 
         rank = next((i + 1 for i, mid in enumerate(returned) if mid in gold), None)
@@ -169,7 +230,7 @@ def score(rows: list, k: int, verbose: bool):
         "mrr": rr_total / n,
         "ndcg_at_5": ndcg5_total / n,
         "ndcg_at_10": ndcg10_total / n,
-    }
+    }, failures
 
 
 def by_category(rows, results):
@@ -188,23 +249,39 @@ def cmd_run(args):
 
     rows = load_queries()
 
-    # hybrid_recall increments access_count/recall_count/last_accessed_at on every
-    # row it returns (see migration 071). Those columns feed the A-MAC scoring lane
-    # AND lifecycle tiering, so an unguarded eval run would promote whatever it
-    # retrieves and corrupt the never-accessed statistic. Snapshot first, restore
-    # in a finally block so a crash mid-run cannot leave the corpus perturbed.
-    snapped = sb_rpc("eval_access_snapshot_take", {})
-    print(f"access-stat snapshot taken ({snapped} rows) — eval will be non-mutating")
+    with eval_lock(f"run --tag {args.tag}"):
+        # hybrid_recall increments access_count/recall_count/last_accessed_at on every
+        # row it returns (see migration 071). Those columns feed the A-MAC scoring lane
+        # AND lifecycle tiering, so an unguarded eval run would promote whatever it
+        # retrieves and corrupt the never-accessed statistic. Snapshot first, restore
+        # in a finally block so a crash mid-run cannot leave the corpus perturbed.
+        snapped = sb_rpc("eval_access_snapshot_take", {})
+        print(f"access-stat snapshot taken ({snapped} rows) — eval will be non-mutating")
 
-    print(f"Running {len(rows)} eval queries (k={args.k}) against hybrid_recall …")
-    try:
-        results, m = score(rows, args.k, args.verbose)
-    finally:
-        repaired = sb_rpc("eval_access_snapshot_restore", {})
-        print(f"access stats restored ({repaired} rows perturbed by this run)")
+        print(f"Running {len(rows)} eval queries (k={args.k}) against hybrid_recall …")
+        try:
+            results, m, failures = score(rows, args.k, args.verbose)
+        finally:
+            repaired = sb_rpc("eval_access_snapshot_restore", {})
+            print(f"access stats restored ({repaired} rows perturbed by this run)")
+
+    # A run with failed retrievals scored those queries as misses. Recording it would
+    # put a number measuring infrastructure availability into eval_runs, where the
+    # nightly gate medians over it for the next 7 runs — so one Ollama blip poisons a
+    # week of gating and the alert it eventually fires is unattributable. Refuse.
+    fail_pct = failures / max(len(rows), 1)
+    if failures and fail_pct > args.max_fail_pct:
+        die(f"{failures}/{len(rows)} retrievals FAILED ({fail_pct:.0%} > "
+            f"{args.max_fail_pct:.0%} tolerance) — refusing to record a run whose score "
+            f"reflects an outage, not retrieval. Fix the embedder and re-run.")
+    if failures:
+        print(f"  ! {failures}/{len(rows)} retrievals failed (within "
+              f"{args.max_fail_pct:.0%} tolerance) — recording, but treat as noisy")
 
     run = sb_post("eval_runs", {
-        "tag": args.tag, "git_sha": args.git_sha, "notes": args.notes, **m,
+        "tag": args.tag, "git_sha": args.git_sha,
+        "notes": (args.notes or "") + (f" [{failures} retrieval failures]" if failures else ""),
+        **m,
     })[0]
     sb_post("eval_run_results", [{"run_id": run["id"], **r} for r in results])
 
@@ -322,6 +399,8 @@ def cmd_sweep(args):
     print(f"sweeping depths {depths} over {len(rows)} queries "
           f"(reranker: {RERANKER_URL})\n")
 
+    lock = eval_lock(f"sweep --depths {args.depths}")
+    lock.__enter__()
     snapped = sb_rpc("eval_access_snapshot_take", {})
     print(f"access-stat snapshot taken ({snapped} rows) — sweep will be non-mutating\n")
     table = []
@@ -378,6 +457,7 @@ def cmd_sweep(args):
     finally:
         repaired = sb_rpc("eval_access_snapshot_restore", {})
         print(f"\naccess stats restored ({repaired} rows perturbed by this sweep)")
+        lock.__exit__(None, None, None)
 
     base = next((r for r in table if r["depth"] == 0), None)
     print("\n=== sweep summary ===")
@@ -464,6 +544,10 @@ def main():
     r.add_argument("--fail-under-recall5", type=float, default=None, help="hard floor for CI")
     r.add_argument("--git-sha", default=os.environ.get("GIT_SHA"))
     r.add_argument("--notes")
+    r.add_argument("--max-fail-pct", type=float, default=0.05,
+                   help="refuse to record the run if more than this fraction of "
+                        "retrievals errored (default 0.05) — keeps outage noise out "
+                        "of the gate's trailing median")
     r.add_argument("-v", "--verbose", action="store_true")
     r.set_defaults(func=cmd_run)
 
