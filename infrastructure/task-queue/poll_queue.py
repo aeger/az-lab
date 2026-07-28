@@ -58,6 +58,126 @@ def _get_google_key():
         return None
 
 
+# ── Skill outcome loop (research 2026-07-25, T2) ─────────────────────────────────
+# The skills table had 27 rows and exactly ONE with a non-zero outcome counter,
+# because success/fail counts only ever got written when an agent remembered to call
+# record_task_completion. The MCP tool is correct; nobody invoked it. The poller sees
+# every task's terminal state anyway, so it records the outcome itself and the signal
+# stops depending on agent discipline.
+#
+# Matching is deliberately trigger-based (not embedding-based) so it stays offline,
+# deterministic, and auditable: the chosen skill is written back to context.skill_name
+# at claim time, so any bad match is visible on the task row rather than buried.
+_SKILL_MATCH_HAYSTACK_CHARS = 4000
+# A trigger's weight is the SQUARE of its word count, so specific multi-word triggers
+# dominate generic ones. This matters: skills carry triggers as broad as "dns", "vm",
+# "git" and "commit", which appear in half the queue's prose. Scoring them at 1 each
+# while "apply supabase migration" scores 9 keeps a passing mention from claiming a task.
+_SKILL_MATCH_MIN_SCORE = 4   # one 2-word trigger, or 4 generic single-word hits
+
+
+def _fetch_skill_triggers():
+    """[(name, [trigger, ...]), ...] for skills that have triggers. Best-effort."""
+    try:
+        rows = api_request("GET", "skills", params={"select": "name,triggers"})
+    except Exception as e:
+        print(f"skill trigger fetch failed (non-fatal): {e}", file=sys.stderr)
+        return []
+    return [(r["name"], r.get("triggers") or []) for r in (rows or []) if r.get("triggers")]
+
+
+def _match_skill(task: dict) -> str | None:
+    """Best-matching skill name for a task, or None if nothing scores high enough."""
+    haystack = f"{task.get('title') or ''}\n{task.get('description') or ''}".lower()
+    haystack = haystack[:_SKILL_MATCH_HAYSTACK_CHARS]
+    if not haystack.strip():
+        return None
+
+    best_name, best_score = None, 0
+    for name, triggers in _fetch_skill_triggers():
+        score = 0
+        for trig in triggers:
+            trig = (trig or "").strip().lower()
+            if not trig:
+                continue
+            # Word-boundary match so "vm" doesn't fire on "vmware" and "dns" doesn't
+            # fire on "dnsmasq-adjacent" prose.
+            if re.search(rf"(?<!\w){re.escape(trig)}(?!\w)", haystack):
+                score += len(trig.split()) ** 2
+        # Ties break toward the name that sorts first purely for determinism — a tie
+        # means neither skill is clearly the right one, and the match is advisory.
+        if score > best_score:
+            best_name, best_score = name, score
+
+    return best_name if best_score >= _SKILL_MATCH_MIN_SCORE else None
+
+
+def resolve_task_skill(task: dict) -> str | None:
+    """Skill for this task: an explicit context.skill_name wins over the matcher.
+
+    Whoever queued the task knows better than a keyword heuristic, so an explicit
+    value is never overwritten.
+    """
+    ctx = task.get("context") or {}
+    explicit = (ctx.get("skill_name") or "").strip() if isinstance(ctx, dict) else ""
+    return explicit or _match_skill(task)
+
+
+def stamp_task_skill(task: dict) -> None:
+    """Persist the matched skill onto context.skill_name at claim time.
+
+    Written at claim (not completion) so the attribution survives a crash mid-task,
+    and so a wrong match is inspectable on the row while the task is still running.
+    """
+    ctx = task.get("context") or {}
+    if not isinstance(ctx, dict) or ctx.get("skill_name"):
+        return
+    matched = _match_skill(task)
+    if not matched:
+        return
+    new_ctx = dict(ctx)
+    new_ctx["skill_name"] = matched
+    new_ctx["skill_matched_by"] = "poller-triggers"
+    try:
+        api_request("PATCH", f"task_queue?id=eq.{task['id']}", data={"context": new_ctx})
+        task["context"] = new_ctx
+        print(f"Matched skill '{matched}' for task {task['id']}")
+    except Exception as e:
+        print(f"stamp_task_skill failed (non-fatal): {e}", file=sys.stderr)
+
+
+def record_skill_outcome(task: dict, success: bool, note: str = "") -> None:
+    """Increment success/fail counters for the task's skill. Never raises.
+
+    Only called on TERMINAL states. pending_eval / pending_jeff_action are explicitly
+    excluded: the work isn't adjudicated yet, and counting it as a success there would
+    score the skill on "the agent produced output", not "the output was right".
+    """
+    skill_name = resolve_task_skill(task)
+    if not skill_name:
+        return
+    try:
+        applied = api_request(
+            "POST",
+            "rpc/record_skill_outcome",
+            data={
+                "p_skill_name": skill_name,
+                "p_success": bool(success),
+                "p_note": (note or "")[:500],
+            },
+        )
+        # The RPC returns false for an unknown skill. Say so instead of reporting a
+        # write that did not happen — a stale context.skill_name would otherwise look
+        # like it was recording outcomes for weeks.
+        if applied is False:
+            print(f"Skill '{skill_name}' not found — outcome not recorded", file=sys.stderr)
+        else:
+            print(f"Recorded {'success' if success else 'failure'} for skill '{skill_name}'")
+    except Exception as e:
+        # A telemetry write must never fail a task that already finished.
+        print(f"record_skill_outcome failed (non-fatal): {e}", file=sys.stderr)
+
+
 def route_task(task: dict) -> dict:
     """Return {"model": str|None, "runner": "claude"|"gemini"} routing decision.
 
@@ -735,11 +855,31 @@ def build_prompt(task):
             "Approach it fresh — do not try to resume or patch the previous failed attempt.\n\n"
         )
 
+    # Skill hint (research 2026-07-25, T2 part B). Only emitted when a skill actually
+    # matched, so this costs nothing on the ~87% of tasks with no relevant skill and
+    # never degrades into a generic "consider using skills" nag the model learns to skip.
+    #
+    # It deliberately asks for recall_skill but NOT for the outcome args of
+    # record_task_completion: the poller already records success/fail for this task
+    # (see record_skill_outcome). Asking here too would increment the counters twice
+    # per task and quietly corrupt the very signal T2 exists to produce.
+    skill_hint = ""
+    matched_skill = (raw_ctx.get("skill_name") or "").strip() if isinstance(raw_ctx, dict) else ""
+    if matched_skill:
+        skill_hint = (
+            f"\n\nA saved skill may apply here: `{matched_skill}`. "
+            f"Call recall_skill(name=\"{matched_skill}\") before starting and follow it if it fits; "
+            "if it is wrong or stale for this task, say so in your summary so it can be refined.\n"
+            "Do not pass skill_name/success to record_task_completion — the task poller records "
+            "this task's outcome automatically."
+        )
+
     return (
         f"{retry_preamble}"
         f"Task: {task['title']}\n\n"
         f"{description}"
-        f"{context_str}\n\n"
+        f"{context_str}"
+        f"{skill_hint}\n\n"
         "Complete this task. Be concise in your response — summarize what you did."
     )
 
@@ -1455,6 +1595,7 @@ def main():
     print(f"Claimed task {task_id}: {title}")
 
     mark_in_progress(task_id)
+    stamp_task_skill(task)  # attribute the task to a skill before work starts
     log_activity("status", f"Claimed: {title}", task_id=task_id)
     discord_notify(f"🟡 Claimed: {title} — starting now")
     episode_id = start_episode(task)
@@ -1511,10 +1652,12 @@ def main():
             discord_notify(f"✅ Done: {title} — {summary}")
             print(f"Task {task_id} completed.")
             end_episode(episode_id, "completed", summary=summary, outcome=summary)
+            record_skill_outcome(task, True, summary)
     except Exception as e:
         error_msg = str(e)
         print(f"Task {task_id} failed: {error_msg}", file=sys.stderr)
         mark_failed(task_id, error_msg, goal_id=task.get("goal_id"), original_task=task)
+        record_skill_outcome(task, False, error_msg)
         log_activity("error", error_msg[:200], task_id=task_id)
         discord_notify(f"❌ Failed: {title} — {error_msg[:120]}")
         end_episode(episode_id, "failed", outcome=error_msg)
