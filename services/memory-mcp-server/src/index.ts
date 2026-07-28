@@ -1004,8 +1004,10 @@ async function applyStartupMigrations(): Promise<void> {
 
   // Migration 027: staleness_candidate column + flag_stale_memories() + hybrid_recall returns staleness_candidate
   // Migration 057 replaced 027's predicate: staleness keys off VERIFICATION age, not access recency.
-  // Flags project/reference rows with access_count >= 10 unverified for 14+ days (expires_at, when set, wins).
-  // hybrid_recall now returns staleness_candidate so agents can trigger re-verification.
+  // Migration 060 then dropped 057's `access_count >= 10` gate, so the rule is now every
+  // project/reference row unverified for 14+ days (an explicit expires_at, when set, wins).
+  // Migration 085 moved that rule into memory_is_stale() and demoted staleness_candidate to a
+  // cache — read is_stale_now (or the review queue) for truth, not the column.
   try {
     const { data, error } = await supabase.rpc("apply_staleness_candidate_if_missing");
     if (error) {
@@ -1125,10 +1127,18 @@ function startStalenessJob(supabase: any): void {
         .maybeSingle();
       if (existingTask) return;
 
+      // Source this off the SAME derived predicate as stalePending above.
+      // Migration 085 demoted staleness_candidate to a nightly cache; between a
+      // verification pass and the next sweep it still reads true for rows that
+      // are no longer stale. Reading the cache here made the "Top by importance"
+      // list name already-verified memories while the count came off the derived
+      // view — the two halves of one task brief disagreeing. is_stale_now is the
+      // PostgREST computed column over memory_is_stale(), so it can't drift.
       const { data: top } = await supabase
         .from("memories")
         .select("name, importance_score, verified_at, created_at")
-        .eq("staleness_candidate", true)
+        .eq("is_stale_now", true)
+        .not("is_active", "is", false)
         .order("importance_score", { ascending: false })
         .limit(5);
       const summary = (top || [])
