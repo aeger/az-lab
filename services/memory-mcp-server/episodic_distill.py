@@ -761,14 +761,18 @@ def main():
 
 
 def run_staleness_sweep() -> tuple[int, int]:
-    """Re-flag staleness_candidate from verification age (migration 057).
+    """Materialize the staleness rule into staleness_candidate (migrations 057/060/085).
 
     Delegates the whole rule to flag_stale_memories() so this job and the 24h
     startStalenessJob in src/index.ts cannot drift apart. Returns
     (rows_changed, total_currently_flagged).
 
-    A flagged memory is served at a reduced confidence and labelled +stale on
-    recall; an agent clears it by re-reading and calling update_memory_verified.
+    Since migration 085 the rule itself lives in memory_is_stale(), and
+    stale_memories_review_queue derives membership from it directly rather than
+    reading the column this writes. So a lapse here degrades only recall's
+    confidence haircut and +stale label — never the review queue's correctness.
+    An agent clears a row by stamping verified_at (update_memory_verified() or a
+    direct UPDATE both work).
     """
     try:
         result = supa_post("rpc/flag_stale_memories", {})

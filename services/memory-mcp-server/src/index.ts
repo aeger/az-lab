@@ -1109,11 +1109,12 @@ function startStalenessJob(supabase: any): void {
       const newlyFlagged = data as number;
       if (newlyFlagged > 0) console.log(`[staleness] Newly flagged ${newlyFlagged} memories`);
 
-      // Queue a review task if there are any unresolved stale candidates and no pending task already
+      // Queue a review task if there are any unresolved stale candidates and no pending task already.
+      // Counted off the review queue itself (migration 085 made it derive staleness from
+      // verification age) so the number in the task matches the pages the agent will work.
       const { count: stalePending } = await supabase
-        .from("memories")
-        .select("id", { count: "exact", head: true })
-        .eq("staleness_candidate", true);
+        .from("stale_memories_review_queue")
+        .select("id", { count: "exact", head: true });
       if (!stalePending || stalePending <= 0) return;
 
       const { data: existingTask } = await supabase
@@ -1145,7 +1146,7 @@ function startStalenessJob(supabase: any): void {
       const { error: insertErr } = await supabase.from("task_queue").insert({
         title: `Re-verify ${stalePending} unverified memories`,
         description:
-          `${stalePending} project/reference memories have gone 14+ days without anyone vouching for them (staleness keys off verification age, not access recency — migration 057). Recall already serves them at ${STALE_CONFIDENCE_FACTOR}x confidence with a +stale label, so this is a correctness backlog, not an outage.\n\nDo NOT assume these are hot. Migration 060 dropped the old \`access_count >= 10\` gate, so this set is essentially every project/reference row older than 14 days — median access_count is 0. access_count is now only a review-ORDERING term.\n\nWork it in pages off the review queue, not all at once:\n  SELECT * FROM stale_memories_review_queue WHERE review_rank BETWEEN 1 AND 25;\n(ordering: expired-TTL first, then hot-and-stale, then oldest-unverified)\n\nFor each: re-read it, check its claims against live state, correct or annotate what drifted, then call update_memory_verified (which clears the flag). Only stamp what you actually checked — blanket-stamping destroys the signal this column exists to carry. Do not archive on age alone.\n\nNote: dated point-in-time log entries (daily research, triage, incident write-ups) are immutable historical records; they cannot drift and are not worth re-verifying individually.\n\nTop by importance:\n\n${summary}`,
+          `${stalePending} project/reference memories have gone 14+ days without anyone vouching for them (staleness keys off verification age, not access recency — migration 057). Recall already serves them at ${STALE_CONFIDENCE_FACTOR}x confidence with a +stale label, so this is a correctness backlog, not an outage.\n\nDo NOT assume these are hot. Migration 060 dropped the old \`access_count >= 10\` gate, so this set is essentially every project/reference row older than 14 days — median access_count is 0. access_count is now only a review-ORDERING term.\n\nWork it in pages off the review queue, not all at once:\n  SELECT * FROM stale_memories_review_queue WHERE review_rank BETWEEN 1 AND 25;\n(ordering: expired-TTL first, then hot-and-stale, then oldest-unverified)\n\nFor each: re-read it, check its claims against live state, correct or annotate what drifted, then stamp verified_at — either update_memory_verified(memory_id) or a direct UPDATE works, since migration 085 made queue membership derive from verified_at rather than from the nightly staleness_candidate flag. Only stamp what you actually checked — blanket-stamping destroys the signal this column exists to carry. Do not archive on age alone.\n\nNote: dated point-in-time log entries (daily research, triage, incident write-ups) are immutable historical records; they cannot drift and are not worth re-verifying individually.\n\nTop by importance:\n\n${summary}`,
         priority: 2,
         status: "pending",
         source: "system",
@@ -1709,15 +1710,20 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
             await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
 
             // Attach verified_at to each result so the display can show verification age.
+            // is_stale_now is the PostgREST computed column over memory_is_stale()
+            // (migration 085) — the SAME predicate stale_memories_review_queue uses.
+            // Reading the derived value rather than the cached staleness_candidate column
+            // keeps the haircut and the +stale label in step with the review queue instead
+            // of trailing it by up to 24h until the nightly sweep materializes the flag.
             const verifiedRows = await supabase
               .from("memories")
-              .select("id, verified_at, staleness_candidate")
+              .select("id, verified_at, is_stale_now")
               .in("id", filtered.map((m: any) => m.id));
             const verifiedMap: Record<string, string | null> = {};
             const staleMap: Record<string, boolean> = {};
             for (const row of (verifiedRows.data || []) as any[]) {
               verifiedMap[row.id] = row.verified_at;
-              staleMap[row.id] = row.staleness_candidate === true;
+              staleMap[row.id] = row.is_stale_now === true;
             }
             for (const m of filtered as any[]) {
               m.verified_at = verifiedMap[m.id] ?? null;
