@@ -101,8 +101,12 @@ Deployed on svc-podman-01: ntfy 2.26.3, `compose-stack@ntfy.service` enabled,
 LE cert issued (CN=ntfy.az-lab.dev, expires 2026-10-26), auth seeded
 (7 users, per-topic ACLs, 5 write-only service tokens).
 
-Verified via the local edge (`curl --resolve ntfy.az-lab.dev:443:192.168.1.181`):
-health 200, anonymous publish 403, authed publish 200, wrong-topic-with-token 403.
+Verified: health 200, anonymous publish 403, authed publish 200,
+wrong-topic-with-token 403 — and a publish over the real DNS name from the LAN.
+
+AdGuard per-host rewrite `ntfy.az-lab.dev → 192.168.1.181` **was added** (it was the
+only service host missing one). This is orthogonal to the A/B exposure choice — it just
+keeps LAN clients off the public edge, where hairpin NAT does not work.
 
 **OPEN — inbound reachability unverified.** The whole point of Option A is off-LAN
 Android push, and that is NOT yet confirmed working:
