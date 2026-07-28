@@ -153,6 +153,26 @@ def upsert_memory_by_name(payload: dict) -> str | None:
         return result[0].get("id")
     return None
 
+DATE_FRAG_RE = re.compile(r"\s*[-—:]?\s*\d{4}-\d{2}-\d{2}\s*")
+
+
+def cluster_ref_name(cluster_mems: list, prefix: str = "weekly-ref") -> str:
+    """Stable, honest name for a consolidated cluster, under the given prefix.
+
+    The name has to be a function of cluster *membership*, not of a mutable
+    counter. Naming the reference after the highest-`access_count` member made
+    the key wobble between runs: as read counts shifted, one cluster could
+    re-emit under a new name (starting a fresh duplicate family) while an
+    unrelated cluster silently overwrote an old name in place. Dated log titles
+    are stripped too — the summariser is told to omit ephemeral dates, so
+    inheriting one labels the reference with a date it does not describe.
+    """
+    names = sorted(m["name"] for m in cluster_mems)
+    undated = [n for n in names if not DATE_FRAG_RE.search(n)]
+    label = DATE_FRAG_RE.sub(" ", (undated or names)[0])
+    label = re.sub(r"\s{2,}", " ", label).strip(" -—:/|,")
+    return f"{prefix}:{label or (undated or names)[0]}"
+
 # ── Clustering ────────────────────────────────────────────────────────────────
 def cosine_sim(a: list, b: list) -> float:
     va, vb = np.array(a), np.array(b)
@@ -487,8 +507,7 @@ def run_project_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int,
         if not content:
             content = summarize_cluster_heuristic(cluster_mems)
 
-        top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
-        ref_name = f"ref:{top_mem['name']}"
+        ref_name = cluster_ref_name(cluster_mems, "ref")
         description = f"Consolidated from {len(cluster_mems)} project memories"
         tags = ["auto-consolidated", "project-distilled"] + [
             t for m in cluster_mems for t in (m.get("tags") or [])
@@ -612,8 +631,7 @@ def main():
                     content = summarize_cluster_haiku(batch)
                 if not content:
                     content = summarize_cluster_heuristic(batch)
-                top_mem = max(batch, key=lambda m: m.get("access_count", 0))
-                sem_name = f"semantic:{top_mem['name']}"
+                sem_name = cluster_ref_name(batch, "semantic")
                 sem_id = write_semantic_memory(sem_name,
                     f"Distilled from {len(batch)} episodic memories ({llm_status})",
                     content, ["distilled", "episodic-origin"])
@@ -639,8 +657,7 @@ def main():
                     content = summarize_cluster_haiku(cluster_mems)
                 if not content:
                     content = summarize_cluster_heuristic(cluster_mems)
-                top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
-                sem_name = f"semantic:{top_mem['name']}"
+                sem_name = cluster_ref_name(cluster_mems, "semantic")
                 sem_id = write_semantic_memory(sem_name,
                     f"Distilled from {len(cluster_mems)} episodic memories ({llm_status})",
                     content, ["distilled", "episodic-origin"])
@@ -694,8 +711,7 @@ def main():
             content = summarize_cluster_heuristic(cluster_mems)
 
         # Generate semantic memory name from top memory
-        top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
-        semantic_name = f"semantic:{top_mem['name']}"
+        semantic_name = cluster_ref_name(cluster_mems, "semantic")
         description = f"Distilled from {len(cluster_mems)} episodic memories ({llm_status})"
         tags = ["distilled", "auto-consolidated"] + [
             t for m in cluster_mems for t in (m.get("tags") or [])
@@ -826,27 +842,6 @@ def write_consolidation_memory(name: str, description: str, content: str, tags: 
     except Exception as e:
         log.error(f"[Phase 3] Supabase write failed: {e}")
     return None
-
-
-DATE_FRAG_RE = re.compile(r"\s*[-—:]?\s*\d{4}-\d{2}-\d{2}\s*")
-
-
-def cluster_ref_name(cluster_mems: list) -> str:
-    """Stable, honest weekly-ref name for a consolidated cluster.
-
-    The name has to be a function of cluster *membership*, not of a mutable
-    counter. Naming the reference after the highest-`access_count` member made
-    the key wobble between runs: as read counts shifted, one cluster could
-    re-emit under a new name (starting a fresh duplicate family) while an
-    unrelated cluster silently overwrote an old name in place. Dated log titles
-    are stripped too — the summariser is told to omit ephemeral dates, so
-    inheriting one labels the reference with a date it does not describe.
-    """
-    names = sorted(m["name"] for m in cluster_mems)
-    undated = [n for n in names if not DATE_FRAG_RE.search(n)]
-    label = DATE_FRAG_RE.sub(" ", (undated or names)[0])
-    label = re.sub(r"\s{2,}", " ", label).strip(" -—:/|,")
-    return f"weekly-ref:{label or (undated or names)[0]}"
 
 
 def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, int]:
