@@ -1,0 +1,16 @@
+[Unit]
+Description=Nightly memory retrieval eval timer
+Requires=memory-eval-nightly.service
+
+[Timer]
+# 05:00 UTC — deliberately AFTER the nightly memory jobs that mutate the corpus:
+# dreaming 02:15, episodic-distill 03:00 (incl. the staleness sweep), contradiction
+# scan 03:30, weekly consolidation Sun 04:00. Evaluating before those land would
+# measure yesterday's corpus and make the trend line jitter for reasons unrelated
+# to the recall path.
+OnCalendar=*-*-* 05:00:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

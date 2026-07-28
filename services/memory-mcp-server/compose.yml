@@ -32,7 +32,7 @@ services:
       - LLM_URL=${LLM_URL:-}
       - LLM_MODEL=${LLM_MODEL:-llama3.2:3b}
       # TEI cross-encoder reranking (primary — local, fast, ~80ms)
-      # bge-reranker-v2-m3 served by tei-reranker container below
+      # bge-reranker-base served by tei-reranker container below
       - RERANKER_URL=http://tei-reranker:8080
       # Nemotron reranking (fallback when TEI unavailable — skipped if NVIDIA_API_KEY unset)
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}

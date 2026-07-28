@@ -392,7 +392,7 @@ function contentHashOf(embedText: string): string {
 }
 
 // ── TEI Cross-Encoder Reranking (primary) ─────────────────────────────────────
-// Calls bge-reranker-v2-m3 via HuggingFace TEI /rerank endpoint.
+// Calls the TEI cross-encoder (BAAI/bge-reranker-base, see compose.yml) via /rerank.
 // Returns reranked array on success, null on failure (triggers Nemotron fallback).
 // ~80ms latency, CPU-only, local — no external API required.
 async function rerankWithTEI(query: string, memories: any[]): Promise<any[] | null> {
@@ -411,7 +411,7 @@ async function rerankWithTEI(query: string, memories: any[]): Promise<any[] | nu
     const results = (await res.json()) as Array<{ index: number; score: number }>;
     const sorted = results.sort((a, b) => b.score - a.score);
     const reranked = sorted.map((r) => memories[r.index]);
-    console.log(`[rerank] TEI bge-reranker-v2-m3 reranked ${memories.length} memories`);
+    console.log(`[rerank] TEI cross-encoder reranked ${memories.length} memories`);
     return reranked;
   } catch (err: any) {
     console.warn("[rerank] TEI unavailable:", err.message, "— falling back to Nemotron");

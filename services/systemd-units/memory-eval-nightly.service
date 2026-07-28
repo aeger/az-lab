@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly memory retrieval eval + regression gate
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/almty1/azlab/services/memory-mcp-server/eval
+EnvironmentFile=/home/almty1/azlab/services/memory-mcp-server/.env
+ExecStart=/home/almty1/azlab/services/memory-mcp-server/eval/nightly_eval.sh
+StandardOutput=append:/home/almty1/azlab/services/memory-mcp-server/eval_nightly.log
+StandardError=append:/home/almty1/azlab/services/memory-mcp-server/eval_nightly.log
