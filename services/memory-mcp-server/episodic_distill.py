@@ -44,6 +44,7 @@ Systemd timer: episodic-distill.timer (nightly at 03:00 UTC)
 """
 
 import os
+import re
 import sys
 import json
 import logging
@@ -827,6 +828,27 @@ def write_consolidation_memory(name: str, description: str, content: str, tags: 
     return None
 
 
+DATE_FRAG_RE = re.compile(r"\s*[-—:]?\s*\d{4}-\d{2}-\d{2}\s*")
+
+
+def cluster_ref_name(cluster_mems: list) -> str:
+    """Stable, honest weekly-ref name for a consolidated cluster.
+
+    The name has to be a function of cluster *membership*, not of a mutable
+    counter. Naming the reference after the highest-`access_count` member made
+    the key wobble between runs: as read counts shifted, one cluster could
+    re-emit under a new name (starting a fresh duplicate family) while an
+    unrelated cluster silently overwrote an old name in place. Dated log titles
+    are stripped too — the summariser is told to omit ephemeral dates, so
+    inheriting one labels the reference with a date it does not describe.
+    """
+    names = sorted(m["name"] for m in cluster_mems)
+    undated = [n for n in names if not DATE_FRAG_RE.search(n)]
+    label = DATE_FRAG_RE.sub(" ", (undated or names)[0])
+    label = re.sub(r"\s{2,}", " ", label).strip(" -—:/|,")
+    return f"weekly-ref:{label or (undated or names)[0]}"
+
+
 def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, int]:
     """Phase 3: weekly sweep of 30-day project memories → reference with source=consolidation."""
     memories = fetch_project_30day_memories()
@@ -847,6 +869,7 @@ def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, 
 
     created = 0
     processed = 0
+    window_end = datetime.now(timezone.utc).date().isoformat()
 
     for cluster_idxs in clusters[:MAX_CLUSTERS]:
         cluster_mems = [memories[i] for i in cluster_idxs]
@@ -859,9 +882,11 @@ def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, 
         if not content:
             content = summarize_cluster_heuristic(cluster_mems)
 
-        top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
-        ref_name = f"weekly-ref:{top_mem['name']}"
-        description = f"Weekly consolidation of {len(cluster_mems)} project memories (30-day window)"
+        ref_name = cluster_ref_name(cluster_mems)
+        description = (
+            f"Weekly consolidation of {len(cluster_mems)} project memories "
+            f"({WEEKLY_LOOKBACK_DAYS}-day window ending {window_end})"
+        )
         tags = ["auto-consolidated", "weekly-consolidated"] + [
             t for m in cluster_mems for t in (m.get("tags") or [])
             if t not in (CONSOLIDATED_TAG, "auto-consolidated", "weekly-consolidated")
