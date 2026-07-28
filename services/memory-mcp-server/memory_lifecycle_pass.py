@@ -53,6 +53,60 @@ def rpc(fn: str, body: dict = None):
     return r.json()
 
 
+def sb_get(path: str, params: dict):
+    r = httpx.get(f"{SUPABASE_URL}/rest/v1/{path}", headers=SB_HEADERS,
+                  params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def retrieval_gate(max_age_h: float = 48.0, drop_pct: float = 10.0):
+    """Is retrieval healthy enough to retire memories tonight?
+
+    Migration 068 declared the regression harness a hard prerequisite for the 065
+    lifecycle work, but nothing ever enforced it: 211 rows were cold-tiered and
+    migrations 073-075 shipped with no recorded run. This is that enforcement.
+
+    Returns (ok, reason). Retirement is the one step here that is expensive to undo
+    in bulk, so it is what gets gated — tier re-assignment is cheap and reversible
+    and still runs. Fails CLOSED: no runs, a stale run, or an unreadable eval_runs
+    table all block retirement, because "we cannot tell if recall regressed" is not
+    a state in which to start dropping memories.
+    """
+    try:
+        runs = sb_get("eval_runs", {
+            "select": "tag,ndcg_at_10,created_at",
+            "order": "created_at.desc", "limit": "8",
+        })
+    except Exception as e:
+        return False, f"eval_runs unreadable ({e})"
+
+    scored = [r for r in runs if r.get("ndcg_at_10") is not None]
+    if not scored:
+        return False, "no eval run has a recorded nDCG@10"
+
+    newest = scored[0]
+    from datetime import datetime, timezone
+    ts = datetime.fromisoformat(newest["created_at"].replace("Z", "+00:00"))
+    age_h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
+    if age_h > max_age_h:
+        return False, (f"newest eval run '{newest['tag']}' is {age_h:.1f}h old "
+                       f"(limit {max_age_h:.0f}h) — retrieval health unknown")
+
+    prior = [r["ndcg_at_10"] for r in scored[1:]]
+    if not prior:
+        return True, f"nDCG@10 {newest['ndcg_at_10']:.3f} ({age_h:.1f}h old), no baseline yet"
+
+    prior.sort()
+    mid = len(prior) // 2
+    median = prior[mid] if len(prior) % 2 else (prior[mid - 1] + prior[mid]) / 2.0
+    if median > 0 and newest["ndcg_at_10"] < median * (1.0 - drop_pct / 100.0):
+        return False, (f"nDCG@10 {newest['ndcg_at_10']:.3f} is >{drop_pct:.0f}% below "
+                       f"trailing median {median:.3f} — retrieval regressed")
+    return True, (f"nDCG@10 {newest['ndcg_at_10']:.3f} vs trailing median "
+                  f"{median:.3f} ({age_h:.1f}h old)")
+
+
 def send_discord(msg: str):
     try:
         httpx.post(f"{AGENT_BUS_URL}/message", json={"text": msg},
@@ -80,7 +134,14 @@ def main():
     dist = {t["tier"]: t["n"] for t in tiers}
     print(f"tiers: {dist}")
 
-    batch = rpc("retire_cold_memories", {"p_limit": args.limit, "p_dry_run": not args.live})
+    gate_ok, gate_reason = retrieval_gate()
+    print(f"retrieval gate: {'PASS' if gate_ok else 'BLOCK'} — {gate_reason}")
+
+    # A blocked gate downgrades this run to a dry run; it never aborts the pass,
+    # because tier re-assignment above is exactly what we still want when recall
+    # is shaky. Only the irreversible half is withheld.
+    live = args.live and gate_ok
+    batch = rpc("retire_cold_memories", {"p_limit": args.limit, "p_dry_run": not live})
     action = batch[0]["action"] if batch else "(none)"
     print(f"retirement batch ({len(batch)}): {action}")
     for b in batch:
@@ -89,7 +150,10 @@ def main():
     if args.notify:
         lines = [f"**Memory lifecycle pass** — tiers hot {dist.get('hot',0)} / "
                  f"warm {dist.get('warm',0)} / cold {dist.get('cold',0)}",
+                 f"retrieval gate: {'PASS' if gate_ok else '**BLOCK**'} — {gate_reason}",
                  f"{len(batch)} in retirement batch — {action}"]
+        if args.live and not gate_ok:
+            lines.insert(1, "⚠️ --live was requested but retirement was held as a dry run.")
         if batch:
             lines += [f"• {b['name']}" for b in batch[:10]]
             if len(batch) > 10:

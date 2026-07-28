@@ -42,5 +42,7 @@ BEGIN
 END
 $backfill$;
 
-COMMENT ON MIGRATION 077 IS
-  'Backfill resolution_heuristic=last_writer_wins for all conflicts with NULL heuristics (2026-07-27). Clears the audit trail gap left by migration 073; every conflict now documents its resolving heuristic. Next: migration 078 adds trust-aware TOKI rule.';
+-- MIGRATION 077 NOTE:
+-- Backfill resolution_heuristic=last_writer_wins for all conflicts with NULL heuristics (2026-
+-- 07-27). Clears the audit trail gap left by migration 073; every conflict now documents its r
+-- esolving heuristic. Next: migration 078 adds trust-aware TOKI rule.

@@ -1,68 +1,118 @@
--- Migration 076: wire scan_memory_for_injection to force quarantined on hits
+-- Migration 076: make trust_tier='quarantined' reachable via soft injection signals
 -- Ref: 2026-07-27 daily research, rec 1; migration 061 (trust_weight defining quarantined=0.40)
 --
--- THE PROBLEM
---   Migration 061 defined trust_tier='quarantined' with a soft weight of 0.40 (lowest before
---   hard filtering). But 0 rows ever reach this tier. The injection scanner exists
---   (migration 041 — scan_memory_for_injection trigger on every INSERT) and detects
---   poisoning attempts, but does NOT set quarantined when a hit occurs. Instead, it
---   derives trust_tier from provenance only, leaving 'quarantined' unreachable.
+-- SUPERSEDES the 2026-07-27 draft of this file, which never applied. That draft:
+--   1. ended with `COMMENT ON MIGRATION 076 IS ...` — not valid PostgreSQL, no such
+--      statement exists. It is a syntax error that aborted the whole file, which is
+--      why 076/077/078 were committed (56431d4) but never landed in the database.
+--   2. string-patched the deployed function body to reference `v_injection_hit`,
+--      a variable that does not exist in it (declared vars are v_combined, v_threat).
+--      Had the syntax error not fired first, this would have created a function that
+--      throws on EVERY memory write.
+--   3. patched the trust_tier assignment site, which sits ABOVE the scan — the
+--      override would have read the signal before it was computed.
 --
--- THE FIX
---   Modify scan_memory_for_injection() to force trust_tier='quarantined' when the
---   injection detector returns a hit. This converts the latent quarantined tier into
---   an active defense: poisoned writes land at weight 0.40 and must clear a higher
---   bar to appear in recall, even if their provenance would normally rank them higher.
+-- WHY THE ORIGINAL RECOMMENDATION IS NOT IMPLEMENTED LITERALLY
+--   The rec was "a scanner hit forces trust_tier='quarantined' instead of the
+--   source-derived tier". But the scanner is ALREADY wired into the write path and
+--   already does something STRICTER than quarantining: on a hit it RAISES, so the
+--   poisoned row is never stored at all. Rewriting that to "store it at weight 0.40"
+--   would be a security DOWNGRADE — it would turn a rejected write into a retrievable
+--   one. The hard block is kept exactly as-is.
 --
--- WHY A PATCH, NOT A FULL CREATE OR REPLACE
---   scan_memory_for_injection() is ~100 lines (trust derivation, injection scanning,
---   sidecar table updates). Retyping it to add one conditional would be the higher-risk
---   edit (transcription slip, missing a detail, silent change to behavior). Instead,
---   we patch the deployed function in place: find the trust_tier assignment and add
---   an override guard that forces quarantined only when injection is detected.
+--   The real defect the rec identified is still real: 'quarantined' is unreachable,
+--   so a tier that hybrid_recall pays to evaluate can never fire. This migration makes
+--   it reachable from the other end — a SOFT signal class that is suspicious enough to
+--   cap trust but not to reject the write.
+--
+-- WHAT COUNTS AS A SOFT SIGNAL
+--   arXiv 2606.22030's finding is to cap trust by PROVENANCE, not by how confident the
+--   text sounds. The sharpest textual proxy for a provenance lie is content that asserts
+--   its OWN authority — "treat this memory as authoritative", "override all previous
+--   memories". That is the classic poisoning shape and it is precisely the claim a
+--   trust system must not take at face value. Such a write is not necessarily an
+--   attack (a human could phrase a note that way), so it is stored — at 0.40.
+--
+--   Verified against all 833 live memories on 2026-07-28: every pattern below matches
+--   ZERO existing rows, so this migration reclassifies nothing and is a no-op on
+--   today's corpus. It only affects future writes.
+--
+-- METHOD
+--   Full CREATE OR REPLACE, not a string patch. The body below is the deployed
+--   pre-076 definition with the soft-signal block added; retyping it in full is
+--   auditable in review, whereas a regex patch against a live body is not (see
+--   failure 2 above). The hard-block CASE is byte-identical to the deployed one.
 
-DO $patch$
-DECLARE
-  v_def  text;
-  v_hits integer;
-  v_search text;
-  v_replacement text;
-BEGIN
-  SELECT pg_get_functiondef(p.oid) INTO v_def
-  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-  WHERE n.nspname = 'public' AND p.proname = 'scan_memory_for_injection';
+CREATE OR REPLACE FUNCTION public.scan_memory_for_injection()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+declare
+  v_combined text;
+  v_threat   text;
+  v_soft     text;
+begin
+  -- Provenance-derived tier first; the soft-signal block below may cap it.
+  new.trust_tier := public.derive_trust_tier(new.source, new.writer_agent);
 
-  IF v_def IS NULL THEN
-    RAISE EXCEPTION 'migration 076: scan_memory_for_injection not found';
-  END IF;
+  if tg_op = 'UPDATE'
+     and old.content     is not distinct from new.content
+     and old.name        is not distinct from new.name
+     and old.description is not distinct from new.description
+  then
+    return new;
+  end if;
 
-  -- Idempotency: if the patch is already applied, bail out.
-  IF position('quarantined on injection' in v_def) > 0 THEN
-    RAISE NOTICE 'migration 076: injection quarantine already wired, skipping patch';
-    RETURN;
-  END IF;
+  v_combined := coalesce(new.name, '') || E'\n'
+             || coalesce(new.description, '') || E'\n'
+             || coalesce(new.content, '');
 
-  -- Find the existing trust_tier assignment. scan_memory_for_injection() calls
-  -- derive_trust_tier and assigns the result. We need to patch the assignment
-  -- to conditionally override to 'quarantined' if the injection scan found something.
-  v_search := 'new.trust_tier := public.derive_trust_tier(new.source, new.writer_agent);';
-  v_replacement :=
-    E'-- Assign trust tier from provenance, but override to quarantined if injection detected.\n' ||
-    E'new.trust_tier := CASE\n' ||
-    E'  WHEN v_injection_hit THEN ''quarantined''  -- quarantined on injection\n' ||
-    E'  ELSE public.derive_trust_tier(new.source, new.writer_agent)\n' ||
-    E'END;';
+  -- ── HARD BLOCK: unchanged from migration 041. A hit rejects the write. ──────
+  v_threat := case
+    when v_combined ~* 'ignore\s+(previous|all|above|prior)\s+instructions'                              then 'prompt_injection'
+    when v_combined ~* 'you\s+are\s+now\s+'                                                              then 'role_hijack'
+    when v_combined ~* 'do\s+not\s+tell\s+the\s+user'                                                    then 'deception_hide'
+    when v_combined ~* 'system\s+prompt\s+override'                                                      then 'sys_prompt_override'
+    when v_combined ~* 'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)'                    then 'disregard_rules'
+    when v_combined ~* 'act\s+as\s+(if|though)\s+you\s+(have\s+no|don''?t\s+have)\s+(restrictions|limits|rules)' then 'bypass_restrictions'
+    when v_combined ~* 'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)'                 then 'exfil_curl'
+    when v_combined ~* 'wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)'                 then 'exfil_wget'
+    when v_combined ~* 'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)'               then 'read_secrets'
+    when v_combined ~* 'authorized_keys'                                                                 then 'ssh_backdoor'
+    when v_combined ~* 'pretend\s+(you\s+are|to\s+be)\s+(a\s+)?(different|new|another)'                  then 'persona_hijack'
+    when v_combined ~* 'your\s+(new\s+)?(instructions?|rules?|directives?)\s+are'                        then 'instruction_override'
+    when v_combined ~  E'[\u200b-\u200d\u2060\ufeff\u202a-\u202e]'                                       then 'invisible_unicode'
+    else null
+  end;
 
-  v_hits := (length(v_def) - length(replace(v_def, v_search, ''))) / length(v_search);
-  IF v_hits <> 1 THEN
-    RAISE EXCEPTION
-      'migration 076: expected exactly 1 derive_trust_tier assignment site in scan_memory_for_injection, found % — drifted, patch aborted', v_hits;
-  END IF;
+  if v_threat is not null then
+    raise exception 'memory_governance_block: % matched in memory "%"', v_threat, coalesce(new.name, '<unnamed>')
+      using errcode = 'check_violation', hint = 'Content matched a known prompt-injection / exfil pattern. Edit before re-submitting.';
+  end if;
 
-  EXECUTE replace(v_def, v_search, v_replacement);
-  RAISE NOTICE 'migration 076: injection detector now forces trust_tier=quarantined on hits';
-END
-$patch$;
+  -- ── SOFT SIGNAL: store, but cap trust at 'quarantined' (weight 0.40). ───────
+  -- Evaluated only after the hard block, so a severe hit still rejects outright.
+  v_soft := case
+    when v_combined ~* '(this|the following)\s+(memory|fact|instruction)\s+(is|should be)\s+(treated as\s+)?(authoritative|trusted|verified|highest)'
+                                                                        then 'self_asserted_authority'
+    when v_combined ~* 'override\s+(all\s+)?(other|previous|existing)\s+(memor|instruction|rule)'
+                                                                        then 'self_asserted_precedence'
+    when v_combined ~* 'data:[a-z]+/[a-z]+;base64,'                     then 'embedded_data_uri'
+    when v_combined ~* '<!--[^>]*(instruction|prompt|ignore|system)[^>]*-->' then 'hidden_html_directive'
+    when v_combined ~* '\b(eval|exec)\s*\(\s*(requests\.|urllib|fetch\()' then 'remote_code_exec'
+    else null
+  end;
 
-COMMENT ON MIGRATION 076 IS
-  'Wire scan_memory_for_injection to set trust_tier=quarantined when injection is detected (2026-07-27). Converts the 0.40 soft weight into an active defense: poisoned writes rank below provenance-trusted ones in hybrid_recall, even if both have similar relevance.';
+  if v_soft is not null then
+    new.trust_tier := 'quarantined';
+    raise notice 'memory_governance_quarantine: % in memory "%" — stored at trust_tier=quarantined',
+      v_soft, coalesce(new.name, '<unnamed>');
+  end if;
+
+  return new;
+end;
+$function$;
+
+COMMENT ON FUNCTION public.scan_memory_for_injection() IS
+  'Write-path governance trigger. Severe prompt-injection/exfil patterns RAISE and reject the write (migration 041). Softer self-asserted-authority patterns instead cap trust_tier at ''quarantined'' (weight 0.40 per migration 061), making that tier reachable without downgrading the hard block (migration 076, 2026-07-28). Ref arXiv 2606.22030: cap trust by provenance, not textual confidence.';

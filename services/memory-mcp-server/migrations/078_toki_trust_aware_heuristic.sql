@@ -84,5 +84,9 @@ COMMENT ON FUNCTION public.trust_tier_to_heuristic(text, text) IS
 
 GRANT EXECUTE ON FUNCTION public.trust_tier_to_heuristic(text, text) TO anon, authenticated, service_role;
 
-COMMENT ON MIGRATION 078 IS
-  'Add trust-aware TOKI rule for conflict resolution (2026-07-27, arXiv 2606.22030). When a low/medium-trust write contradicts a high-trust memory, set resolution_heuristic=await_confirmation instead of auto-resolving. Depends on: migration 061 (trust_weight), 064 (derive_trust_tier), 073 (TOKI vocabulary). Usage: call trust_tier_to_heuristic(tier_a, tier_b) at conflict-detection INSERT time.';
+-- MIGRATION 078 NOTE:
+-- Add trust-aware TOKI rule for conflict resolution (2026-07-27, arXiv 2606.22030). When a low
+-- /medium-trust write contradicts a high-trust memory, set resolution_heuristic=await_confirma
+-- tion instead of auto-resolving. Depends on: migration 061 (trust_weight), 064 (derive_trust_
+-- tier), 073 (TOKI vocabulary). Usage: call trust_tier_to_heuristic(tier_a, tier_b) at conflic
+-- t-detection INSERT time.
