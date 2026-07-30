@@ -158,6 +158,38 @@ def sb_rpc(fn: str, body: dict) -> list:
 
 FORGETTING_CATEGORY = "forgetting"
 
+# Bump whenever the active probe set changes (migration 091). cmd_gate only
+# medians over runs sharing this value — nDCG is a mean over the probe
+# population, so comparing across probe-set changes measures the change, not a
+# regression. Migration 091 added the 13-probe hard tier: 56 -> 69 positives.
+SCORESET_VERSION = 2
+
+
+def annotate_reachability(rows: list) -> list:
+    """Mark which forbidden ids hybrid_recall could actually return.
+
+    WHY (2026-07-30 REC 1): every hybrid_recall lane filters `is_active IS NOT
+    FALSE`. A forbidden id whose row is inactive is therefore unreachable BY
+    CONSTRUCTION — its probe can never contribute a carry-forward hit, and
+    folding it into the FCFR denominator drags the rate toward zero regardless
+    of how the ranker behaves. That is exactly how FCFR read 0.0000 on six
+    consecutive runs while nobody noticed: 8 of the 9 forgetting probes seeded
+    by migration 084 pointed only at superseded (inactive) rows.
+
+    Proven, not assumed — see eval/falsify_fcfr.py, which forces a violation
+    through the same score() path and confirms the metric itself is wired."""
+    all_ids = sorted({i for r in rows for i in (r.get("forbidden_memory_ids") or [])})
+    live = set()
+    for i in range(0, len(all_ids), 100):  # keep the URL under PostgREST's limit
+        chunk = all_ids[i:i + 100]
+        live.update(m["id"] for m in sb_get("memories", {
+            "select": "id", "id": f"in.({','.join(chunk)})", "is_active": "not.is.false",
+        }))
+    for r in rows:
+        fids = r.get("forbidden_memory_ids") or []
+        r["_reachable_forbidden"] = [i for i in fids if i in live]
+    return rows
+
 
 def load_queries() -> list:
     rows = sb_get("eval_queries", {
@@ -167,7 +199,30 @@ def load_queries() -> list:
     })
     if not rows:
         die("eval_queries is empty — seed it before running (migration 068).")
-    return rows
+    return annotate_reachability(rows)
+
+
+def control_ranking(k: int) -> list:
+    """The MemDelta control arm (arXiv 2606.29914, via 2026-07-30 REC 2).
+
+    A ranking that never sees the query: the corpus prior alone — importance,
+    then recency. This is what an agent gets with retrieval switched off and
+    only "here are the most important recent memories" in context.
+
+    It matters because absolute scores on a self-authored probe set are not
+    evidence of anything. Independent evaluation put a plain model with the
+    conversation in context at 57.6 on LongMemEval, ahead of most dedicated
+    memory systems, while Mem0's OSS edition scored 32.4 against a claimed
+    93.4. Recall@5 = 1.0000 tells us nothing on its own; nDCG minus THIS tells
+    us whether the six lanes and the reranker earn their latency.
+
+    Query-independent means one fetch serves every probe."""
+    rows = sb_get("memories", {
+        "select": "id", "is_active": "not.is.false",
+        "order": "importance_score.desc.nullslast,last_accessed_at.desc.nullslast,created_at.desc",
+        "limit": str(max(k, 10)),
+    })
+    return [r["id"] for r in rows]
 
 
 def retrieve(question: str, topic_hint: str, k: int) -> list:
@@ -194,7 +249,7 @@ def ndcg_at(returned: list, gold: set, cut: int) -> float:
     return (dcg / idcg) if idcg else 0.0
 
 
-def score(rows: list, k: int, verbose: bool):
+def score(rows: list, k: int, verbose: bool, control: list = None):
     """Score every probe, but aggregate the POSITIVE metrics over the non-forgetting
     population only.
 
@@ -217,6 +272,13 @@ def score(rows: list, k: int, verbose: bool):
     n_forgetting = 0
     carry_forward_hits = 0
     violations = []
+    # Scorable subset: probes with at least one REACHABLE forbidden id. See
+    # annotate_reachability — the blended rate over a mostly-unreachable
+    # denominator is what hid the metric for six runs.
+    n_forgetting_scorable = 0
+    carry_forward_hits_scorable = 0
+    # Control arm (query-independent corpus prior), scored over the SAME probes.
+    ctrl_hits5, ctrl_ndcg10_total = 0, 0.0
 
     for q in rows:
         gold = set(q["gold_memory_ids"] or [])
@@ -243,14 +305,23 @@ def score(rows: list, k: int, verbose: bool):
                 hits10 += rank <= 10
             ndcg5_total += nd5
             ndcg10_total += nd10
+            if control is not None:
+                ctrl_rank = next((i + 1 for i, mid in enumerate(control) if mid in gold), None)
+                ctrl_hits5 += bool(ctrl_rank and ctrl_rank <= 5)
+                ctrl_ndcg10_total += ndcg_at(control, gold, 10)
 
         # Negative golds. Scored on the top-10 regardless of k so the number means
         # the same thing across runs with different retrieval depths.
         carried = [m for m in returned[:10] if m in forbidden]
+        reachable = set(q.get("_reachable_forbidden") or [])
         if forbidden:
             n_forgetting += 1
+            if reachable:
+                n_forgetting_scorable += 1
             if carried:
                 carry_forward_hits += 1
+                if reachable:
+                    carry_forward_hits_scorable += 1
                 violations.append((q, carried, returned))
 
         results.append({
@@ -284,7 +355,22 @@ def score(rows: list, k: int, verbose: bool):
     metrics["false_carry_forward_rate"] = (
         carry_forward_hits / n_forgetting if n_forgetting else None
     )
+    # The number worth gating on. NULL — not 0.0 — when no probe declares a
+    # reachable forbidden id, because "not measurable" and "measured, perfect"
+    # must not print the same.
+    metrics["fcfr_scorable"] = (
+        carry_forward_hits_scorable / n_forgetting_scorable if n_forgetting_scorable else None
+    )
+    metrics["n_forgetting"] = n_forgetting
+    metrics["n_forgetting_scorable"] = n_forgetting_scorable
+    metrics["scoreset_version"] = SCORESET_VERSION
+    if control is not None:
+        metrics["recall_at_5_control"] = ctrl_hits5 / n_positive
+        metrics["ndcg_at_10_control"] = ctrl_ndcg10_total / n_positive
+        metrics["delta_over_no_memory"] = metrics["ndcg_at_10"] - metrics["ndcg_at_10_control"]
     return results, metrics, failures, {"n": n_forgetting, "hits": carry_forward_hits,
+                                        "n_scorable": n_forgetting_scorable,
+                                        "hits_scorable": carry_forward_hits_scorable,
                                         "violations": violations}
 
 
@@ -313,9 +399,13 @@ def cmd_run(args):
         snapped = sb_rpc("eval_access_snapshot_take", {})
         print(f"access-stat snapshot taken ({snapped} rows) — eval will be non-mutating")
 
+        ctrl = None if args.no_control else control_ranking(args.k)
+        if ctrl is not None:
+            print(f"control arm: {len(ctrl)} corpus-prior rows (query-independent)")
+
         print(f"Running {len(rows)} eval queries (k={args.k}) against hybrid_recall …")
         try:
-            results, m, failures, fcf = score(rows, args.k, args.verbose)
+            results, m, failures, fcf = score(rows, args.k, args.verbose, control=ctrl)
         finally:
             repaired = sb_rpc("eval_access_snapshot_restore", {})
             print(f"access stats restored ({repaired} rows perturbed by this run)")
@@ -349,11 +439,31 @@ def cmd_run(args):
     print(f"  MRR        {m['mrr']:.3f}")
     print(f"  nDCG@5     {m['ndcg_at_5']:.3f}")
     print(f"  nDCG@10    {m['ndcg_at_10']:.3f}")
+    if "ndcg_at_10_control" in m:
+        print(f"  --- MemDelta control arm (retrieval disabled) ---")
+        print(f"  recall@5   {m['recall_at_5_control']:.3f}  (corpus prior, no query)")
+        print(f"  nDCG@10    {m['ndcg_at_10_control']:.3f}  (corpus prior, no query)")
+        print(f"  Δ over no-memory  {m['delta_over_no_memory']:+.3f}  "
+              f"← the only number that says retrieval earned its keep")
     if m["false_carry_forward_rate"] is None:
         print("  FCFR       n/a (no probes declare forbidden_memory_ids)")
     else:
         print(f"  FCFR       {m['false_carry_forward_rate']:.3f}  "
               f"({fcf['hits']}/{fcf['n']} probes returned a superseded memory)")
+    # The blended FCFR above includes probes whose forbidden rows are inactive and
+    # therefore unreachable through any hybrid_recall lane. They cannot fail, so
+    # they only drag the rate down. Report the honest denominator alongside it.
+    if m["fcfr_scorable"] is None:
+        print("  FCFR-live  n/a — NO probe declares a REACHABLE forbidden id, so the "
+              "forgetting lane is not being measured at all (see falsify_fcfr.py)")
+    else:
+        print(f"  FCFR-live  {m['fcfr_scorable']:.3f}  "
+              f"({fcf['hits_scorable']}/{fcf['n_scorable']} probes whose forbidden rows "
+              f"are still active — the number to gate on)")
+        if fcf["n"] > fcf["n_scorable"]:
+            print(f"             {fcf['n'] - fcf['n_scorable']} probe(s) vacuous "
+                  f"(all forbidden ids is_active=false; retained as an is_active-filter "
+                  f"regression test)")
     print("  by category (recall@5):")
     for c, v in sorted(by_category(rows, results).items()):
         label = f"{c} *" if c == FORGETTING_CATEGORY else c
@@ -389,9 +499,12 @@ def cmd_run(args):
         print(f"  FAIL: recall@5 {m['recall_at_5']:.3f} < floor {args.fail_under_recall5}", file=sys.stderr)
         return 1
 
-    fcfr = m["false_carry_forward_rate"]
+    # Gate on the scorable rate, falling back to the blended one only if no probe
+    # declares a reachable forbidden id. Gating on the blended rate would mean
+    # gating on a number that 8 of 9 probes are structurally unable to move.
+    fcfr = m["fcfr_scorable"] if m["fcfr_scorable"] is not None else m["false_carry_forward_rate"]
     if args.max_fcfr is not None and fcfr is not None and fcfr > args.max_fcfr:
-        print(f"  FAIL: false-carry-forward rate {fcfr:.3f} > ceiling {args.max_fcfr} — "
+        print(f"  FAIL: false-carry-forward rate {fcfr:.3f} > ceiling {args.max_fcfr} —"
               f"superseded memories are being served. Check the is_active filter on "
               f"every hybrid_recall lane (migration 048b), supersession heuristic (073), "
               f"and trust-tier weighting.", file=sys.stderr)
@@ -735,7 +848,8 @@ def cmd_gate(args):
     still catches a real step change. Fires on nDCG@10 specifically because it is the
     metric that moves when ranking degrades without gold falling out of top-k."""
     sel = {"select": "id,tag,created_at,ndcg_at_10,recall_at_5,n_queries,git_sha,"
-                     "false_carry_forward_rate",
+                     "false_carry_forward_rate,fcfr_scorable,n_forgetting_scorable,"
+                     "ndcg_at_10_control,delta_over_no_memory,scoreset_version",
            "order": "created_at.desc", "limit": "1"}
     if args.tag:
         sel["tag"] = f"eq.{args.tag}"
@@ -746,18 +860,29 @@ def cmd_gate(args):
     if cur.get("ndcg_at_10") is None:
         die(f"run {cur['tag']} has no ndcg_at_10 — cannot gate")
 
+    # Median only over runs that scored the SAME probe set (migration 091).
+    # nDCG is a mean over the probe population, so the population is part of the
+    # metric definition: medianing across a probe-set change compares two
+    # different metrics and alerts on the change itself. Migration 084 dodged
+    # this once with a split denominator; scoreset_version makes it structural.
+    ssv = cur.get("scoreset_version") or 1
     hist = sb_get("eval_runs", {
         "select": "tag,created_at,ndcg_at_10",
         "ndcg_at_10": "not.is.null",
+        "scoreset_version": f"eq.{ssv}",
         "created_at": f"lt.{cur['created_at']}",
         "order": "created_at.desc", "limit": str(args.window),
     })
     vals = [h["ndcg_at_10"] for h in hist]
-    print(f"gate: run '{cur['tag']}' nDCG@10={cur['ndcg_at_10']:.4f} (n={cur['n_queries']}) "
-          f"vs trailing {len(vals)} run(s)")
+    print(f"gate: run '{cur['tag']}' nDCG@10={cur['ndcg_at_10']:.4f} (n={cur['n_queries']}, "
+          f"scoreset v{ssv}) vs trailing {len(vals)} run(s) on the same probe set")
     if len(vals) < args.min_history:
-        print(f"  only {len(vals)} prior run(s) with nDCG (<{args.min_history}) — "
-              f"establishing trend, not gating yet")
+        print(f"  only {len(vals)} prior run(s) with nDCG on scoreset v{ssv} "
+              f"(<{args.min_history}) — establishing trend, not gating yet")
+        if args.notify_ok:
+            discord(_ok_line(cur, None, vals, ssv) +
+                    f"\n_establishing trend on scoreset v{ssv} "
+                    f"({len(vals)}/{args.min_history} prior runs) — not gating yet_")
         return 0
 
     med = statistics.median(vals)
@@ -784,9 +909,19 @@ def cmd_gate(args):
     # FCFR is gated separately from nDCG, not folded into it. A superseded memory
     # reaching the top-10 is a correctness failure at ANY level — there is no
     # trailing median to be "within tolerance" of, so it gets an absolute ceiling.
-    fcfr = cur.get("false_carry_forward_rate")
+    #
+    # Gate the SCORABLE rate (migration 091). The blended rate averages in probes
+    # whose forbidden rows are inactive and therefore unreachable through any
+    # hybrid_recall lane; those probes cannot fail, so they only push the rate
+    # toward zero. That dilution is precisely why FCFR read 0.0000 for six runs
+    # while the lane was never actually exercised.
+    fcfr = cur.get("fcfr_scorable")
+    if fcfr is None and cur.get("n_forgetting_scorable") == 0:
+        print("  ! forgetting lane NOT MEASURED — no probe declares a reachable "
+              "forbidden id (run eval/falsify_fcfr.py --audit-only)", file=sys.stderr)
     if fcfr is not None:
-        print(f"  false-carry-forward {fcfr:.3f} (ceiling {args.max_fcfr})")
+        print(f"  false-carry-forward (scorable) {fcfr:.3f} over "
+              f"{cur.get('n_forgetting_scorable')} probe(s) (ceiling {args.max_fcfr})")
         if fcfr > args.max_fcfr:
             discord(f"🔻 **Superseded memories are being served** — eval `{cur['tag']}`\n"
                     f"false-carry-forward rate **{fcfr:.3f}** > ceiling {args.max_fcfr}. "
@@ -797,11 +932,31 @@ def cmd_gate(args):
             return 1
 
     if args.notify_ok:
-        fcfr_txt = f", FCFR {fcfr:.3f}" if fcfr is not None else ""
-        discord(f"✅ Nightly memory eval `{cur['tag']}`: nDCG@10 {cur['ndcg_at_10']:.4f} "
-                f"({delta_pct:+.1f}% vs median), recall@5 {cur['recall_at_5']:.3f}, "
-                f"n={cur['n_queries']}{fcfr_txt}")
+        discord(_ok_line(cur, delta_pct, vals, ssv))
     return 0
+
+
+def _ok_line(cur: dict, delta_pct, vals: list, ssv: int) -> str:
+    """The green nightly line.
+
+    2026-07-30 REC 1 asked for the forgetting lane to be VISIBLE alongside
+    Recall@5, and REC 2 for delta-over-no-memory. Both are here, and both say
+    "not measured" out loud when they are not measured — a silent metric is how
+    FCFR sat at 0.0000 for six runs without anyone asking why."""
+    vs = f" ({delta_pct:+.1f}% vs median of {len(vals)})" if delta_pct is not None else ""
+    fcfr, n_sc = cur.get("fcfr_scorable"), cur.get("n_forgetting_scorable")
+    if fcfr is not None:
+        forget = f"forgetting {fcfr:.3f} over {n_sc} live probe(s)"
+    elif n_sc == 0:
+        forget = "forgetting **NOT MEASURED** (no reachable forbidden ids)"
+    else:
+        forget = "forgetting n/a"
+    d = cur.get("delta_over_no_memory")
+    ctrl = (f"Δ over no-memory **{d:+.3f}** (control nDCG@10 "
+            f"{cur.get('ndcg_at_10_control'):.3f})") if d is not None else "no control arm"
+    return (f"✅ Nightly memory eval `{cur['tag']}` (scoreset v{ssv})\n"
+            f"nDCG@10 {cur['ndcg_at_10']:.4f}{vs} · recall@5 {cur['recall_at_5']:.3f} · "
+            f"n={cur['n_queries']}\n{ctrl} · {forget}")
 
 
 def main():
@@ -819,6 +974,10 @@ def main():
                         "Fails the run when superseded memories reach the top-10. "
                         "Not on by default — establish a baseline before gating.")
     r.add_argument("--git-sha", default=os.environ.get("GIT_SHA"))
+    r.add_argument("--no-control", action="store_true",
+                   help="skip the MemDelta control arm (migration 091). The control "
+                        "is one extra query, not one extra retrieval per probe — "
+                        "there is rarely a reason to skip it.")
     r.add_argument("--notes")
     r.add_argument("--max-fail-pct", type=float, default=0.05,
                    help="refuse to record the run if more than this fraction of "

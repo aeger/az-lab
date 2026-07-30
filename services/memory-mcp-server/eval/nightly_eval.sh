@@ -58,7 +58,11 @@ if [ "$RUN_RC" -ne 0 ]; then
   exit "$RUN_RC"
 fi
 
-python3 retrieval_regression.py gate --tag "$TAG" --window 7 --drop-pct 5.0
+# --notify-ok posts the GREEN line too, not just regressions (2026-07-30 REC 1).
+# Without it the forgetting lane and the control arm are invisible unless they
+# breach — and FCFR sat at 0.0000 for six runs precisely because nothing ever
+# printed it where Jeff would see it.
+python3 retrieval_regression.py gate --tag "$TAG" --window 7 --drop-pct 5.0 --notify-ok
 GATE_RC=$?
 
 echo "=== done  rc=$GATE_RC ==="
