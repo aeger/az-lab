@@ -22,8 +22,16 @@ measurement arm of the "make Claude an active participant in its memory" thread.
 ## Components
 - `memory_eval.py` — generic QA over injection **strategies** (none/recency/random/semantic/hybrid/oracle). Metrics: accuracy, recall@k, ctx_tokens, latency.
 - `scenario_eval.py` + `scenarios/*.json` — realistic **incident** scenarios across knowledge **substrates** (blind / well-documented-homelab / az-lab memory). Rubric-graded vs a gold fix, with replicates.
+- `retrieval_regression.py` — the nightly **retrieval** gate (separate concern from injection: zero LLM calls, seconds not minutes). `run` / `gate` / `trend` / `sweep` / `router`.
+- `falsify_fcfr.py` — **run this before trusting any FCFR number.** `--audit-only` reports how many probes declare a *reachable* forbidden id; the full run forces a violation through `score()` to prove the metric is wired. Written 2026-07-30 after FCFR read exactly 0 on six consecutive runs: the metric was wired, but 8 of 9 probes pointed only at `is_active=false` rows that `hybrid_recall` filters on every lane, so they could not fail. A metric that cannot fail is not a passing metric.
 - Retrieval = the real path: Ollama `nomic-embed-text` (768d) + `hybrid_recall` RPC.
 - LLM (agent+grader) = NemoClaw (NVIDIA NIM, Nemotron 120B). `EVAL_LLM_PROVIDER=anthropic` supported once a valid key exists (the one in `../.env` is 401).
+
+## Retrieval-gate state (2026-07-30, migration 091)
+- Probe set is **scoreset v2**: 79 positive + 11 with forbidden ids (88 active rows). `cmd_gate` medians only over runs sharing `scoreset_version`, so changing the probe set cannot fire an unattributable regression alert — bump the constant in `retrieval_regression.py` whenever you add or retire probes.
+- Headline: Recall@5 **0.835**, nDCG@10 **0.701**, Δ-over-no-memory **+0.686**, FCFR-live **0.500** (2 scorable probes).
+- The old 56 probes still score **1.00 in every category** while the 21 adversarial paraphrases score **9/21** — same golds, no shared distinctive tokens. Read that as label leakage in the original set, not as a ranker regression.
+- Adding probes is the lever that keeps this instrument alive. Write them as the SYMPTOM in the words someone hitting it would use, and check the wording against the gold for shared distinctive tokens before committing.
 
 ## Current state (2026-07-13)
 - ✅ Both harnesses built, committed (az-lab beta `d1fea02`, `b3b6a57`).
