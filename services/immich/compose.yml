@@ -42,6 +42,11 @@ services:
       - immich-model-cache:/cache
     networks:
       - immich-internal
+      # immich-internal is internal:true, so ML could not reach huggingface.co
+      # to download CLIP/face models — smart search and facial recognition
+      # silently produced nothing. Dedicated egress bridge rather than the
+      # shared proxy network: ML has no Traefik route and nothing else needs it.
+      - immich-egress
 
   immich-redis:
     image: redis:6.2-alpine
@@ -81,3 +86,4 @@ networks:
     external: true
   immich-internal:
     internal: true
+  immich-egress: {}
