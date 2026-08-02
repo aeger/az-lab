@@ -7,6 +7,7 @@ import { createHash, createHmac } from "crypto";
 import WebSocket from "ws";
 import express, { Request, Response } from "express";
 import { z } from "zod";
+import threatPatternDefs from "./threat-patterns.json" with { type: "json" };
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || "3100", 10);
@@ -57,22 +58,25 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ── Security Scanner ─────────────────────────────────────────────────────────
-const THREAT_PATTERNS: Array<[RegExp, string]> = [
-  [/ignore\s+(previous|all|above|prior)\s+instructions/i, "prompt_injection"],
-  [/you\s+are\s+now\s+/i, "role_hijack"],
-  [/do\s+not\s+tell\s+the\s+user/i, "deception_hide"],
-  [/system\s+prompt\s+override/i, "sys_prompt_override"],
-  [/disregard\s+(your|all|any)\s+(instructions|rules|guidelines)/i, "disregard_rules"],
-  [/act\s+as\s+(if|though)\s+you\s+(have\s+no|don'?t\s+have)\s+(restrictions|limits|rules)/i, "bypass_restrictions"],
-  [/curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)/i, "exfil_curl"],
-  [/wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)/i, "exfil_wget"],
-  [/cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)/i, "read_secrets"],
-  [/authorized_keys/i, "ssh_backdoor"],
-  [/\$HOME\/\.ssh|~\/\.ssh/i, "ssh_access"],
-  [/pretend\s+(you\s+are|to\s+be)\s+(a\s+)?(different|new|another)/i, "persona_hijack"],
-  [/your\s+(new\s+)?(instructions?|rules?|directives?)\s+are/i, "instruction_override"],
-  [/\u200b|\u200c|\u200d|\u2060|\ufeff|[\u202a-\u202e]/, "invisible_unicode"],
-];
+// Patterns live in src/threat-patterns.json, NOT here. That file is the single
+// source of truth shared with injection_scan.py — the retro/rescan worker that
+// closes OWASP ASI06 interception point 4 (post-hoc forensic detection). Before
+// 2026-08-02 the list was inline in this file and therefore reachable only from
+// the three write paths below, which is how 785 of 955 rows came to exist having
+// never been scanned even once.
+//
+// Adding a pattern? Edit the JSON and bump its `version`. The weekly
+// memory-injection-rescan.timer re-scans every row whose scan_pattern_version is
+// behind that number, so a pattern addition applies retroactively to the whole
+// corpus instead of only to writes that happen after it.
+// mode === "block" ONLY. The JSON also carries the five "signal" patterns from
+// the scan_memory_for_injection() DB trigger, which quarantine rather than reject.
+// Pulling those into scanContent() would turn a soft signal into a hard block and
+// make every already-quarantined row unwritable — so the filter is load-bearing.
+const THREAT_PATTERNS: Array<[RegExp, string]> = threatPatternDefs.patterns
+  .filter((p) => p.mode === "block")
+  .map((p) => [new RegExp(p.re, p.flags), p.id] as [RegExp, string]);
+const SCAN_PATTERN_VERSION: number = threatPatternDefs.version;
 
 function scanContent(text: string): string | null {
   for (const [pattern, threatId] of THREAT_PATTERNS) {
@@ -1503,6 +1507,37 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       // near-duplicate. match_memories is the single-embedding analogue of
       // find_duplicate_memories (which operates corpus-wide on pairs).
       // The 0.7–0.92 band is left to mem0Resolve below.
+      //
+      // CONTRADICTION BYPASS — 2026-08-01 daily research REC 4.
+      //
+      // The gate as originally written was a synchronous hard reject that ran
+      // BEFORE any contradiction detection and persisted NOTHING: the twin got
+      // conflict_flagged, but the incoming content survived only in the caller's
+      // transcript. memory-contradiction-scan.timer at 03:30 cannot recover it,
+      // because that scan compares rows that EXIST.
+      //
+      // That is the exact failure mode named in MemTX: Transactional Belief Commit
+      // for Stateful Agent Memory (arXiv 2607.23929) — "a synchronous near-duplicate
+      // gate can prematurely reject contradictory writes before the asynchronous
+      // contradiction detector can evaluate them".
+      //
+      // Concretely for az-lab: a CORRECTION phrased like the thing it corrects —
+      // "RB5009 SSH times out from svc-podman-01" vs "RB5009 SSH now works from
+      // svc-podman-01" — is lexically and semantically near-identical, clears 0.92
+      // cosine, and was thrown away. The system was structurally biased toward
+      // keeping the OLDER belief, and whether a correction survived depended only on
+      // whether the writer happened to reuse the memory name: the same-name UPDATE
+      // path above calls detectConflicts() and keeps the write; only this new-name
+      // path rejected.
+      //
+      // Note this uses mightContradict() directly rather than detectConflicts().
+      // detectConflicts writes memory_conflicts rows keyed on newMemoryId, so it
+      // needs a row that exists — it cannot run before the insert. mightContradict
+      // is the pure negation+topic-overlap predicate detectConflicts is built on,
+      // so the gate now applies the SAME test, just at a point where there is no id
+      // yet. Once the row is persisted, detectConflicts runs over it normally at
+      // the end of the insert path and files the conflict pair for the 03:30 scan.
+      let tentativeTwin: { id: string; name: string; similarity: number } | null = null;
       if (embedding) {
         const { data: novCheck } = await supabase.rpc("match_memories", {
           query_embedding: JSON.stringify(embedding),
@@ -1512,9 +1547,18 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const top = (novCheck as any[] | null)?.[0];
         if (top && top.type === type && top.similarity >= 0.92) {
           const novelty = (1 - top.similarity).toFixed(3);
-          await supabase.from("memories").update({ conflict_flagged: true }).eq("id", top.id);
-          console.log(`[novelty] REJECT "${name}": novelty=${novelty} vs "${top.name}" (cosine=${top.similarity.toFixed(3)}) — flagged twin for review`);
-          return { content: [{ type: "text" as const, text: `Rejected: novelty=${novelty} (cosine=${top.similarity.toFixed(3)}) — near-duplicate of existing ${type} memory "${top.name}" (flagged for review). Update that memory or use a more distinct name to force a new entry.` }] };
+          if (mightContradict(content, top.content ?? "")) {
+            // Belief-commit: admit the write as TENTATIVE and let adjudication happen
+            // asynchronously. Rejecting is a decision the synchronous path does not
+            // have the evidence to make.
+            tentativeTwin = { id: top.id, name: top.name, similarity: top.similarity };
+            await supabase.from("memories").update({ conflict_flagged: true }).eq("id", top.id);
+            console.log(`[novelty] BYPASS "${name}": novelty=${novelty} vs "${top.name}" (cosine=${top.similarity.toFixed(3)}) — contradiction detected, admitting as tentative`);
+          } else {
+            await supabase.from("memories").update({ conflict_flagged: true }).eq("id", top.id);
+            console.log(`[novelty] REJECT "${name}": novelty=${novelty} vs "${top.name}" (cosine=${top.similarity.toFixed(3)}) — flagged twin for review`);
+            return { content: [{ type: "text" as const, text: `Rejected: novelty=${novelty} (cosine=${top.similarity.toFixed(3)}) — near-duplicate of existing ${type} memory "${top.name}" (flagged for review). Update that memory or use a more distinct name to force a new entry.` }] };
+          }
         }
       }
 
@@ -1529,6 +1573,16 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
 
         for (const d of decisions) {
           if (d.action === "NOOP") {
+            // A tentative contradiction must not be NOOP'd away — that would just
+            // move the silent loss the novelty gate used to cause from one
+            // synchronous decision point to the next one (REC 4, 2026-08-01).
+            // mem0Resolve sees a near-identical twin and can reasonably call the
+            // write redundant; it is exactly wrong when the near-identity is
+            // because one text NEGATES the other.
+            if (tentativeTwin) {
+              console.log(`[mem0] NOOP OVERRIDDEN "${name}": contradiction with "${tentativeTwin.name}" outranks redundancy (${d.rationale})`);
+              continue;
+            }
             console.log(`[mem0] NOOP "${name}": ${d.rationale}`);
             return { content: [{ type: "text" as const, text: `NOOP: Fact already captured in "${d.target_name}". No write needed. (${d.rationale})` }] };
           }
@@ -1581,6 +1635,27 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (is_point_in_time !== undefined) insert.is_point_in_time = is_point_in_time;
       // Collaborative Memory provenance: track contributing agent (REC3, arXiv 2505.18279)
       insert.provenance = insertOwner ? { contributing_agent: insertOwner } : {};
+      // MemTX tentative belief-commit (REC 4, 2026-08-01). This row was admitted
+      // over the 0.92 novelty gate because it CONTRADICTS its near-twin, so it
+      // enters flagged and unadjudicated rather than as an accepted fact.
+      //
+      // trust_tier is deliberately NOT set here even though the research asked for
+      // 'medium': it is trigger-owned. memories_set_writer_agent_biu runs
+      // derive_trust_tier(source, writer_agent) BEFORE INSERT and would overwrite
+      // any value written from here, so setting it would be decorative. The
+      // tentative state is carried by conflict_flagged + the `contradicts` link +
+      // the memory_conflicts pair that detectConflicts files below — all of which
+      // the 03:30 contradiction scan and resolve_conflict_auto already consume.
+      if (tentativeTwin) {
+        insert.conflict_flagged = true;
+        insert.provenance = {
+          ...(insert.provenance as Record<string, unknown>),
+          tentative: true,
+          contradicts_memory_id: tentativeTwin.id,
+          contradicts_memory_name: tentativeTwin.name,
+          admitted_over_novelty_gate: Number(tentativeTwin.similarity.toFixed(4)),
+        };
+      }
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
@@ -1618,10 +1693,29 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         }
       }
 
+      // Explicit `contradicts` edge to the twin (REC 4). detectConflicts below files
+      // the memory_conflicts PAIR, but that table is the adjudication queue; the link
+      // graph is what get_linked_memories and spreading_activation_rerank traverse,
+      // so without this edge a reader of either memory would never see the other.
+      let tentativeNote = "";
+      if (tentativeTwin && inserted?.id) {
+        const { error: linkErr } = await supabase.from("memory_links").upsert({
+          source_id: inserted.id, target_id: tentativeTwin.id,
+          relationship: "contradicts", link_type: "semantic",
+          strength: Math.min(tentativeTwin.similarity, 1.0),
+        }, { onConflict: "source_id,target_id,relationship" });
+        if (linkErr) console.warn(`[novelty] contradicts-link failed: ${linkErr.message}`);
+        tentativeNote =
+          ` ⚠️ Admitted as TENTATIVE over the novelty gate (cosine=${tentativeTwin.similarity.toFixed(3)}` +
+          ` vs "${tentativeTwin.name}") because it appears to CONTRADICT it. Both rows are` +
+          ` conflict_flagged; the 03:30 contradiction scan will adjudicate. Previously this` +
+          ` write would have been silently rejected.`;
+      }
+
       const conflicts = await detectConflicts(inserted.id, content, type, memTags, embedding);
       const conflictNote = conflicts ? ` ⚠️ Possible contradiction with: ${conflicts}` : "";
 
-      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${mem0Note}${conflictNote}` }] };
+      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${mem0Note}${tentativeNote}${conflictNote}` }] };
     }
   );
 

@@ -157,12 +157,42 @@ def sb_rpc(fn: str, body: dict) -> list:
 
 
 FORGETTING_CATEGORY = "forgetting"
+ABSTENTION_CATEGORY = "abstention"
+
+# Default relevance floor for the abstention tier (migration 096).
+#
+# CALIBRATION, MEASURED 2026-08-01 — this number is a placeholder, not a finding.
+#   top hybrid_score, gold AT rank 1   (n=50): min 0.8503  median 1.0263  max 1.0783
+#   top hybrid_score, gold NOT at rank1(n=42): min 0.8783  median 1.0070  max 1.0783
+#   unanswerable probes reach 1.0651 ("IoT SSID password" -> "Claude Desktop SSH")
+# The answerable and unanswerable distributions are indistinguishable, because
+# hybrid_score is a fused RANK score, not a calibrated cross-query relevance
+# probability. NO floor separates them. The default below is the median top score
+# of a correct rank-1 hit — chosen so abstention_rate starts at a value that is
+# neither trivially 0 nor trivially 1, and can be re-tuned offline against
+# eval_run_results.top_score without re-running anything.
+# Treat abstention_rate as an instrument under construction until a calibrated
+# signal replaces the floor (top1-vs-top5 margin, or the TEI cross-encoder score,
+# which unlike hybrid_score IS query-conditioned).
+ABSTENTION_FLOOR = float(os.environ.get("ABSTENTION_FLOOR", "1.0263"))
 
 # Bump whenever the active probe set changes (migration 091). cmd_gate only
 # medians over runs sharing this value — nDCG is a mean over the probe
 # population, so comparing across probe-set changes measures the change, not a
 # regression. Migration 091 added the 13-probe hard tier: 56 -> 69 positives.
-SCORESET_VERSION = 2
+# v3 (migration 096, 2026-08-01): +8 abstention probes, +tier column.
+# v4 (migration 101, 2026-08-02): +18 AUTHORED hard-tier probes, 3 -> 21. This
+# MUST be a version bump, not a silent addition: n_queries goes 79 -> 97 and every
+# corpus-wide mean is taken over a different, deliberately harder population, so a
+# v3 median compared against a v4 run would report the probe set as a regression.
+# Expect the headline numbers to DROP. That is the point — v3's recall@5 was
+# bit-identical to fifteen decimals across six runs because nothing could move it.
+SCORESET_VERSION = 4
+
+# Below this many hard probes, a hard-tier floor is noise wearing a gate's clothes.
+# 096 shipped a tier of 3 that scored n_hard=1 on the night it ran; migration 101
+# took it to 21. Raise the floor rather than lower this.
+MIN_HARD_TIER_FOR_GATE = 8
 
 
 def annotate_reachability(rows: list) -> list:
@@ -193,7 +223,7 @@ def annotate_reachability(rows: list) -> list:
 
 def load_queries() -> list:
     rows = sb_get("eval_queries", {
-        "select": "id,question,topic_hint,gold_memory_ids,forbidden_memory_ids,category",
+        "select": "id,question,topic_hint,gold_memory_ids,forbidden_memory_ids,category,tier",
         "active": "is.true",
         "order": "category,created_at",
     })
@@ -249,7 +279,8 @@ def ndcg_at(returned: list, gold: set, cut: int) -> float:
     return (dcg / idcg) if idcg else 0.0
 
 
-def score(rows: list, k: int, verbose: bool, control: list = None):
+def score(rows: list, k: int, verbose: bool, control: list = None,
+          abstention_floor: float = ABSTENTION_FLOOR):
     """Score every probe, but aggregate the POSITIVE metrics over the non-forgetting
     population only.
 
@@ -270,8 +301,25 @@ def score(rows: list, k: int, verbose: bool, control: list = None):
     failures = 0
     n_positive = 0
     n_forgetting = 0
+    # Hard tier (migration 096) — probes whose gold currently lands at rank 6-20.
+    # Scored as a SUBSET of the positives, not a separate population: they are
+    # already inside n_queries, this just reports them on their own so a gain
+    # confined to the already-easy probes cannot read as a real improvement.
+    n_hard, hard_hits5, hard_ndcg10 = 0, 0, 0.0
+    hard_hits1, hard_ndcg5 = 0, 0.0
+    # Abstention tier (migration 096) — probes with NO gold row. Excluded from
+    # every positive aggregate: their gold set is empty, so rank is always None
+    # and folding them in would look like 8 new misses.
+    n_abstain, abstain_ok = 0, 0
+    abstain_detail = []
     carry_forward_hits = 0
     violations = []
+    # Distractor lane — forbidden ids on probes that are NOT supersession tests
+    # (migration 101). Reported, deliberately not gated: recall@1 on the hard tier
+    # already fails when a distractor outranks gold, and a second gate on the same
+    # underlying event would double-count one regression as two.
+    n_distractor, distractor_hits = 0, 0
+    distractor_violations = []
     # Scorable subset: probes with at least one REACHABLE forbidden id. See
     # annotate_reachability — the blended rate over a mostly-unreachable
     # denominator is what hid the metric for six runs.
@@ -284,19 +332,36 @@ def score(rows: list, k: int, verbose: bool, control: list = None):
         gold = set(q["gold_memory_ids"] or [])
         forbidden = set(q.get("forbidden_memory_ids") or [])
         is_forgetting = q["category"] == FORGETTING_CATEGORY
+        is_abstention = q["category"] == ABSTENTION_CATEGORY
         t0 = time.time()
         try:
-            returned = retrieve(q["question"], q.get("topic_hint"), k)
+            # retrieve_rows, not retrieve: the abstention tier needs hybrid_score,
+            # and recording top_score for EVERY probe is what lets the relevance
+            # floor be re-tuned offline instead of by re-running the harness.
+            # Identical RPC call — retrieve() is retrieve_rows() plus a projection.
+            rows_out = retrieve_rows(q["question"], q.get("topic_hint"), k)
+            returned = [r["id"] for r in rows_out][:k]
         except Exception as e:  # a failed retrieval is a miss, not a crash
             print(f"  ! retrieval failed for {q['id']}: {e}", file=sys.stderr)
-            returned = []
+            rows_out, returned = [], []
             failures += 1
         latency = int((time.time() - t0) * 1000)
+        top_score = rows_out[0].get("hybrid_score") if rows_out else None
 
         rank = next((i + 1 for i, mid in enumerate(returned) if mid in gold), None)
         nd5, nd10 = ndcg_at(returned, gold, 5), ndcg_at(returned, gold, 10)
 
-        if not is_forgetting:
+        if is_abstention:
+            # Correct behaviour is to return NOTHING at or above the floor. A probe
+            # that returns rows below the floor still abstains — the caller's
+            # relevance cut, not the row count, is what an agent acts on.
+            n_abstain += 1
+            above = [r for r in rows_out if (r.get("hybrid_score") or 0.0) >= abstention_floor]
+            if not above:
+                abstain_ok += 1
+            abstain_detail.append((q, above[:1], top_score))
+
+        if not is_forgetting and not is_abstention:
             n_positive += 1
             if rank:
                 rr_total += 1.0 / rank
@@ -309,27 +374,60 @@ def score(rows: list, k: int, verbose: bool, control: list = None):
                 ctrl_rank = next((i + 1 for i, mid in enumerate(control) if mid in gold), None)
                 ctrl_hits5 += bool(ctrl_rank and ctrl_rank <= 5)
                 ctrl_ndcg10_total += ndcg_at(control, gold, 10)
+            if q.get("tier") == "hard":
+                n_hard += 1
+                hard_hits5 += bool(rank and rank <= 5)
+                hard_ndcg10 += nd10
+                # The gate pair (2026-08-02, REC 2). The hard tier is built from
+                # near-duplicate distractor clusters, so its characteristic failure
+                # is the SIBLING row taking rank 1 with gold right behind it —
+                # recall@5 scores that as a hit, recall@1 catches it. nDCG@5 gives
+                # the multi-hop probes partial credit for finding one of two golds
+                # instead of scoring half an answer as a whole one.
+                hard_hits1 += bool(rank and rank <= 1)
+                hard_ndcg5 += nd5
 
         # Negative golds. Scored on the top-10 regardless of k so the number means
         # the same thing across runs with different retrieval depths.
         carried = [m for m in returned[:10] if m in forbidden]
         reachable = set(q.get("_reachable_forbidden") or [])
         if forbidden:
-            n_forgetting += 1
-            if reachable:
-                n_forgetting_scorable += 1
-            if carried:
-                carry_forward_hits += 1
+            # FCFR counts SUPERSESSION failures only — "a retired fact reached the
+            # top-10, so an agent can answer from it". Migration 101's hard-tier
+            # probes also carry forbidden ids, but for a different purpose: the
+            # forbidden row there is a near-duplicate DISTRACTOR that is very much
+            # still current, just not the answer. Folding those into FCFR would (a)
+            # make the alert text ("a retired fact reached the top-10") false, and
+            # (b) make its 0.0 ceiling unreachable by construction, since the whole
+            # point of a distractor probe is that the distractor is competitive.
+            # Distractor carry-forward is already penalised where it belongs: it
+            # pushes gold off rank 1, which is exactly what hard_recall_at_1 gates.
+            if is_forgetting:
+                n_forgetting += 1
                 if reachable:
-                    carry_forward_hits_scorable += 1
-                violations.append((q, carried, returned))
+                    n_forgetting_scorable += 1
+                if carried:
+                    carry_forward_hits += 1
+                    if reachable:
+                        carry_forward_hits_scorable += 1
+                    violations.append((q, carried, returned))
+            else:
+                n_distractor += 1
+                if carried:
+                    distractor_hits += 1
+                    distractor_violations.append((q, carried, returned))
 
         results.append({
             "query_id": q["id"], "gold_rank": rank, "hit_at_5": bool(rank and rank <= 5),
             "returned_ids": returned, "latency_ms": latency, "ndcg_at_10": round(nd10, 4),
+            "top_score": round(top_score, 6) if top_score is not None else None,
         })
         if verbose:
-            if is_forgetting:
+            if is_abstention:
+                mark = "ABSTAINED" if not abstain_detail[-1][1] else "ANSWERED"
+                ts = f"{top_score:.4f}" if top_score is not None else "  n/a "
+                print(f"  [{q['category']:<10}] {mark:<12} top={ts}  {q['question'][:52]}")
+            elif is_forgetting:
                 mark = f"CARRY x{len(carried)}" if carried else "clean"
                 print(f"  [{q['category']:<10}] {mark:<12} {q['question'][:56]}")
             else:
@@ -363,7 +461,22 @@ def score(rows: list, k: int, verbose: bool, control: list = None):
     )
     metrics["n_forgetting"] = n_forgetting
     metrics["n_forgetting_scorable"] = n_forgetting_scorable
+    metrics["n_distractor"] = n_distractor
+    metrics["distractor_rate"] = (distractor_hits / n_distractor) if n_distractor else None
     metrics["scoreset_version"] = SCORESET_VERSION
+
+    # Hard tier (migration 096). NULL rather than 0.0 when the tier is empty —
+    # "no hard probes" and "hard probes all failed" must not print the same.
+    metrics["n_hard"] = n_hard
+    metrics["hard_recall_at_5"] = (hard_hits5 / n_hard) if n_hard else None
+    metrics["hard_ndcg_at_10"] = (hard_ndcg10 / n_hard) if n_hard else None
+    metrics["hard_recall_at_1"] = (hard_hits1 / n_hard) if n_hard else None
+    metrics["hard_ndcg_at_5"] = (hard_ndcg5 / n_hard) if n_hard else None
+
+    # Abstention tier (migration 096). Same NULL discipline.
+    metrics["n_abstention"] = n_abstain
+    metrics["abstention_rate"] = (abstain_ok / n_abstain) if n_abstain else None
+    metrics["abstention_floor"] = abstention_floor if n_abstain else None
     if control is not None:
         metrics["recall_at_5_control"] = ctrl_hits5 / n_positive
         metrics["ndcg_at_10_control"] = ctrl_ndcg10_total / n_positive
@@ -371,13 +484,22 @@ def score(rows: list, k: int, verbose: bool, control: list = None):
     return results, metrics, failures, {"n": n_forgetting, "hits": carry_forward_hits,
                                         "n_scorable": n_forgetting_scorable,
                                         "hits_scorable": carry_forward_hits_scorable,
-                                        "violations": violations}
+                                        "violations": violations,
+                                        "n_distractor": n_distractor,
+                                        "distractor_hits": distractor_hits,
+                                        "distractor_violations": distractor_violations,
+                                        "abstain_detail": abstain_detail}
 
 
 def by_category(rows, results):
     cat = {}
     idx = {r["query_id"]: r for r in results}
     for q in rows:
+        # Abstention probes have no gold, so hit_at_5 is False by construction.
+        # Listing them here would print "abstention 0/8" — a perfect abstention
+        # score rendered as total failure. They have their own metric.
+        if q["category"] == ABSTENTION_CATEGORY:
+            continue
         c = cat.setdefault(q["category"], {"n": 0, "hit5": 0})
         c["n"] += 1
         c["hit5"] += idx[q["id"]]["hit_at_5"]
@@ -405,7 +527,8 @@ def cmd_run(args):
 
         print(f"Running {len(rows)} eval queries (k={args.k}) against hybrid_recall …")
         try:
-            results, m, failures, fcf = score(rows, args.k, args.verbose, control=ctrl)
+            results, m, failures, fcf = score(rows, args.k, args.verbose, control=ctrl,
+                                              abstention_floor=args.abstention_floor)
         finally:
             repaired = sb_rpc("eval_access_snapshot_restore", {})
             print(f"access stats restored ({repaired} rows perturbed by this run)")
@@ -432,13 +555,34 @@ def cmd_run(args):
 
     print(f"\n=== {args.tag} ===")
     print(f"  n          {m['n_queries']}  (positive-gold probes; "
-          f"{fcf['n']} forgetting probes scored separately)")
-    print(f"  recall@1   {m['recall_at_1']:.3f}")
-    print(f"  recall@5   {m['recall_at_5']:.3f}")
-    print(f"  recall@10  {m['recall_at_10']:.3f}")
+          f"{fcf['n']} forgetting + {m['n_abstention']} abstention probes scored separately)")
+    # HEADLINE ORDER IS DELIBERATE (2026-08-01 REC 2). recall@5 has printed
+    # 0.835443037974684 on six consecutive runs — bit-identical to 15 decimals
+    # across the A/B control AND both treatment arms. Every change so far reorders
+    # inside the top 5 without moving anything across the k=5 boundary, so recall@5
+    # can detect neither a regression nor an improvement on this scoreset. recall@1
+    # and nDCG@5 DO move on exactly those runs (0.5696 -> 0.5823, 0.6950 -> 0.7026).
+    # They lead now; recall@5 is demoted and labelled rather than deleted, because
+    # the historical series is still worth plotting.
+    print(f"  recall@1   {m['recall_at_1']:.3f}   ← sensitive")
+    print(f"  nDCG@5     {m['ndcg_at_5']:.3f}   ← sensitive")
+    print(f"  nDCG@10    {m['ndcg_at_10']:.3f}   ← gate metric")
     print(f"  MRR        {m['mrr']:.3f}")
-    print(f"  nDCG@5     {m['ndcg_at_5']:.3f}")
-    print(f"  nDCG@10    {m['ndcg_at_10']:.3f}")
+    print(f"  recall@5   {m['recall_at_5']:.3f}   (insensitive on this scoreset — do not gate on it)")
+    print(f"  recall@10  {m['recall_at_10']:.3f}")
+    if m["n_hard"]:
+        print(f"  --- hard tier ({m['n_hard']} probes) ---")
+        print(f"  recall@1   {m['hard_recall_at_1']:.3f}   <- GATE METRIC")
+        print(f"  nDCG@5     {m['hard_ndcg_at_5']:.3f}   <- GATE METRIC")
+        print(f"  recall@5   {m['hard_recall_at_5']:.3f}")
+        print(f"  nDCG@10    {m['hard_ndcg_at_10']:.3f}")
+        if m["n_hard"] < 8:
+            print(f"  ! tier holds only {m['n_hard']} probes — too thin to gate on. "
+                  f"The 6-20 band is nearly empty because gold is either top-5 or "
+                  f"missed outright; a useful hard tier needs AUTHORED probes. "
+                  f"Re-mine with: SELECT * FROM eval_hard_tier_candidates;")
+    else:
+        print("  --- hard tier: EMPTY (no probe currently lands at rank 6-20) ---")
     if "ndcg_at_10_control" in m:
         print(f"  --- MemDelta control arm (retrieval disabled) ---")
         print(f"  recall@5   {m['recall_at_5_control']:.3f}  (corpus prior, no query)")
@@ -464,6 +608,24 @@ def cmd_run(args):
             print(f"             {fcf['n'] - fcf['n_scorable']} probe(s) vacuous "
                   f"(all forbidden ids is_active=false; retained as an is_active-filter "
                   f"regression test)")
+    # Abstention (migration 096, REC 5). The ONLY probe class that can catch
+    # over-retrieval: every other probe rewards returning something.
+    if m["abstention_rate"] is None:
+        print("  ABSTAIN    n/a (no abstention probes active)")
+    else:
+        print(f"  ABSTAIN    {m['abstention_rate']:.3f}  "
+              f"({int(m['abstention_rate'] * m['n_abstention'])}/{m['n_abstention']} "
+              f"unanswerable probes correctly returned nothing above floor "
+              f"{m['abstention_floor']:.4f})")
+        print(f"             ! floor is UNCALIBRATED — hybrid_score distributions for "
+              f"answerable and unanswerable queries overlap almost completely "
+              f"(migration 096). Read this with top_score, not on its own.")
+        for q, above, ts in fcf["abstain_detail"]:
+            if above:
+                print(f"  ! CONFABULATION  {q['question'][:58]}")
+                print(f"      answered with \"{above[0]['name'][:52]}\" @ "
+                      f"{above[0]['hybrid_score']:.4f}")
+
     print("  by category (recall@5):")
     for c, v in sorted(by_category(rows, results).items()):
         label = f"{c} *" if c == FORGETTING_CATEGORY else c
@@ -472,12 +634,27 @@ def cmd_run(args):
         print(f"    (* forgetting probes are excluded from the aggregate above; "
               f"see FCFR)")
 
+    # Distractor lane (migration 101) — over-retrieval on probes that are NOT
+    # supersession tests. Reported separately from FCFR because the failure is a
+    # different thing: the row returned here is CURRENT, just not the answer.
+    if m.get("n_distractor"):
+        print(f"  DISTRACTOR {m['distractor_rate']:.3f}  "
+              f"({fcf['distractor_hits']}/{fcf['n_distractor']} probes returned a "
+              f"near-duplicate they were told not to — over-retrieval, not stale data)")
+        print(f"             not gated directly: a distractor outranking gold already "
+              f"shows up as a hard-tier recall@1 miss, and gating both would count "
+              f"one regression twice.")
+
     # Name the offenders. An FCFR of 0.111 is not actionable; "probe X returned the
     # v5.9.0 row at rank 3" is.
     for q, carried, returned in fcf["violations"]:
         ranks = ", ".join(f"{m_id[:8]}@{returned.index(m_id) + 1}" for m_id in carried)
         print(f"  ! CARRY-FORWARD  {q['question'][:60]}")
         print(f"      superseded rows returned: {ranks}")
+    for q, carried, returned in fcf["distractor_violations"]:
+        ranks = ", ".join(f"{m_id[:8]}@{returned.index(m_id) + 1}" for m_id in carried)
+        print(f"  ! DISTRACTOR     {q['question'][:60]}")
+        print(f"      wrong-but-current rows returned: {ranks}")
 
     if args.compare:
         prev = sb_get("eval_runs", {"select": "tag,recall_at_5,mrr,ndcg_at_10", "tag": f"eq.{args.compare}",
@@ -497,6 +674,36 @@ def cmd_run(args):
 
     if args.fail_under_recall5 is not None and m["recall_at_5"] < args.fail_under_recall5:
         print(f"  FAIL: recall@5 {m['recall_at_5']:.3f} < floor {args.fail_under_recall5}", file=sys.stderr)
+        return 1
+
+    # Hard-tier floors — the gate as of 2026-08-02 (research REC 2).
+    # Refuse to PASS silently when the tier is too thin to mean anything: a floor
+    # applied to a 1-probe tier is a coin flip dressed as a gate, and 096 shipped
+    # exactly that (n_hard=1, hard_recall_at_5=0.0000).
+    for flag, key, label in (
+        (args.fail_under_hard_recall1, "hard_recall_at_1", "hard recall@1"),
+        (args.fail_under_hard_ndcg5, "hard_ndcg_at_5", "hard nDCG@5"),
+    ):
+        if flag is None:
+            continue
+        if not m["n_hard"]:
+            print(f"  FAIL: {label} floor requested but the hard tier is EMPTY — "
+                  f"nothing was measured.", file=sys.stderr)
+            return 1
+        if m["n_hard"] < MIN_HARD_TIER_FOR_GATE:
+            print(f"  FAIL: {label} floor requested but the hard tier holds only "
+                  f"{m['n_hard']} probe(s); {MIN_HARD_TIER_FOR_GATE} is the minimum "
+                  f"for the number to mean anything. Author more probes rather than "
+                  f"lowering this.", file=sys.stderr)
+            return 1
+        if m[key] < flag:
+            print(f"  FAIL: {label} {m[key]:.3f} < floor {flag} — a near-duplicate "
+                  f"distractor is outranking its gold. Check recall_weights and the "
+                  f"trgm/entity lanes before adjusting the floor.", file=sys.stderr)
+            return 1
+
+    if args.fail_under_recall1 is not None and m["recall_at_1"] < args.fail_under_recall1:
+        print(f"  FAIL: recall@1 {m['recall_at_1']:.3f} < floor {args.fail_under_recall1}", file=sys.stderr)
         return 1
 
     # Gate on the scorable rate, falling back to the blended one only if no probe
@@ -847,9 +1054,11 @@ def cmd_gate(args):
     single run alarms on noise; gating on the median of the last N absorbs it and
     still catches a real step change. Fires on nDCG@10 specifically because it is the
     metric that moves when ranking degrades without gold falling out of top-k."""
-    sel = {"select": "id,tag,created_at,ndcg_at_10,recall_at_5,n_queries,git_sha,"
+    sel = {"select": "id,tag,created_at,ndcg_at_10,recall_at_5,recall_at_1,ndcg_at_5,"
+                     "n_queries,git_sha,"
                      "false_carry_forward_rate,fcfr_scorable,n_forgetting_scorable,"
-                     "ndcg_at_10_control,delta_over_no_memory,scoreset_version",
+                     "ndcg_at_10_control,delta_over_no_memory,scoreset_version,"
+                     "n_hard,hard_ndcg_at_10,n_abstention,abstention_rate,abstention_floor",
            "order": "created_at.desc", "limit": "1"}
     if args.tag:
         sel["tag"] = f"eq.{args.tag}"
@@ -895,8 +1104,11 @@ def cmd_gate(args):
         msg = (f"🔻 **Memory retrieval regression** — nightly eval `{cur['tag']}`\n"
                f"nDCG@10 **{cur['ndcg_at_10']:.4f}** vs trailing-{len(vals)} median "
                f"{med:.4f} (**{delta_pct:+.1f}%**, floor -{args.drop_pct}%)\n"
-               f"recall@5 {cur['recall_at_5']:.3f} · n={cur['n_queries']} · "
-               f"git `{(cur.get('git_sha') or 'unknown')[:8]}`\n"
+               # recall@1 + nDCG@5, not recall@5 (2026-08-01 REC 2): recall@5 has
+               # been bit-identical across six runs, so quoting it next to a
+               # regression tells the reader nothing about what moved.
+               f"recall@1 {cur['recall_at_1']:.3f} · nDCG@5 {cur['ndcg_at_5']:.3f} · "
+               f"n={cur['n_queries']} · git `{(cur.get('git_sha') or 'unknown')[:8]}`\n"
                f"Check what touched the recall path: `hybrid_recall`, RRF weights, "
                f"`trust_weight()`, rerank depth. Trend: "
                f"`python3 eval/retrieval_regression.py trend`")
@@ -954,9 +1166,23 @@ def _ok_line(cur: dict, delta_pct, vals: list, ssv: int) -> str:
     d = cur.get("delta_over_no_memory")
     ctrl = (f"Δ over no-memory **{d:+.3f}** (control nDCG@10 "
             f"{cur.get('ndcg_at_10_control'):.3f})") if d is not None else "no control arm"
+    # 2026-08-01 REC 2: recall@5 is off the green line. It printed the identical
+    # float on six consecutive runs including both A/B arms, so as a daily status
+    # signal it conveyed nothing. recall@1 and nDCG@5 move on the same runs.
+    ar = cur.get("abstention_rate")
+    if ar is not None:
+        n_ab = cur.get("n_abstention") or 0
+        abstain = (f"abstention {ar:.3f} over {n_ab} probe(s) "
+                   f"@floor {cur.get('abstention_floor'):.3f} _(uncalibrated)_")
+    else:
+        abstain = "abstention **NOT MEASURED** (no unanswerable probes)"
+    nh = cur.get("n_hard") or 0
+    hard = (f"hard tier {cur['hard_ndcg_at_10']:.3f} over {nh} probe(s)"
+            if cur.get("hard_ndcg_at_10") is not None else "hard tier empty")
     return (f"✅ Nightly memory eval `{cur['tag']}` (scoreset v{ssv})\n"
-            f"nDCG@10 {cur['ndcg_at_10']:.4f}{vs} · recall@5 {cur['recall_at_5']:.3f} · "
-            f"n={cur['n_queries']}\n{ctrl} · {forget}")
+            f"nDCG@10 {cur['ndcg_at_10']:.4f}{vs} · recall@1 {cur['recall_at_1']:.3f} · "
+            f"nDCG@5 {cur['ndcg_at_5']:.3f} · n={cur['n_queries']}\n"
+            f"{ctrl} · {forget}\n{hard} · {abstain}")
 
 
 def main():
@@ -968,7 +1194,21 @@ def main():
     r.add_argument("--k", type=int, default=10, help="retrieval depth (recall@10 needs >=10)")
     r.add_argument("--compare", help="prior run tag to diff against")
     r.add_argument("--tolerance", type=float, default=0.02, help="allowed recall@5 drop vs --compare")
-    r.add_argument("--fail-under-recall5", type=float, default=None, help="hard floor for CI")
+    r.add_argument("--fail-under-recall5", type=float, default=None,
+                   help="DEPRECATED (2026-08-01 REC 2) — recall@5 is insensitive on this "
+                        "scoreset; prefer --fail-under-recall1")
+    r.add_argument("--fail-under-hard-recall1", type=float, default=None,
+                   help="fail when tier=hard recall@1 falls below this. THE gate as of "
+                        "2026-08-02 — the hard tier is distractor-based, so its failure "
+                        "mode is the sibling row at rank 1, which recall@5 cannot see")
+    r.add_argument("--fail-under-hard-ndcg5", type=float, default=None,
+                   help="fail when tier=hard nDCG@5 falls below this. Companion gate: "
+                        "gives partial credit on multi-gold multi-hop probes")
+    r.add_argument("--fail-under-recall1", type=float, default=None,
+                   help="hard floor for CI on recall@1, which actually moves")
+    r.add_argument("--abstention-floor", type=float, default=ABSTENTION_FLOOR,
+                   help="hybrid_score at or above which a returned row counts as "
+                        "'answered' for the abstention tier (migration 096; UNCALIBRATED)")
     r.add_argument("--max-fcfr", type=float, default=None,
                    help="hard ceiling on the false-carry-forward rate (migration 084). "
                         "Fails the run when superseded memories reach the top-10. "
