@@ -97,7 +97,23 @@ fi
 python3 retrieval_regression.py gate --tag "$TAG" --window 7 --drop-pct 5.0 --notify-ok
 GATE_RC=$?
 
-# 3. refresh — rewrite the ground-truth block in the memories row
+# 3. skill outcome assertion (2026-08-04 daily research, TIER 1).
+#
+# Asserts that the procedural-memory loop is actually being fed: a skill with
+# evidence of use and zero LIVE (non-backfilled) outcomes gets flagged. Migration
+# 104 seeded the counters from 39 terminal agent_episodes, which fixes cold-start
+# for the refine pass but says nothing about whether agents are self-reporting now
+# — so the gate subtracts the seeded counts before it judges.
+#
+# Exit code is DISCARDED and deliberately not folded into FINAL_RC. This is
+# telemetry about skill curation, not retrieval; a starved counter turning the
+# retrieval unit red would bury the signal that matters behind the one that
+# doesn't. It runs before the state refresh so its output lands next to the eval
+# numbers in the same journal entry.
+python3 skill_outcome_gate.py --min-evidence 3 --notify \
+  || echo "skill outcome gate failed (non-fatal)" >&2
+
+# 4. refresh — rewrite the ground-truth block in the memories row
 #    name='memory-mcp-server' (2026-08-02 daily research, REC 3).
 #
 # That row is the most-recalled state record in the corpus and it seeds every
