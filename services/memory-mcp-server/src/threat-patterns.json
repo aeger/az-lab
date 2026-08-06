@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "notes": "Canonical injection/exfil pattern set. SINGLE SOURCE OF TRUTH for the TS write-time scanner (src/index.ts scanContent) and the Python retro-scanner (injection_scan.py). Patterns are written in a dialect both JS RegExp and Python re accept — avoid lookbehind, named groups and \\p{...} classes. BUMP `version` on ANY change to `patterns`: memory-injection-rescan.timer re-scans every row whose memories.scan_pattern_version is behind this number, which is what makes pattern additions retroactive instead of forward-only.",
   "mode_meaning": {
     "block": "scanContent() rejects the write. Mirrors the hard-block arm of the scan_memory_for_injection() DB trigger (migration 076).",
@@ -10,13 +10,14 @@
     "medium": "Attack-shaped but expressible in ordinary technical writing. Read the excerpt before acting.",
     "low": "Dual-use in a homelab corpus — az-lab genuinely documents SSH keys, .env files and credential paths. Expect a high benign rate; these exist to make exfil TEXT visible, not to accuse."
   },
+  "version_log": "v2 (2026-08-05): widened the qualifier run in prompt_injection and disregard_rules from ONE token to one-or-more. Both read `\\s+(a|b|c)\\s+<noun>`, which matches 'ignore previous instructions' and 'ignore all instructions' but MISSES 'ignore all previous instructions' — the single most common phrasing of the attack — because the group consumes one qualifier and then demands the noun. Found by probing record_episode while wiring the v5.14.0 write-time gates: the canonical payload sailed through every guarded lane and the DB trigger alike. `((a|b|c)\\s+)+` fixes it without widening the match beyond stacked qualifiers ('please ignore the instructions' still does not match, by design). Migration 106 carries the same change into scan_memory_for_injection() so the two layers stay in parity.",
   "parity_notes": "Verified against pg_get_functiondef(scan_memory_for_injection) on 2026-08-02. Two intentional asymmetries, recorded here so nobody 'fixes' them by accident: (1) ssh_access (~/.ssh) is in the TS list but NOT in the DB trigger's hard block — it matches az-lab's own SSH bootstrap docs, so blocking on it at the DB layer would reject legitimate writes. (2) The five signal patterns are in the DB trigger but NOT in scanContent(). Both layers are represented below; `mode` is what keeps them apart.",
   "patterns": [
-    { "id": "prompt_injection",         "mode": "block",  "severity": "high",   "flags": "i", "re": "ignore\\s+(previous|all|above|prior)\\s+instructions" },
+    { "id": "prompt_injection",         "mode": "block",  "severity": "high",   "flags": "i", "re": "ignore\\s+((previous|all|above|prior)\\s+)+instructions" },
     { "id": "role_hijack",              "mode": "block",  "severity": "medium", "flags": "i", "re": "you\\s+are\\s+now\\s+" },
     { "id": "deception_hide",           "mode": "block",  "severity": "high",   "flags": "i", "re": "do\\s+not\\s+tell\\s+the\\s+user" },
     { "id": "sys_prompt_override",      "mode": "block",  "severity": "high",   "flags": "i", "re": "system\\s+prompt\\s+override" },
-    { "id": "disregard_rules",          "mode": "block",  "severity": "high",   "flags": "i", "re": "disregard\\s+(your|all|any)\\s+(instructions|rules|guidelines)" },
+    { "id": "disregard_rules",          "mode": "block",  "severity": "high",   "flags": "i", "re": "disregard\\s+((your|all|any)\\s+)+(instructions|rules|guidelines)" },
     { "id": "bypass_restrictions",      "mode": "block",  "severity": "high",   "flags": "i", "re": "act\\s+as\\s+(if|though)\\s+you\\s+(have\\s+no|don'?t\\s+have)\\s+(restrictions|limits|rules)" },
     { "id": "exfil_curl",               "mode": "block",  "severity": "high",   "flags": "i", "re": "curl\\s+[^\\n]*\\$\\{?\\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)" },
     { "id": "exfil_wget",               "mode": "block",  "severity": "high",   "flags": "i", "re": "wget\\s+[^\\n]*\\$\\{?\\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)" },

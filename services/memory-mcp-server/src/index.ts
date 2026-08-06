@@ -62,8 +62,13 @@ const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_KEY);
 // source of truth shared with injection_scan.py — the retro/rescan worker that
 // closes OWASP ASI06 interception point 4 (post-hoc forensic detection). Before
 // 2026-08-02 the list was inline in this file and therefore reachable only from
-// the three write paths below, which is how 785 of 955 rows came to exist having
+// the memories write path, which is how 785 of 955 rows came to exist having
 // never been scanned even once.
+//
+// Guarded write lanes (interception point 1, write-time admission): remember,
+// save_skill, set_memory_block, record_episode, remember_file, store_file.
+// Still unguarded and deliberately so for now: merge_memories and add_memory_link
+// mutate rows/edges that were themselves scanned on the way in.
 //
 // Adding a pattern? Edit the JSON and bump its `version`. The weekly
 // memory-injection-rescan.timer re-scans every row whose scan_pattern_version is
@@ -83,6 +88,28 @@ function scanContent(text: string): string | null {
     if (pattern.test(text)) return threatId;
   }
   return null;
+}
+
+// Scan several named fields at once. Returns "field:threat_id" on the first hit,
+// null when everything is clean. Undefined/empty fields are skipped so optional
+// tool arguments don't need a guard at every call site.
+function scanFields(fields: Array<[string, string | undefined | null]>): string | null {
+  for (const [field, value] of fields) {
+    if (!value) continue;
+    const threat = scanContent(value);
+    if (threat) return `${field}:${threat}`;
+  }
+  return null;
+}
+
+// MIME types whose bytes are read back as prose by an agent. Only these get their
+// body scanned — running the pattern set over a PNG or a tarball tests noise, and
+// invisible_unicode in particular would fire on arbitrary binary.
+function isAgentReadableText(mime: string): boolean {
+  return mime.startsWith("text/") ||
+    mime === "application/json" ||
+    mime === "application/xml" ||
+    mime === "application/x-yaml";
 }
 
 // ── Conflict Detection ────────────────────────────────────────────────────────
@@ -1348,11 +1375,17 @@ function startEmbeddingBackfillJob(supabase: any): void {
   setInterval(run, 30 * 60 * 1000);
 }
 
+// Single source of truth for the reported version. Keep in sync with
+// package.json. Two separate literals used to carry this — the MCP handshake and
+// GET /health — and on 2026-08-05 the /health one was missed on a version bump,
+// so the endpoint every dashboard and research run reads was a release behind.
+const SERVER_VERSION = "5.14.0";
+
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.13.0",
+    version: SERVER_VERSION,
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -2268,6 +2301,17 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const key = `files/${Date.now()}-${filename}`;
         const body = Buffer.from(content_base64, "base64");
 
+        // Security gate (OWASP ASI06). Metadata always — it is what recall_file
+        // surfaces. Body only for agent-readable text; binary payloads are stored
+        // opaquely and never re-enter an agent's context as prose.
+        const fileThreat = scanFields([
+          ["filename", filename], ["description", description],
+          ["content", isAgentReadableText(mime) ? body.toString("utf-8") : undefined],
+        ]);
+        if (fileThreat) {
+          return { content: [{ type: "text" as const, text: `Blocked: ${fileThreat.split(":")[0]} matches threat pattern '${fileThreat.split(":")[1]}'. File not stored.` }] };
+        }
+
         try {
           await r2!.send(new PutObjectCommand({
             Bucket: R2_BUCKET,
@@ -2404,6 +2448,14 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const ext = key.split(".").pop()?.toLowerCase() || "";
         const mime = content_type || (ext === "md" ? "text/markdown" : ext === "json" ? "application/json" : "text/plain");
         const body = Buffer.from(content, "utf-8");
+
+        // Security gate (OWASP ASI06). store_file payloads come back verbatim
+        // through get_file, so this lane is as readable as a memory row.
+        const storeThreat = scanFields([["key", key], ["content", content]]);
+        if (storeThreat) {
+          return { content: [{ type: "text" as const, text: `Blocked: ${storeThreat.split(":")[0]} matches threat pattern '${storeThreat.split(":")[1]}'. Nothing written to R2.` }] };
+        }
+
         try {
           await r2!.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: body, ContentType: mime }));
           return { content: [{ type: "text" as const, text: `Stored ${body.length.toLocaleString()} bytes → ${R2_BUCKET}/${key}` }] };
@@ -3027,6 +3079,19 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       episode_id: z.string().uuid().optional().describe("Existing episode ID to update (omit to create new)"),
     },
     async ({ agent, task_id, status, summary, input_summary, actions, outcome, learnings, memories_consulted, episode_id }) => {
+      // Security gate (OWASP ASI06). Episodes are embedded and readable by every
+      // agent through recall_episodes, and episodic_distill.py promotes them into
+      // long-term memory — an unscanned episode is the "write once, fire later"
+      // surface, so the gate covers the update path too, not just the insert.
+      // `actions` is serialised because it is free-form JSON supplied by the caller.
+      const episodeThreat = scanFields([
+        ["summary", summary], ["input_summary", input_summary], ["outcome", outcome],
+        ["learnings", learnings], ["actions", actions ? JSON.stringify(actions) : undefined],
+      ]);
+      if (episodeThreat) {
+        return { content: [{ type: "text" as const, text: `Blocked: ${episodeThreat.split(":")[0]} matches threat pattern '${episodeThreat.split(":")[1]}'. Episode not recorded.` }] };
+      }
+
       if (episode_id) {
         // Update existing episode
         const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
@@ -3165,7 +3230,7 @@ const haEnabled = !!(HA_URL && HA_TOKEN);
 
 app.get("/health", (_req: Request, res: Response) => {
   const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 10; // +10: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant + check_stale_context + update_read_watermark; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.13.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  res.json({ status: "ok", service: "memory-mcp-server", version: SERVER_VERSION, tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
