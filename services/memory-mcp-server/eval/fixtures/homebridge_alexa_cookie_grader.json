@@ -1,0 +1,51 @@
+{
+  "_doc": "Hand-labelled grader fixtures (2026-08-07, eval TIER 3). expect_band is the OVERALL normalised score (0..1) a trustworthy grader must land in for this answer. Bands are deliberately wide \u2014 the test is 'can the grader tell these apart', not 'does it agree to two decimals'. These are the human spot-check, made repeatable: run `python3 grader.py calibrate` before believing any scenario_eval number.",
+  "scenario_id": "homebridge_alexa_cookie",
+  "fixtures": [
+    {
+      "name": "gold_verbatim",
+      "expect_band": [
+        0.85,
+        1.0
+      ],
+      "why": "The gold reference itself. A grader that cannot score its own gold near the top is broken.",
+      "answer": "ROOT CAUSE: The Amazon authentication cookie / refresh token used by the homebridge-alexa-smarthome plugin has EXPIRED. Amazon rejects the stored token with InvalidToken (HTTP 400); the plugin logs 'Cookie invalid, Renew unsuccessful' at startup and CANNOT self-renew once in this state \u2014 so a plain restart will NOT fix it. The 'fine a few days ago, changed nothing' pattern is the signature of a periodic cookie expiry. TOPOLOGY (a common misconception): Homebridge is NOT a Home Assistant add-on. It runs as Proxmox LXC 102 at 192.168.1.159 (web UI :8581); Home Assistant is a separate VM. Access it via the hypervisor: `ssh proxmox -- pct exec 102 -- systemctl status homebridge`; log at /var/lib/homebridge/homebridge.log. FIX: (1) back up and delete the plugin's stored auth state directory /var/lib/homebridge/persist/.homebridge-alexa-smarthome; (2) systemctl restart homebridge; (3) re-login to Amazon through the plugin's cookie proxy at http://192.168.1.159:9000/ \u2014 the plugin then picks up the fresh cookie automatically. GOTCHA: the :9000 login proxy can fail with 'Proxy Server could not be initialized' if a leftover homebridge process still holds the port after restart; if :9000 isn't listening, restart once more when the port is free."
+    },
+    {
+      "name": "strong_paraphrase",
+      "expect_band": [
+        0.7,
+        1.0
+      ],
+      "why": "Correct diagnosis and fix, entirely reworded, no copied phrasing.",
+      "answer": "Diagnosis: the Amazon login cookie the homebridge-alexa-smarthome plugin keeps has aged out. Amazon now refuses it, and the plugin cannot renew it by itself once that happens, which is why bouncing the service changes nothing. That 'worked last week, touched nothing' shape is the classic periodic expiry.\n\nOne thing first: Homebridge here is not a Home Assistant add-on. It is its own Proxmox container, LXC 102, reachable at 192.168.1.159 with the UI on 8581. Home Assistant is a separate VM, so leave HA alone.\n\nSteps:\n1. Take a backup, then remove the saved credential directory at /var/lib/homebridge/persist/.homebridge-alexa-smarthome\n2. systemctl restart homebridge\n3. Open the plugin's cookie proxy on port 9000 at http://192.168.1.159:9000/ and sign in to Amazon again. The plugin picks the new cookie up on its own.\nIf port 9000 is not listening, an old process is still holding it \u2014 restart once more."
+    },
+    {
+      "name": "generic_reauth",
+      "expect_band": [
+        0.05,
+        0.5
+      ],
+      "why": "Right neighbourhood (auth), none of the specifics. Partial credit, not full, not zero.",
+      "answer": "This sounds like an authentication problem between Homebridge and Amazon. Try re-authenticating your Amazon account in the plugin settings, and restart Homebridge. You may also want to check that your network connection is fine and that the plugin is up to date. If it still fails, re-pair the devices in the Alexa app."
+    },
+    {
+      "name": "wrong_ha_chase",
+      "expect_band": [
+        0.0,
+        0.3
+      ],
+      "why": "Confidently chases Home Assistant \u2014 the exact misconception the scenario plants.",
+      "answer": "Your Homebridge runs as a Home Assistant add-on, so start there. Open the Home Assistant add-on store, find the Homebridge add-on and restart it. Then check configuration.yaml for the homebridge block and make sure the Alexa integration is enabled under the Supervisor panel. Reinstalling the add-on from scratch usually clears this up."
+    },
+    {
+      "name": "empty_refusal",
+      "expect_band": [
+        0.0,
+        0.15
+      ],
+      "why": "Says nothing useful. The floor case \u2014 a grader that gives this real points is inflating.",
+      "answer": "I'm not sure what's wrong. You should check the logs and see if anything looks off."
+    }
+  ]
+}

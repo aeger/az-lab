@@ -115,30 +115,63 @@ def _strip_reasoning(text: str) -> str:
     return text.strip()
 
 
-def llm(messages: list, model: str, max_tokens: int = 512, temperature: float = 0.2, retries: int = 3) -> str:
-    """One chat completion → assistant text (reasoning stripped)."""
+class LLMRejectedFormat(RuntimeError):
+    """The endpoint refused the requested response_format (4xx, not a transport error).
+
+    Separated from a generic failure so grader.py can negotiate DOWN — json_schema
+    to json_object to prompt-only — instead of burning all its retries re-sending a
+    constraint this endpoint is never going to accept.
+    """
+
+
+def llm(messages: list, model: str, max_tokens: int = 512, temperature: float = 0.2,
+        retries: int = 3, response_format: dict | None = None) -> str:
+    """One chat completion → assistant text (reasoning stripped).
+
+    response_format (2026-08-07, eval TIER 3) enables constrained decoding for the
+    grader. Passing it is what stops a grader model from emitting prose or echoing
+    the prompt's placeholders — the failure eval/STATUS.md has been blocked on since
+    2026-07-13. Endpoints that do not support it raise LLMRejectedFormat rather than
+    retrying, so the caller can fall back a level.
+    """
     last = ""
     for attempt in range(retries):
         try:
             if LLM_PROVIDER == "anthropic":
                 sys_msg = "".join(m["content"] for m in messages if m["role"] == "system")
                 turns = [m for m in messages if m["role"] != "system"]
+                body = {"model": model, "max_tokens": max_tokens, "temperature": temperature,
+                        "system": sys_msg, "messages": turns}
+                # Anthropic has no response_format; the portable equivalent is to
+                # prefill the assistant turn with "{" so the reply must continue a
+                # JSON object. The "{" is re-attached below since it is consumed.
+                prefilled = False
+                if response_format is not None:
+                    body["messages"] = turns + [{"role": "assistant", "content": "{"}]
+                    prefilled = True
                 r = httpx.post("https://api.anthropic.com/v1/messages",
                                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
                                         "content-type": "application/json"},
-                               json={"model": model, "max_tokens": max_tokens, "temperature": temperature,
-                                     "system": sys_msg, "messages": turns}, timeout=90)
+                               json=body, timeout=90)
                 if r.status_code == 200:
-                    return _strip_reasoning((r.json().get("content") or [{}])[0].get("text", ""))
+                    text = _strip_reasoning((r.json().get("content") or [{}])[0].get("text", ""))
+                    return ("{" + text) if prefilled and not text.lstrip().startswith("{") else text
                 last = f"{r.status_code} {r.text[:160]}"
             else:  # nim / openai-compatible
+                body = {"model": model, "max_tokens": max_tokens, "temperature": temperature,
+                        "messages": messages}
+                if response_format is not None:
+                    body["response_format"] = response_format
                 r = httpx.post(NIM_URL,
                                headers={"Authorization": f"Bearer {NIM_KEY}", "Content-Type": "application/json"},
-                               json={"model": model, "max_tokens": max_tokens, "temperature": temperature,
-                                     "messages": messages}, timeout=90)
+                               json=body, timeout=90)
                 if r.status_code == 200:
                     return _strip_reasoning(r.json()["choices"][0]["message"]["content"])
                 last = f"{r.status_code} {r.text[:160]}"
+                if response_format is not None and 400 <= r.status_code < 500:
+                    raise LLMRejectedFormat(f"{r.status_code} {r.text[:200]}")
+        except LLMRejectedFormat:
+            raise
         except Exception as e:
             last = str(e)[:160]
         time.sleep(1.5 * (attempt + 1))

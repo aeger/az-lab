@@ -25,13 +25,13 @@ Usage:
 """
 import argparse
 import json
-import re
 import sys
 import time
 from pathlib import Path
 
 # reuse the validated low-level clients + config from memory_eval
 from memory_eval import embed, sb_rpc, sb_get, llm, AGENT_MODEL, GRADER_MODEL, LLM_PROVIDER, EMBED_MODEL
+from grader import Grade, GradeStatus, grade_llm, grade_anchored, aggregate
 
 HERE = Path(__file__).resolve().parent
 
@@ -82,40 +82,28 @@ def agent_respond(scenario: dict, context: str) -> str:
                model=AGENT_MODEL, max_tokens=700, temperature=0.4)
 
 
-GRADER_SYS = (
-    "You are a strict technical grader. Score a troubleshooting ANSWER against the GOLD "
-    "reference fix using the RUBRIC. Award points only for content that matches the gold "
-    "(paraphrase ok). Generic advice that happens to overlap earns partial credit; wrong or "
-    "hallucinated specifics earn zero and hurt the safety score.\n"
-    "Output ONLY the score lines below — one per rubric dimension, then a one-line note. "
-    "No reasoning, no preamble, no other text. Exactly this format:\n"
-    "root_cause: <int>\nfix_correct: <int>\nspecificity: <int>\ntopology: <int>\n"
-    "safety: <int>\nnotes: <one short sentence>"
-)
-
-
+# Grading moved to grader.py (2026-08-07, eval TIER 3).
+#
+# What used to live here was a line-format regex parse whose else-branch was
+# `dims[k] = 0`. A grade that failed to PARSE was recorded as a grade of ZERO and
+# then averaged in, which is why eval/STATUS.md logged "scores clearly-correct
+# answers near zero" as the project's #1 blocker for three weeks. Measured on the
+# fixtures in fixtures/homebridge_alexa_cookie_grader.json, the old path parsed
+# 0/5 rubric dimensions on one fixture and 2/5 on two more — the scores it
+# reported for those were parse artifacts, not judgements.
+#
+# grade_llm() uses constrained decoding and returns a STATUS; an unparseable grade
+# is INVALID and is excluded from the mean rather than being counted as zero.
+# grade_anchored() is the LLM-free deterministic cross-check.
 def grade(scenario: dict, answer: str) -> dict:
-    rub = scenario["rubric"]
-    rubric_text = "\n".join(f"- {k} (0..{v['max']}): {v['desc']}" for k, v in rub.items())
-    user = (f"PROBLEM:\n{scenario['user_report']}\n\nGOLD REFERENCE FIX:\n{scenario['gold_reference']}\n\n"
-            f"RUBRIC:\n{rubric_text}\n\nANSWER TO GRADE:\n{answer}")
-    out = llm([{"role": "system", "content": GRADER_SYS}, {"role": "user", "content": user}],
-              model=GRADER_MODEL, max_tokens=300, temperature=0.0)
-    # Line-format parse — robust to reasoning-model preambles (take the LAST int per key).
-    dims, parsed = {}, 0
-    for k, v in rub.items():
-        matches = re.findall(rf"{re.escape(k)}\s*[:=]\s*(\d+)", out, re.I)
-        if matches:
-            dims[k] = max(0, min(int(matches[-1]), v["max"]))
-            parsed += 1
-        else:
-            dims[k] = 0
-    nm = re.search(r"notes\s*[:=]\s*(.+)", out, re.I)
-    notes = (nm.group(1).strip()[:160] if nm else "")
-    maxtot = sum(v["max"] for v in rub.values())
-    got = sum(dims.values())
-    return {"dims": dims, "score": round(got / maxtot, 3), "raw_total": got, "max_total": maxtot,
-            "notes": notes, "parsed_dims": parsed}
+    """Back-compat shim: same dict shape the rest of this file already consumes."""
+    g = grade_llm(scenario, answer, llm, GRADER_MODEL)
+    a = grade_anchored(scenario, answer)
+    d = g.to_json()
+    d["parsed_dims"] = len(g.dims) if g.valid else 0
+    d["anchored_score"] = a.score if a.valid else None
+    d["anchored_dims"] = a.dims if a.valid else None
+    return d
 
 
 def cmd_run(args):
@@ -129,7 +117,8 @@ def cmd_run(args):
     print(f"Scenario: {scenario['title']}\nConditions: {conditions} × {args.reps} reps "
           f"(agent={AGENT_MODEL}, provider={LLM_PROVIDER})\n")
 
-    agg = {c: {"scores": [], "dims": {k: [] for k in scenario["rubric"]}, "recall": None, "names": []}
+    agg = {c: {"scores": [], "anchored": [], "dims": {k: [] for k in scenario["rubric"]},
+               "recall": None, "names": [], "grades": []}
            for c in conditions}
 
     for cond in conditions:
@@ -141,16 +130,38 @@ def cmd_run(args):
                                or ("homebridge" in n.lower() and "alexa" in n.lower()) for n in names)
                 agg[cond]["recall"] = bool(agg[cond]["recall"]) or gold_hit
             ans = agent_respond(scenario, ctx)
-            g = grade(scenario, ans)
-            agg[cond]["scores"].append(g["score"])
-            for k in scenario["rubric"]:
-                agg[cond]["dims"][k].append(g["dims"][k])
-            samples.setdefault(cond, {"answer": ans, "grade": g, "ctx_chars": len(ctx)})
-            rows_f.write(json.dumps({"condition": cond, "rep": rep, "score": g["score"],
-                                     "dims": g["dims"], "notes": g["notes"], "ctx_chars": len(ctx),
+
+            g = grade_llm(scenario, ans, llm, GRADER_MODEL)
+            a = grade_anchored(scenario, ans)
+            agg[cond]["grades"].append(g)
+            if a.valid:
+                agg[cond]["anchored"].append(a.score)
+
+            # An INVALID grade contributes nothing. This is the fix: it used to
+            # contribute 0.0, which is a claim about the ANSWER when it is really
+            # a fact about the GRADER.
+            if g.valid:
+                agg[cond]["scores"].append(g.score)
+                for k in scenario["rubric"]:
+                    agg[cond]["dims"][k].append(g.dims[k])
+
+            samples.setdefault(cond, {"answer": ans, "grade": g.to_json(),
+                                      "anchored": a.to_json(), "ctx_chars": len(ctx)})
+            rows_f.write(json.dumps({"condition": cond, "rep": rep,
+                                     "score": g.score if g.valid else None,
+                                     "status": g.status.value, "detail": g.detail,
+                                     "anchored_score": a.score if a.valid else None,
+                                     "dims": g.dims if g.valid else None,
+                                     "anchored_dims": a.dims if a.valid else None,
+                                     "notes": g.notes, "ctx_chars": len(ctx),
                                      "retrieved": names if cond == "memory" else None}) + "\n")
-            print(f"  {cond:7} rep{rep+1}: {g['score']:.2f}  "
-                  + " ".join(f"{k}={g['dims'][k]}" for k in scenario['rubric']) + f"  — {g['notes'][:70]}")
+            if g.valid:
+                print(f"  {cond:7} rep{rep+1}: llm {g.score:.2f}  anchored {a.score:.2f}  "
+                      + " ".join(f"{k}={g.dims[k]}" for k in scenario['rubric'])
+                      + f"  — {g.notes[:60]}")
+            else:
+                print(f"  {cond:7} rep{rep+1}: llm INVALID ({g.status.value})  "
+                      f"anchored {a.score:.2f}  — {g.detail[:70]}")
     rows_f.close()
 
     report = render(scenario, conditions, agg, samples, args)
@@ -170,19 +181,50 @@ def render(scenario, conditions, agg, samples, args):
     L.append(f"- agent/grader: `{AGENT_MODEL}` (provider `{LLM_PROVIDER}`) · retrieval: `{EMBED_MODEL}`+`hybrid_recall` · reps={args.reps}, k={args.k}")
     L.append(f"- grading vs GOLD reference across {len(rub)} rubric dims (max {sum(v['max'] for v in rub.values())} pts)")
     L.append("")
-    header = "| condition | overall | " + " | ".join(rub.keys()) + " | recall |"
+    header = ("| condition | overall (llm) | anchored | graded | "
+              + " | ".join(rub.keys()) + " | recall |")
     L.append(header)
-    L.append("|" + "---|" * (len(rub) + 3))
+    L.append("|" + "---|" * (len(rub) + 5))
+    voids = []
     for c in conditions:
         dims = " | ".join(f"{_mean(agg[c]['dims'][k]):.1f}/{rub[k]['max']}" for k in rub)
         rec = "—" if agg[c]["recall"] is None else ("✓" if agg[c]["recall"] else "✗")
-        L.append(f"| {c} | **{_mean(agg[c]['scores']):.2f}** | {dims} | {rec} |")
+        stats = aggregate(agg[c]["grades"])
+        if stats["void"]:
+            voids.append((c, stats["void_reason"]))
+        overall = "VOID" if stats["void"] else f"**{stats['mean_score']:.2f}**"
+        anch = f"{_mean(agg[c]['anchored']):.2f}" if agg[c]["anchored"] else "—"
+        L.append(f"| {c} | {overall} | {anch} | {stats['n_valid']}/{stats['n']} | {dims} | {rec} |")
     L.append("")
-    base = _mean(agg[conditions[0]]["scores"]) if conditions else 0
-    L.append("## Read")
+    L.append("- **graded** = grades that actually parsed. An unparseable grade is excluded, "
+             "never counted as 0 — see grader.py.")
+    if voids:
+        L.append("")
+        L.append("> **RUN VOID** for: " + "; ".join(f"`{c}` ({why})" for c, why in voids))
+        L.append("> The grader did not return usable judgements for these conditions. "
+                 "Read the `anchored` column, which needs no LLM, and re-run "
+                 "`python3 grader.py calibrate` before trusting anything here.")
+    L.append("")
+    # Δ is computed on the ANCHORED score, not the LLM score. It is deterministic
+    # and needs no model, so a conclusion drawn from it survives the grader model
+    # being swapped, rate-limited, or having a bad day — which the headline
+    # comparison in this eval has to.
+    def _anch(c):
+        return _mean(agg[c]["anchored"]) if agg[c]["anchored"] else None
+
+    base = _anch(conditions[0]) if conditions else None
+    L.append("## Read (anchored — deterministic, no LLM)")
     for c in conditions:
-        L.append(f"- **{c}: {_mean(agg[c]['scores']):.2f}**"
-                 + (f"  (Δ vs {conditions[0]} = {_mean(agg[c]['scores'])-base:+.2f})" if c != conditions[0] else "  (baseline)"))
+        v = _anch(c)
+        if v is None:
+            L.append(f"- **{c}: no anchored score** (scenario has no `anchors` block)")
+            continue
+        delta = ("  (baseline)" if c == conditions[0] or base is None
+                 else f"  (Δ vs {conditions[0]} = {v - base:+.2f})")
+        llm_stats = aggregate(agg[c]["grades"])
+        llm_note = ("llm VOID" if llm_stats["void"]
+                    else f"llm {llm_stats['mean_score']:.2f} on {llm_stats['n_valid']}/{llm_stats['n']}")
+        L.append(f"- **{c}: {v:.2f}**{delta}  ·  {llm_note}")
     if "memory" in agg and agg["memory"]["names"]:
         L.append(f"- memory retrieved: {', '.join(agg['memory']['names'][:6])}")
     L.append("")

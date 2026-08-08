@@ -1,0 +1,35 @@
+# Standalone eval arm — NOT part of the production memory-mcp stack.
+#
+# This exists to be measured, not to serve traffic. Promotion into
+# services/memory-mcp-server/compose.yml (replacing az-tei-reranker) is a
+# separate, deliberate step that happens only if rerank_ab.py says INT8 held
+# nDCG@5 >= 0.73 while getting p50 under 2000ms.
+#
+# NOTE: no `internal: true` network. Quantization downloads the model from
+# HuggingFace on first start, and an internal network turns that into a silent
+# hang rather than an error.
+name: az-rerank-onnx
+
+services:
+  rerank-onnx:
+    image: az-rerank-onnx:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: az-rerank-onnx
+    restart: "no"
+    ports:
+      - "127.0.0.1:8088:8080"
+    environment:
+      - MODEL_DIR=/models/int8
+      - MAX_INPUT_LENGTH=512
+      - MAX_CLIENT_BATCH_SIZE=32
+      # Match what the incumbent az-tei-reranker actually gets on this 4-core
+      # host. Handing the INT8 arm more threads than the fp32 arm would make
+      # the A/B measure the thread budget instead of the quantization.
+      - ORT_THREADS=4
+    volumes:
+      - rerank-onnx-models:/models
+
+volumes:
+  rerank-onnx-models:

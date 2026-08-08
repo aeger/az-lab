@@ -1379,7 +1379,7 @@ function startEmbeddingBackfillJob(supabase: any): void {
 // package.json. Two separate literals used to carry this — the MCP handshake and
 // GET /health — and on 2026-08-05 the /health one was missed on a version bump,
 // so the endpoint every dashboard and research run reads was a release behind.
-const SERVER_VERSION = "5.14.0";
+const SERVER_VERSION = "5.15.0";
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
@@ -1768,8 +1768,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       agent_scope: z.string().optional().describe("Filter by agent_scope array: pass agent name (e.g. 'wren') to see only memories scoped to 'shared' or this agent. Requires migration 012."),
       min_confidence: z.number().min(0).max(1).optional().describe("Exclude memories with confidence below this threshold (default 0.0 = return all). Use 0.5 to hide speculative/unverified memories."),
       memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Filter by memory class. episodic=event log, semantic=durable facts (default for most), procedural=skills/how-to, working=short-term context."),
+      as_of: z.string().datetime({ offset: true }).optional().describe("BI-TEMPORAL time travel (migration 109). ISO-8601 timestamp — returns what was TRUE AS OF that moment (valid_from <= as_of < valid_to), re-admitting facts that have since been superseded. Omit for normal recall, which already filters to 'true now'. This is VALID time (when the fact held in the world), NOT ingestion time (created_at) — use it to answer 'what did we believe on the 3rd', not 'what did we write on the 3rd'."),
     },
-    async ({ query, topic_hint, type, tags, limit, semantic, recall_mode, agent_id, agent_scope, min_confidence, memory_class }) => {
+    async ({ query, topic_hint, type, tags, limit, semantic, recall_mode, agent_id, agent_scope, min_confidence, memory_class, as_of }) => {
       // Adaptive router (RECALL_ROUTER=1). Only consulted when the caller expressed
       // NO preference — an explicit recall_mode, or the legacy `semantic` boolean,
       // always wins. A caller that asked for a mode gets that mode.
@@ -1819,6 +1820,11 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (agent_scope) rpcParams.p_agent_scope = agent_scope;
         if (min_confidence && min_confidence > 0) rpcParams.p_min_confidence = min_confidence;
         if (memory_class) rpcParams.p_memory_class = memory_class;
+        // Bi-temporal read (migration 109). Only sent when the caller actually asked
+        // for a point in time: hybrid_recall's own default is now(), so omitting the
+        // key and passing now() are the same query, and omitting it keeps the call
+        // compatible with the 11-arg function if a rollback ever puts it back.
+        if (as_of) rpcParams.p_as_of = as_of;
         // Active Retrieval (MIRIX): topic_hint is the highest-weight RRF lane.
         // Semantic-only mode skips the hint so results stay purely embedding-driven.
         if (wantsLexical && topic_hint && topic_hint.trim().length > 0) rpcParams.p_topic_hint = topic_hint.trim();
@@ -2018,6 +2024,17 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (tags && tags.length > 0) q = q.overlaps("tags", tags);
       if (query) q = q.or(`name.ilike.%${query}%,description.ilike.%${query}%,content.ilike.%${query}%`);
       if (memory_class) q = q.eq("memory_class", memory_class);
+      // Bi-temporal filter (migration 109), mirroring hybrid_recall's default so the
+      // fallback cannot serve a fact the primary path would withhold. Unconditional
+      // for the same reason it is unconditional in the RPC: "no longer true" is not
+      // a filter the caller should have to remember to ask for.
+      // NOTE: this path has never filtered is_active either — a pre-existing gap,
+      // left alone here because relaxing/tightening it is a behaviour change the
+      // retrieval gate does not cover. Worth its own pass.
+      {
+        const validAt = as_of ?? new Date().toISOString();
+        q = q.lte("valid_from", validAt).or(`valid_to.is.null,valid_to.gt.${validAt}`);
+      }
       // Agent visibility filter: when agent_id set, return shared + own private; else return shared only (or all if visibility column not yet added)
       if (agent_id) q = q.or(`visibility.eq.shared,and(visibility.eq.private,agent_id.eq.${agent_id})`);
 
