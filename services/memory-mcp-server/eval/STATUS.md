@@ -57,6 +57,8 @@ measurement arm of the "make Claude an active participant in its memory" thread.
 | 2026-07-13 | memory_eval | v1 | none 0.00 · semantic 0.60 · hybrid 0.20 · oracle 0.60 (N=5) |
 | 2026-07-13 | scenario_eval | hb1/hb2 | grader unreliable → scores void; retrieval missed gold |
 | 2026-07-24 | retrieval_regression | baseline-ndcg-20260724 | N=56 · recall@5 0.500 · recall@10 0.643 · MRR 0.327 · **nDCG@10 0.374** |
+| 2026-08-07 | rerank_ab | rerank_ab_int8_20260807 | N=97 · fp32 nDCG@5 0.7470 / recall@5 0.8351 / MRR 0.7650 / p50 4587ms · int8 nDCG@5 0.7370 / recall@5 0.8454 / MRR 0.7486 / p50 1517ms → **-1.3% rel nDCG@5 for 3.0x lower p50, better recall@5** |
+| 2026-08-08 | retrieval_regression | int8-verify-20260808 | post-cutover gate on the live path (`RERANKER_URL` → `rerank-onnx`, INT8): N=97 · **nDCG@10 0.6769** vs trailing-7 median 0.6766 (delta +0.0%, floor 0.6427) · FCFR 0.000 → **PASS, no ranking regression** |
 
 ## 2026-07-24 update (research rec 2 — close the retrieval-gate gap)
 - **nDCG@5/@10 added** to `retrieval_regression.py` (migration 072). recall@k is blind to

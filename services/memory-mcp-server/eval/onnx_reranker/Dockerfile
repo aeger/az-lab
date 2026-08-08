@@ -20,7 +20,7 @@ RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 \
       numpy
 
 WORKDIR /app
-COPY quantize.py serve.py /app/
+COPY quantize.py serve.py healthcheck.py /app/
 
 # Quantization is a BUILD-TIME-optional / RUN-TIME-idempotent step: the artifact
 # lands in the /models volume, so the first `up` pays for it once and every
