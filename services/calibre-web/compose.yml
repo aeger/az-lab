@@ -20,6 +20,13 @@ services:
       - /mnt/calibre/ingest:/cwa-book-ingest
       - /mnt/calibre/library:/calibre-library
       - /home/almty1/calibre-metadata/metadata.db:/calibre-library/metadata.db
+      # Durable disable of the CWA auto-ingest watcher. Jeff wants auto-ingest
+      # permanently OFF — it races manual imports and creates phantom library
+      # records (calibre-library-recovery-20260623 root cause #4). `s6-svc -d`
+      # only lives in /run and was silently lost on every recreate, so the run
+      # script itself is replaced with a no-op stub that marks the service down.
+      # To re-enable auto-ingest: comment out this line and recreate.
+      - /home/almty1/azlab/services/calibre-web/s6-overrides/cwa-ingest-service.run:/etc/s6-overlay/s6-rc.d/cwa-ingest-service/run:ro
     networks:
       - proxy
     labels:
