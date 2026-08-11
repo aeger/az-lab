@@ -194,10 +194,39 @@ def render_block(health, gt, disk_head):
     return "\n".join(lines)
 
 
+def render_description(health, gt):
+    """The one-line description recall actually surfaces.
+
+    WHY THIS IS GENERATED (2026-08-11): the description was hand-maintained while
+    the content block was regenerated nightly, so the two drifted apart — the row
+    advertised "migration head 093 ... scoreset v2 ... Recall@5 0.8354" in its
+    description while its own body said head 103 / scoreset v4 / 0.8247. recall()
+    ranks and displays the DESCRIPTION, so the stale half was the half every agent
+    read. Deriving both from the same ground-truth call makes that class of drift
+    structurally impossible rather than a thing to remember to update."""
+    run = gt.get("latest_eval_run") or {}
+    corpus = gt["corpus"]
+
+    def num(key, fmt="{:.4f}"):
+        v = run.get(key)
+        return fmt.format(v) if isinstance(v, (int, float)) else "n/a"
+
+    return (
+        f"memory-mcp-server LIVE STATE, regenerated nightly by refresh_state_memory.py "
+        f"— v{health.get('version', '?')} · {health.get('tools', '?')} tools · "
+        f"migration head {gt['migration_head_applied']} · "
+        f"corpus {corpus['total']} ({corpus['active']} active) · "
+        f"eval {run.get('tag', 'n/a')} scoreset v{run.get('scoreset_version', '?')} "
+        f"recall@5 {num('recall_at_5')} nDCG@10 {num('ndcg_at_10')} "
+        f"hard recall@5 {num('hard_recall_at_5')}. "
+        f"Do not hand-edit the description or the marked block — both are overwritten."
+    )[:1000]
+
+
 def fetch_memory(client):
     r = client.get(
         f"{SUPABASE_URL}/rest/v1/memories",
-        params={"select": "id,name,content", "name": f"eq.{STATE_MEMORY_NAME}",
+        params={"select": "id,name,content,description", "name": f"eq.{STATE_MEMORY_NAME}",
                 "is_active": "is.true", "limit": "1"},
         headers=sb_headers(),
         timeout=30,
@@ -205,6 +234,26 @@ def fetch_memory(client):
     r.raise_for_status()
     rows = r.json()
     return rows[0] if rows else None
+
+
+# Prose to seed a RECREATED row. Deliberately minimal: the generated block carries
+# the numbers, and inventing history here would be worse than admitting the gap.
+RECREATE_SEED = """
+**This record was recreated automatically after the row went missing.**
+The previous body (28.5 KB of hand-authored gotchas and corrections accumulated
+through 2026-07-31) was deleted on 2026-08-04 17:13 UTC by a `claude-code`
+caller, with no superseding record created. It is not lost — `memory_log` holds
+the full pre-image:
+
+    SELECT old_content FROM memory_log
+    WHERE action='delete' AND old_content ILIKE '%AUTO-GENERATED GROUND TRUTH%'
+    ORDER BY created_at DESC LIMIT 1;
+
+Recover any specific gotcha from there rather than re-deriving it. Everything
+above the marker is regenerated nightly and is current; the prose below it is
+whatever a human has since re-added.
+""".strip()
+
 
 
 def splice(content, block):
@@ -230,10 +279,39 @@ def main():
         health = service_health(client)
         block = render_block(health, gt, disk_migration_head())
 
+        description = render_description(health, gt)
+
         mem = fetch_memory(client)
         if not mem:
-            log.error("no active memory named %r — nothing to refresh", STATE_MEMORY_NAME)
-            return 1
+            # SELF-HEAL (2026-08-11). This used to log an error and return 1, and
+            # nightly_eval.sh swallowed that as "state-memory refresh failed
+            # (non-fatal)". When the row was deleted on 2026-08-04 the job then
+            # failed silently EVERY night for a week while the corpus carried no
+            # state record at all — the exact absence nothing was watching for.
+            # A missing row is now repaired rather than reported.
+            log.warning("no active memory named %r — RECREATING it", STATE_MEMORY_NAME)
+            if args.dry_run:
+                log.info("DRY RUN — would create %r with:\n%s", STATE_MEMORY_NAME, block)
+                return 0
+            r = client.post(
+                f"{SUPABASE_URL}/rest/v1/memories",
+                json={
+                    "name": STATE_MEMORY_NAME,
+                    "type": "project",
+                    "description": description,
+                    "content": block + "\n\n" + RECREATE_SEED,
+                    "embedding": None,   # backfill job re-embeds
+                    "importance_score": 0.9,
+                    "confidence": 0.9,
+                    "source": "claude-code",
+                },
+                headers=sb_headers({"Prefer": "return=minimal"}),
+                timeout=60,
+            )
+            r.raise_for_status()
+            log.warning("recreated %r — prior body recoverable from memory_log "
+                        "(action='delete')", STATE_MEMORY_NAME)
+            return 0
 
         new_content = splice(mem["content"], block)
 
@@ -243,12 +321,16 @@ def main():
         def strip_ts(s):
             return "\n".join(l for l in s.splitlines() if not l.startswith("**Generated:**"))
 
-        if strip_ts(new_content) == strip_ts(mem["content"]):
+        # The description is compared too — it is now generated, so a run where
+        # only the metrics in the description moved must still write.
+        if (strip_ts(new_content) == strip_ts(mem["content"])
+                and description == (mem.get("description") or "")):
             log.info("state memory already current — no write")
             return 0
 
         if args.dry_run:
-            log.info("DRY RUN — would write:\n%s", block)
+            log.info("DRY RUN — would write description:\n%s\n\nand block:\n%s",
+                     description, block)
             return 0
 
         r = client.patch(
@@ -256,7 +338,9 @@ def main():
             params={"id": f"eq.{mem['id']}"},
             # embedding=NULL so startEmbeddingBackfillJob re-embeds; a direct SQL
             # write bypasses remember()'s re-embed and would leave a stale vector.
-            json={"content": new_content, "embedding": None},
+            # description travels WITH content: recall surfaces the description, so
+            # updating one without the other is what produced the 093-vs-103 drift.
+            json={"content": new_content, "description": description, "embedding": None},
             headers=sb_headers({"Prefer": "return=minimal"}),
             timeout=60,
         )

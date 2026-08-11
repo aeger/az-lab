@@ -255,10 +255,38 @@ def control_ranking(k: int) -> list:
     return [r["id"] for r in rows]
 
 
+# ── Embedding A/B arm (REC 1, 2026-08-03 research; migration 113) ────────────
+# Setting RECALL_FN=hybrid_recall_v2 + EMBED_MODEL=<candidate> scores a candidate
+# embedding model against the SAME probes, gold sets, scoring code and reranker
+# as the live arm — the only thing that moves is which column the vector lane
+# reads and which model produced it. Defaults are the live path, so an unset
+# environment reproduces the nightly run exactly.
+RECALL_FN = os.environ.get("RECALL_FN", "hybrid_recall")
+# Matryoshka truncation width for the candidate arm. Must match the width the
+# shadow column was backfilled at, or every query is compared against vectors of
+# a different dimensionality and the arm scores as noise.
+EMBED_TRUNCATE_DIMS = int(os.environ.get("EMBED_TRUNCATE_DIMS", "0") or 0)
+
+
+def _fit_dims(vec: list) -> list:
+    """MRL-truncate + L2-renormalise, mirroring embed_ab_backfill.py exactly.
+
+    Query and document vectors MUST go through identical post-processing. A
+    truncated-but-un-renormalised query against renormalised documents is still
+    rank-equivalent under cosine, but the match_threshold cutoff is applied to a
+    raw similarity — so an asymmetry here silently changes which rows clear
+    p_match_threshold, and that reads as model quality."""
+    if not EMBED_TRUNCATE_DIMS or len(vec) <= EMBED_TRUNCATE_DIMS:
+        return vec
+    out = vec[:EMBED_TRUNCATE_DIMS]
+    norm = math.sqrt(sum(x * x for x in out))
+    return [x / norm for x in out] if norm else out
+
+
 def retrieve(question: str, topic_hint: str, k: int) -> list:
     """The REAL recall path, same call the MCP recall tool makes."""
-    emb = embed(question)
-    res = sb_rpc("hybrid_recall", {
+    emb = _fit_dims(embed(question))
+    res = sb_rpc(RECALL_FN, {
         "p_query_text": question,
         "p_query_embedding": json.dumps(emb),
         "p_match_threshold": 0.3,
@@ -747,8 +775,8 @@ TEI_MAX_BATCH = int(os.environ.get("TEI_MAX_BATCH", "32"))  # TEI /info max_clie
 def retrieve_rows(question: str, topic_hint: str, k: int) -> list:
     """Same call as retrieve(), but keep the FULL rows — the rerank text needs
     name/type/description/content, all of which hybrid_recall already returns."""
-    emb = embed(question)
-    return sb_rpc("hybrid_recall", {
+    emb = _fit_dims(embed(question))
+    return sb_rpc(RECALL_FN, {
         "p_query_text": question,
         "p_query_embedding": json.dumps(emb),
         "p_match_threshold": 0.3,
@@ -938,7 +966,7 @@ def retrieve_routed(question: str, topic_hint: str, k: int, route: dict) -> list
     wants_vector = route["mode"] != "lexical"
     wants_lexical = route["mode"] != "semantic"
 
-    emb = embed(question) if wants_vector else None
+    emb = _fit_dims(embed(question)) if wants_vector else None
     body = {
         "p_query_text": question if wants_lexical else " ",
         "p_query_embedding": json.dumps(emb) if emb else None,
@@ -947,7 +975,7 @@ def retrieve_routed(question: str, topic_hint: str, k: int, route: dict) -> list
     }
     if wants_lexical and topic_hint:
         body["p_topic_hint"] = topic_hint
-    rows = sb_rpc("hybrid_recall", body)
+    rows = sb_rpc(RECALL_FN, body)
 
     if route["rerank"] and len(rows) > 1:
         pool = rows[:20]

@@ -444,8 +444,207 @@ def verify_supabase_auth() -> None:
         raise RuntimeError(f"Supabase startup probe failed: HTTP {e.code}") from e
 
 
+# ── Context preflight gate (REC 3, 2026-08-03 research; arXiv:2607.14275) ─────
+#
+# WHY: the runner used to claim the top of the queue unconditionally and only
+# discover missing context mid-execution, by which point it had already burned a
+# model call, an episode, a Discord ping — and, in the worst case, taken an
+# irreversible action. Two logged incidents drive this:
+#
+#   1. The 2026-07-28 ntfy incident. A task whose PURPOSE was to obtain Jeff's
+#      decision was filed with an agent target. The runner claimed it and
+#      deployed 31 seconds later. The gate lived only in the prose of the
+#      description, where nothing enforced it.
+#      (see memory: human-decision-gates-must-not-enter-the-agent-queue)
+#   2. The 2026-08-01 pending_jeff_action silent drop — a task parked in a
+#      human-gated status with an empty result and no action_required, which
+#      then sat unworked because nothing distinguished "waiting on Jeff" from
+#      "mis-filed and forgotten".
+#
+# The gate is deliberately CONSERVATIVE. Blocking a good task is a worse failure
+# than running a task with thin context: a blocked task needs a human to notice
+# it, and the whole point of the queue is to not need that. So every check fires
+# only on STRUCTURED, unambiguous signals — declared context keys and explicit
+# markers — never on loose keyword matching over free text.
+
+_HUMAN_GATE_MARKERS = (
+    "decision needed",
+    "decision required",
+    "jeff to decide",
+    "needs jeff's decision",
+    "awaiting jeff",
+)
+
+# Hosts the lab actually has a route to. A task naming a host outside this set is
+# not necessarily wrong, so an unknown host is NOT a block on its own — it is only
+# checked when the task declares it structurally in context.hosts.
+_KNOWN_HOSTS = {
+    "svc-podman-01", "192.168.1.181",
+    "proxmox", "ms-01", "192.168.1.182",
+    "ha", "home-assistant", "192.168.1.161",
+    "nemoclaw", "nemoclaw-01", "192.168.1.183",
+    "game", "192.168.30.10",
+    "homebridge", "192.168.1.159",
+    "rb5009", "192.168.1.1",
+    "crs309", "192.168.99.248",
+    "adguard", "192.168.99.2",
+    "localhost", "127.0.0.1",
+}
+
+_WIKILINK_RE = re.compile(r"\[\[([^\]|]+?)\]\]")
+
+
+def _memory_exists(name: str) -> bool:
+    """True if an active memory with this exact name is in the store."""
+    try:
+        rows = api_request("GET", "memories", params={
+            "select": "id",
+            "name": f"eq.{name}",
+            "is_active": "not.is.false",
+            "limit": "1",
+        })
+        return bool(rows)
+    except Exception as e:
+        # A store lookup that ERRORS must not be read as "memory missing" — that
+        # would turn a Supabase blip into a queue-wide block storm. Fail open.
+        print(f"preflight: memory lookup failed for {name!r} ({e}) — treating as present",
+              file=sys.stderr)
+        return True
+
+
+def preflight_task(task: dict) -> list:
+    """Return a list of reasons the task is NOT ready to be claimed. Empty = go.
+
+    Checks, in the order the rec specifies:
+      1. the task has a real agent target and is not a human decision gate
+      2. declared memory references resolve against the store
+      3. declared hosts/paths exist
+    """
+    reasons = []
+    ctx = task.get("context") or {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+    title = (task.get("title") or "")
+    desc = (task.get("description") or "")
+
+    # 1. HUMAN DECISION GATE ---------------------------------------------------
+    # The queue's own convention (see the feedback memory) is that a gate carries
+    # its options in context.action_required. A NON-EMPTY action_required means
+    # the deliverable is Jeff's answer, which is never the runner's to produce.
+    # An explicitly null/absent action_required is the signal that a task parked
+    # in a human status was mis-filed and is really agent work — exactly the
+    # 2026-08-01 case — so it must NOT trip this check.
+    action_required = ctx.get("action_required")
+    if action_required not in (None, "", [], {}):
+        reasons.append(
+            "context.action_required is set — this task's deliverable is Jeff's "
+            "decision, not agent work. Re-file with target='jeff'."
+        )
+
+    # Explicit marker in the title only. Deliberately not scanning the body: a
+    # description that merely quotes an old decision would block a valid task.
+    low_title = title.lower()
+    if any(mark in low_title for mark in _HUMAN_GATE_MARKERS):
+        reasons.append(
+            f"title carries a human-decision marker ({title!r}) — a gate task must "
+            "be filed target='jeff', not run by the agent."
+        )
+
+    if task.get("target") == "jeff":
+        reasons.append("target='jeff' — not agent-runnable.")
+
+    # 2. MEMORY REFERENCES -----------------------------------------------------
+    # context.research_memory is the documented key; memory_refs/referenced_memories
+    # are the other spellings in use. [[wikilinks]] in the description are
+    # unambiguous references too, so they are resolved as well.
+    refs = []
+    for key in ("research_memory", "sibling_research_memory"):
+        v = ctx.get(key)
+        if isinstance(v, str) and v.strip():
+            refs.append(v.strip())
+    for key in ("memory_refs", "referenced_memories", "memories"):
+        v = ctx.get(key)
+        if isinstance(v, list):
+            refs.extend(str(x).strip() for x in v if str(x).strip())
+    refs.extend(m.strip() for m in _WIKILINK_RE.findall(desc) if m.strip())
+
+    missing = [r for r in dict.fromkeys(refs) if not _memory_exists(r)]
+    if missing:
+        reasons.append(
+            "referenced memories do not resolve in the store: "
+            + ", ".join(repr(m) for m in missing[:5])
+            + (f" (+{len(missing) - 5} more)" if len(missing) > 5 else "")
+        )
+
+    # 3. DECLARED HOSTS AND PATHS ---------------------------------------------
+    hosts = ctx.get("hosts") or ctx.get("host")
+    if isinstance(hosts, str):
+        hosts = [hosts]
+    if isinstance(hosts, list):
+        unknown = [h for h in (str(x).strip() for x in hosts)
+                   if h and h.lower() not in _KNOWN_HOSTS]
+        if unknown:
+            reasons.append(
+                "context declares unknown host(s): " + ", ".join(repr(h) for h in unknown[:5])
+            )
+
+    paths = ctx.get("paths") or ctx.get("path")
+    if isinstance(paths, str):
+        paths = [paths]
+    if isinstance(paths, list):
+        # Only absolute local paths are checkable here; a relative path or a path
+        # on another host would produce a meaningless miss.
+        gone = [p for p in (str(x).strip() for x in paths)
+                if p.startswith("/") and not os.path.exists(os.path.expanduser(p))]
+        if gone:
+            reasons.append(
+                "context declares path(s) that do not exist on this host: "
+                + ", ".join(repr(p) for p in gone[:5])
+            )
+
+    return reasons
+
+
+def block_task(task: dict, current_status: str, reasons: list) -> None:
+    """Park a task in `blocked` with a reason instead of claiming and failing.
+
+    Uses the same status-guarded PATCH the claim path uses, so a task another
+    runner has already moved is left alone."""
+    task_id = task["id"]
+    reason_text = "Context preflight failed:\n" + "\n".join(f"  - {r}" for r in reasons)
+    try:
+        api_request(
+            "PATCH",
+            f"task_queue?id=eq.{task_id}&status=eq.{current_status}",
+            data={
+                "status": "blocked",
+                "blocked_reason": reason_text,
+                "failure_mode": "dependency",
+            },
+        )
+    except Exception as e:
+        print(f"preflight: could not block {task_id}: {e}", file=sys.stderr)
+        return
+
+    print(f"Task {task_id} BLOCKED by preflight:\n{reason_text}")
+    log_activity("status", f"Preflight blocked: {task.get('title')}\n{reason_text}",
+                 task_id=task_id)
+    discord_notify(
+        f"⛔ Preflight blocked: {task.get('title')}\n{reason_text}"
+    )
+
+
+# How many queue heads to examine before giving up this cycle. Bounded so a run
+# of blocked tasks cannot turn one poll into a long serial sweep.
+_PREFLIGHT_SCAN_LIMIT = 5
+
+
 def claim_next_task():
-    """Fetch the highest-priority pending or delegated task and claim it atomically."""
+    """Fetch the highest-priority runnable task, preflight it, and claim atomically.
+
+    Tasks that fail preflight are moved to `blocked` and the scan continues to the
+    next candidate, so one mis-filed task at the head of the queue does not stall
+    everything behind it."""
     # Pick up 'ready'/'pending' (new/legacy) and 'delegated' tasks targeting claude-code or wren
     tasks = api_request(
         "GET",
@@ -454,32 +653,39 @@ def claim_next_task():
             "status": "in.(ready,pending,delegated)",
             "target": "in.(claude-code,wren)",
             "order": "priority.asc,created_at.asc",
-            "limit": "1",
-            "select": "id,title,description,context,priority,tags,status,goal_id,attempt_count,error",
+            "limit": str(_PREFLIGHT_SCAN_LIMIT),
+            "select": "id,title,description,context,priority,tags,status,target,goal_id,attempt_count,error",
         },
     )
     if not tasks:
         return None
 
-    task = tasks[0]
-    task_id = task["id"]
-    current_status = task.get("status", "pending")
+    for task in tasks:
+        task_id = task["id"]
+        current_status = task.get("status", "pending")
 
-    # Claim atomically — only succeeds if still in expected status
-    claimed = api_request(
-        "PATCH",
-        f"task_queue?id=eq.{task_id}&status=eq.{current_status}",
-        data={
-            "status": "claimed",
-            "claimed_by": HOSTNAME,
-            "claimed_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-    if not claimed:
-        print(f"Task {task_id} already claimed by another instance, skipping.")
-        return None
+        reasons = preflight_task(task)
+        if reasons:
+            block_task(task, current_status, reasons)
+            continue
 
-    return task
+        # Claim atomically — only succeeds if still in expected status
+        claimed = api_request(
+            "PATCH",
+            f"task_queue?id=eq.{task_id}&status=eq.{current_status}",
+            data={
+                "status": "claimed",
+                "claimed_by": HOSTNAME,
+                "claimed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        if not claimed:
+            print(f"Task {task_id} already claimed by another instance, skipping.")
+            continue
+
+        return task
+
+    return None
 
 
 def log_activity(activity_type, content, task_id=None, metadata=None):
