@@ -130,6 +130,12 @@ def main():
     n_pairs = rpc("refresh_memory_duplicate_pairs")
     print(f"duplicate pairs cached: {n_pairs}")
 
+    # Migration 114: recompute the A-MAC outcome-utility term from episode results
+    # BEFORE tiers are assigned, so a memory that just helped complete a task is
+    # scored on that evidence in the same pass rather than one night later.
+    n_util = rpc("refresh_memory_outcome_utility")
+    print(f"outcome utility refreshed: {n_util} rows changed")
+
     tiers = rpc("assign_memory_tiers")
     dist = {t["tier"]: t["n"] for t in tiers}
     print(f"tiers: {dist}")

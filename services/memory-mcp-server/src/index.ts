@@ -1379,10 +1379,30 @@ function startEmbeddingBackfillJob(supabase: any): void {
 // package.json. Two separate literals used to carry this — the MCP handshake and
 // GET /health — and on 2026-08-05 the /health one was missed on a version bump,
 // so the endpoint every dashboard and research run reads was a release behind.
-const SERVER_VERSION = "5.15.0";
+const SERVER_VERSION = "5.16.0";
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
+  // ── Recall → episode consult correlation ───────────────────────────────────
+  // `agent_episodes.memories_consulted` has been in record_episode's schema since
+  // migration 059 and was populated exactly 0 times across 274 episodes: it is an
+  // optional arg and no agent has ever passed it by hand. That empty column is the
+  // whole reason the A-MAC utility term could never be fit — with no edge from a
+  // memory to the outcome of the task that used it, retention has stayed a 4-term
+  // score with the fifth weight normalized away (see migration 114).
+  //
+  // So recall records what it served and record_episode defaults the field to it.
+  // Scope is deliberate: one server instance per MCP session (see the sessions map
+  // at the bottom of this file), so this buffer is naturally per-agent-per-session
+  // with no keying and no cross-caller leakage. It is a best-effort correlation
+  // signal for retention scoring, NOT an audit log — a restart drops it, and the
+  // worst case is an episode with no consult edge, i.e. exactly today's behaviour.
+  const CONSULT_BUFFER_MAX = 64;
+  let consultBuffer: string[] = [];
+  const recordConsults = (ids: string[]) => {
+    if (ids.length) consultBuffer = [...new Set([...ids, ...consultBuffer])].slice(0, CONSULT_BUFFER_MAX);
+  };
+
   const server = new McpServer({
     name: "memory-mcp-server",
     version: SERVER_VERSION,
@@ -1859,6 +1879,10 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
 
           if (filtered.length > 0) {
             await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
+
+            // Same set that just got its access_count bumped is the set this session
+            // "consulted" — hand it to record_episode so the outcome edge exists.
+            recordConsults(filtered.map((m: any) => m.id));
 
             // Attach verified_at to each result so the display can show verification age.
             // is_stale_now is the PostgREST computed column over memory_is_stale()
@@ -3124,6 +3148,13 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         return { content: [{ type: "text" as const, text: `Blocked: ${episodeThreat.split(":")[0]} matches threat pattern '${episodeThreat.split(":")[1]}'. Episode not recorded.` }] };
       }
 
+      // An explicit argument always wins; the recall buffer only fills the gap the
+      // caller left. Undefined (not []) when there is nothing, so the field keeps
+      // its existing "never set" shape rather than gaining a meaningless empty array.
+      const resolvedConsults = memories_consulted?.length
+        ? memories_consulted
+        : (consultBuffer.length ? consultBuffer : undefined);
+
       if (episode_id) {
         // Update existing episode
         const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
@@ -3133,7 +3164,13 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (actions) updates.actions = actions;
         if (outcome) updates.outcome = outcome;
         if (learnings) updates.learnings = learnings;
-        if (memories_consulted) updates.memories_consulted = memories_consulted;
+        // Union with what is already stored. A long task typically opens the episode,
+        // recalls more as it goes, then closes it — clobbering on the close-out call
+        // would drop every memory consulted before the last recall.
+        if (resolvedConsults) {
+          const { data: curMems } = await supabase.from("agent_episodes").select("memories_consulted").eq("id", episode_id).maybeSingle();
+          updates.memories_consulted = [...new Set([...(curMems?.memories_consulted || []), ...resolvedConsults])];
+        }
         if (status && status !== "in_progress") updates.ended_at = new Date().toISOString();
         // Re-embed when semantic fields change (migration 059) — merge with stored
         // values so a learnings-only update doesn't drop summary/outcome from the vector
@@ -3158,7 +3195,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (actions) row.actions = actions;
       if (outcome) row.outcome = outcome;
       if (learnings) row.learnings = learnings;
-      if (memories_consulted) row.memories_consulted = memories_consulted;
+      if (resolvedConsults) row.memories_consulted = resolvedConsults;
       if (status && status !== "in_progress") row.ended_at = new Date().toISOString();
       // Embed semantic fields at write time (migration 059) — makes the episode
       // recallable via recall_episodes(query). Backfill job covers Ollama outages.
