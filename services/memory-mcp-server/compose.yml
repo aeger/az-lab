@@ -95,8 +95,22 @@ services:
   # nDCG@5 >= 0.73 while getting p50 under 2000ms — was met: 0.7370 / 1517ms.
   # See the RERANKER_URL comment above for the full A/B.
   #
-  # NOT bge-reranker-v2-m3. That proposal stays closed as WONT FIX on CPU
-  # (research v9); this quantizes the model already deployed.
+  # NOT bge-reranker-v2-m3. That proposal is closed as WONT FIX on CPU, and as of
+  # 2026-08-11 that is a MEASUREMENT rather than an assertion. It needed to be:
+  # the arm in eval/results/rerank_ab_20260806.json that the earlier "research v9"
+  # closure rested on has n_probes = 0 — the endpoint was down and the arm never
+  # ran, so the file records all zeros, not a result.
+  #
+  # Measured against az-tei-probe-v2m3 on :8087, identical 20-doc payload per arm:
+  #   onnx-int8 (this service, production)   1,746 ms
+  #   bge-reranker-base fp32                 5,873 ms
+  #   bge-reranker-v2-m3 fp32               23,016 ms
+  # v2-m3 is 13.2x the production path and 3.9x even the fp32 base. 23 seconds on
+  # an interactive recall path is not a quality/latency tradeoff — there is no
+  # attainable nDCG gain that buys it back, so the arm was not run to completion
+  # for quality. Reopen only if this host gains a GPU.
+  #
+  # This service quantizes the model already deployed instead.
   #
   # First start quantizes into the models volume (a HuggingFace download, several
   # minutes); every later start finds the artifact and skips. No `internal: true`
