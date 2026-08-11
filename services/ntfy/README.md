@@ -121,20 +121,50 @@ AdGuard per-host rewrite `ntfy.az-lab.dev → 192.168.1.181` **was added** (it w
 only service host missing one). This is orthogonal to the A/B exposure choice — it just
 keeps LAN clients off the public edge, where hairpin NAT does not work.
 
-**OPEN — inbound reachability unverified.** The whole point of Option A is off-LAN
-Android push, and that is NOT yet confirmed working:
+### RESOLVED 2026-08-11 — inbound reachability CONFIRMED
+
+**Jeff tested from his phone on cellular (WiFi off): `https://ntfy.az-lab.dev/v1/health`
+returned `{"healthy":true}`.** The public edge works. Option A (public-with-auth) is
+verified end-to-end; no RB5009 / Cox edge work is needed.
+
+The 2026-07-28 "edge is dark" finding below is **superseded** — it was an external-fetch
+failure from one off-LAN vantage point, not a router/DNS fault. The
+`70.166.111.99` vs `70.167.221.51` mismatch is a red herring: the WAN *egress* IP is not
+the *ingress* static that `*.az-lab.dev` points at, and 443 does forward correctly on
+`70.167.221.51`. Do not re-open an edge task on that evidence alone.
+
+<details><summary>Superseded 2026-07-28 finding (kept for history)</summary>
 
 - WAN egress IP is **70.166.111.99**, but every `az-lab.dev` A record (including the
   `*` wildcard) points at **70.167.221.51**. `cf-ddns` is **not running** (no container).
 - An external fetch of `https://ntfy.az-lab.dev/v1/health` returned `ECONNREFUSED
-  70.167.221.51:443`. `https://az-lab.dev/` from outside failed identically, so this
-  is an **edge-wide** condition, not ntfy-specific.
+  70.167.221.51:443`. `https://az-lab.dev/` from outside failed identically.
 - Hairpin NAT does not work from svc-podman-01, so it cannot self-test the public path.
 
-Next step is Jeff's: install the ntfy Android app, point it at `https://ntfy.az-lab.dev`,
-log in as `jeff`, and try it **on cellular with WiFi off**. If it fails, the fix is at
-the RB5009 / Cox edge (443 forward on the static, or DNS pointed at the wrong IP) — not
-in this stack. Nothing here changes either way; ntfy already works on-LAN.
+</details>
+
+## Phone setup (Android) — remaining steps for Jeff
+
+1. Install **ntfy** — Play Store or F-Droid (F-Droid build has no Firebase at all).
+2. **Add the account first:** Settings → *Manage users* → **+** →
+   Service URL `https://ntfy.az-lab.dev`, username `jeff`, password from the Supabase
+   credentials store (`ntfy-jeff-password`). Doing this before subscribing avoids the
+   403 you'd otherwise hit — every topic is `deny-all`.
+3. **Change the default server:** Settings → *General* → Default server →
+   `https://ntfy.az-lab.dev`. Otherwise new subscriptions silently go to ntfy.sh.
+4. **Subscribe** (**+** → *Use another server* → pick `https://ntfy.az-lab.dev`), one per
+   topic: `wren-ops`, `atlas-tasks`, `ha-alerts`, `grafana`, `adhoc`.
+5. **Instant delivery is mandatory here.** FCM push only works for topics hosted on
+   ntfy.sh; a self-hosted server delivers over the app's own websocket. Turn on
+   Settings → *General* → **Instant delivery in doze mode** (leave the persistent
+   "ntfy is running" notification alone — that IS the delivery channel), and exempt ntfy
+   from battery optimization: Android Settings → Apps → ntfy → Battery → *Unrestricted*.
+   Skipping this = notifications that arrive hours late or only when the app is opened.
+6. Optional: per-subscription overrides (custom sound / bypass DND) for `ha-alerts` and
+   `grafana`, which are the P5 safety topics.
+
+A test message was published to `wren-ops` on 2026-08-11 (server-side cache is 12h) — it
+should appear as soon as that topic is subscribed.
 
 **Credentials NOT yet in the Supabase store.** They are on svc-podman-01 at
 `~/.ntfy-credentials` (0600) pending an admin token at `~/.secret-drop/az-admin-token`;
