@@ -129,18 +129,28 @@ def sb_get(path, params):
     return r.json()
 
 
-def fetch_active():
+def fetch_active(only_missing: bool = False):
     """Page through active memories. PostgREST caps rows per request, so a single
-    unpaged GET would silently backfill only the first page and report success."""
+    unpaged GET would silently backfill only the first page and report success.
+
+    only_missing restricts to rows with no embedding_v2 yet, which makes the
+    backfill RESUMABLE and idempotent. That matters more than it looks: the
+    corpus grows while a ~2h backfill runs (agents write memories throughout),
+    so a run that embedded a snapshot taken at start always finishes with a few
+    rows still NULL. Without this flag the only way to catch them is to re-embed
+    all ~840 from scratch."""
     rows, offset, page = [], 0, 500
     while True:
-        batch = sb_get("memories", {
+        params = {
             "select": "id,name,description,content",
             "is_active": "not.is.false",
             "order": "id",
             "offset": str(offset),
             "limit": str(page),
-        })
+        }
+        if only_missing:
+            params["embedding_v2"] = "is.null"
+        batch = sb_get("memories", params)
         rows.extend(batch)
         if len(batch) < page:
             return rows
@@ -178,6 +188,8 @@ def main():
     ap.add_argument("--no-renorm", action="store_true",
                     help="ablation: truncate WITHOUT restoring unit norm")
     ap.add_argument("--verify", action="store_true", help="report coverage and exit")
+    ap.add_argument("--only-missing", action="store_true",
+                    help="embed only rows with a NULL embedding_v2 (resumable catch-up pass)")
     args = ap.parse_args()
 
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -186,7 +198,7 @@ def main():
     if args.verify:
         return cmd_verify()
 
-    rows = fetch_active()
+    rows = fetch_active(only_missing=args.only_missing)
     if args.limit:
         rows = rows[:args.limit]
     print(f"Embedding {len(rows)} active memories with {args.model} "
