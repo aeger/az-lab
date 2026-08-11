@@ -23,6 +23,7 @@ measurement arm of the "make Claude an active participant in its memory" thread.
 - `memory_eval.py` — generic QA over injection **strategies** (none/recency/random/semantic/hybrid/oracle). Metrics: accuracy, recall@k, ctx_tokens, latency.
 - `scenario_eval.py` + `scenarios/*.json` — realistic **incident** scenarios across knowledge **substrates** (blind / well-documented-homelab / az-lab memory). Rubric-graded vs a gold fix, with replicates.
 - `retrieval_regression.py` — the nightly **retrieval** gate (separate concern from injection: zero LLM calls, seconds not minutes). `run` / `gate` / `trend` / `sweep` / `router`.
+- `grader.py` — the **scoring layer** for `scenario_eval.py`, and the reason its numbers can now be believed. Two independent scorers: `grade_llm()` (structured decoding, negotiated down `json_schema`→`json_object`→prompt-only, balanced-brace JSON extraction) and `grade_anchored()` (deterministic clause matching against gold-derived anchors — no LLM, free, reproducible). Every grade carries a `GradeStatus`; an unparseable or template-echoing grade is **INVALID and excluded**, never recorded as 0. `aggregate()` returns `mean_score: None` and `void: true` rather than averaging garbage. `python3 grader.py calibrate` checks both scorers against hand-banded fixtures — **run it before trusting any scenario run.**
 - `falsify_fcfr.py` — **run this before trusting any FCFR number.** `--audit-only` reports how many probes declare a *reachable* forbidden id; the full run forces a violation through `score()` to prove the metric is wired. Written 2026-07-30 after FCFR read exactly 0 on six consecutive runs: the metric was wired, but 8 of 9 probes pointed only at `is_active=false` rows that `hybrid_recall` filters on every lane, so they could not fail. A metric that cannot fail is not a passing metric.
 - `falsify_idf_knob.py` — **run this before trusting any `recall_weights` A/B.** Same discipline as `falsify_fcfr.py`, applied to a tuning knob instead of a metric. Phase 1 recomputes the live tilt arithmetic per probe (no retrieval); phase 2 flips `idf_adaptive_enabled` on for real and diffs the *returned id lists* across off / on@lo / on@hi; phase 3 renders a verdict. It mutates exactly one `recall_weights` row and restores it in a `finally`, takes the eval lock, and deliberately does NOT write `eval_runs` (a diagnostic in the trend series would poison the gate median).
 - Retrieval = the real path: Ollama `nomic-embed-text` (768d) + `hybrid_recall` RPC.
@@ -61,19 +62,83 @@ follow for any future `recall_weights` A/B:
 1. Assert the flag is actually `true` **inside** the treatment arm and read it back.
 2. Diff returned id lists, not summary floats. Aggregates collide; lists don't.
 
-## Current state (2026-07-13)
+## Bi-temporal read path — WIRED AND SENSITIVE (2026-08-11)
+Migration 109 gave `hybrid_recall` a `p_as_of` parameter and a
+`valid_from <= T AND (valid_to IS NULL OR valid_to > T)` predicate at all 14 `is_active`
+sites. Its gate (`pre-mig109` / `post-mig109`) came back **bit-identical to 15 decimals** —
+which is the pattern `falsify_idf_knob.py` was written to distrust, so it was checked rather
+than assumed. The state of the store explains the tie and does not excuse it:
+
+| check | value |
+|---|---|
+| memories with `valid_to` closed | **150** / 1041 |
+| of those, also `superseded_by IS NOT NULL` | **150** (all) |
+| closed interval but still `is_active` | **0** |
+| `valid_from` in the future | **0** |
+
+Every closed interval today belongs to a row `is_active` already excluded, so the new
+predicate is exactly redundant on current data. The identical gate therefore proves the
+filter is **inert on the probe set**, NOT that it is correct — a distinction the run log now
+states outright.
+
+Time travel itself was then falsified directly, diffing **returned id lists** rather than
+summary floats (the 07-31 lesson). Query `'Daily Self-Improvement Research 2026-07-10'`,
+`p_match_count 20`, lexical lanes:
+
+| arm | result |
+|---|---|
+| `p_as_of` NULL (now) | target `eb51e87d…` **absent** |
+| `p_as_of` `2026-08-01` (before its `valid_to`) | target **present** |
+| rows re-admitted by the as-of arm | **7** |
+
+So the parameter reaches the query plan and changes what comes back: **wired and sensitive.**
+The remaining untested case is the one that motivated the migration — a row whose validity
+ended while the row stayed active (`n_closed_but_active = 0` today, so it cannot yet occur).
+Until a writer other than `supersede_memory()` sets `valid_to`, that path is unexercised;
+see next steps.
+
+## Current state (2026-08-11)
 - ✅ Both harnesses built, committed (az-lab beta `d1fea02`, `b3b6a57`).
 - ✅ QA harness first read: injection lifts accuracy **0.00 → 0.60**; oracle=0.60 (binding gap visible). N=5, noisy.
-- ⚠️ Scenario harness runs, but **results not yet trustworthy** — see findings.
+- ✅ Scenario harness results are now **trustworthy** — the grader blocker is closed, see below.
+
+### Grader blocker CLOSED (2026-08-11 re-verified; fix landed 2026-08-07)
+Finding 1 below — "grader reliability is the #1 blocker", open since 2026-07-13 — is
+resolved and **measured**, not asserted. `grader.py` replaced the per-dimension regex whose
+`int(matches[-1]) if matches else 0` recorded a grade that FAILED TO PARSE as a grade of
+**zero**, indistinguishable downstream from a genuinely wrong answer. That parser, not the
+model, is why "clearly-correct answers scored near zero": they largely did not score at all.
+
+Both scorers now calibrate clean against the five hand-banded fixtures in
+`fixtures/homebridge_alexa_cookie_grader.json` (raw: `results/grader_calibration_20260811.txt`):
+
+| fixture | band | anchored | llm (2 reps) |
+|---|---|---|---|
+| gold_verbatim | 0.85–1.00 | 1.00 | 1.00, 1.00 |
+| strong_paraphrase | 0.70–1.00 | 0.88 | 1.00, 1.00 |
+| generic_reauth | 0.05–0.50 | 0.12 | 0.38, 0.38 |
+| wrong_ha_chase | 0.00–0.30 | 0.00 | 0.12, 0.12 |
+| empty_refusal | 0.00–0.15 | 0.00 | 0.12, 0.12 |
+
+**anchored 5/5 · llm 5/5 · llm grades that parsed at all 10/10.** The 10/10 parse rate is
+the number that retires the blocker: the original symptom was template-placeholder echo, and
+under structured decoding it now occurs zero times in ten calls. Note the LLM arm is
+consistently *more generous* at the bottom of the scale (0.12 where anchored gives 0.00) —
+it stays inside the bands, but prefer the anchored score when the two disagree, since it
+needs no model and so survives whatever the grader model does next quarter.
+
+Re-run before trusting any scenario number:
+`python3 grader.py calibrate` (add `--anchored-only` for the free, no-API arm).
 
 ## Findings so far (what the runs actually taught us)
-1. **Grader reliability is the #1 blocker.** Nemotron is an unreliable structured grader — scores clearly-correct answers near zero, echoes template placeholders. Fix before trusting any number.
+1. ~~**Grader reliability is the #1 blocker.**~~ **CLOSED 2026-08-11** — see "Grader blocker CLOSED" above. The root cause was the harness parser encoding a parse failure as a score of 0, not the model. Kept here because the *lesson* generalises: a scoring path that maps "I could not read this" onto the worst legal score will manufacture a confident wrong number every time.
 2. **Retrieval is brittle to query framing.** A user report phrased "…on Home Assistant" steered `hybrid_recall` to HA memories; the relevant in-store memory (`homebridge-host-location`) never surfaced even at k=12.
 3. **Best experiential memory is local-only.** `homebridge-alexa-cookie-expiry-fix` isn't in the queryable store (governance-blocked from Supabase) — the "memory" condition structurally can't reach it. The good stuff lives in the bootstrap layer, not the queryable one.
 4. **For semi-common problems, blind/docs can match memory.** Memory's edge is largest on lab-specific, non-obvious, previously-solved incidents — pick scenarios accordingly.
 
 ## Next steps (priority order — check off as done)
-- [ ] **Fix the grader** (biggest lever): constrained output, a different/stronger grader model, or keyword-anchored scoring vs the gold; human spot-check to calibrate.
+- [x] **Fix the grader** (biggest lever) — done 2026-08-07, re-verified 2026-08-11. Landed all three suggested routes: constrained/structured decoding (negotiated `json_schema`→`json_object`→prompt-only), keyword-anchored LLM-free scoring vs the gold, and hand-banded fixtures for calibration. Invalid grades are now excluded and counted rather than averaged as 0, and a run whose invalid fraction exceeds `EVAL_MAX_INVALID_GRADES` (default 0.20) reports **VOID** instead of a confident number.
+- [ ] **Add an as-of probe to the retrieval gate.** Today `retrieval_regression.py` only ever calls `hybrid_recall` with `p_as_of` NULL, so a regression that broke time travel would not fire. Needs a probe asserting the two arms return *different id lists* for a known superseded row (the check run by hand on 2026-08-11 above), plus the still-unexercised case: a row with `valid_to` set and `is_active` left true. That second one requires a writer other than `supersede_memory()` — an expiring lease/cert is the natural first one.
 - [ ] **Make the memory condition fair**: get the fix memory into the queryable store, or add a "local-bootstrap" memory condition, so the pipeline actually has the answer.
 - [ ] **Add lab-specific scenarios** where the fix is genuinely un-guessable (that's where memory should decisively win).
 - [ ] **Add an "ambient" strategy** to `memory_eval.py` (memory pushed every turn) vs on-demand recall — the original research question: does ambient injection close the oracle→1.0 binding gap?
@@ -86,7 +151,9 @@ follow for any future `recall_weights` A/B:
 | 2026-07-13 | scenario_eval | hb1/hb2 | grader unreliable → scores void; retrieval missed gold |
 | 2026-07-24 | retrieval_regression | baseline-ndcg-20260724 | N=56 · recall@5 0.500 · recall@10 0.643 · MRR 0.327 · **nDCG@10 0.374** |
 | 2026-08-07 | rerank_ab | rerank_ab_int8_20260807 | N=97 · fp32 nDCG@5 0.7470 / recall@5 0.8351 / MRR 0.7650 / p50 4587ms · int8 nDCG@5 0.7370 / recall@5 0.8454 / MRR 0.7486 / p50 1517ms → **-1.3% rel nDCG@5 for 3.0x lower p50, better recall@5** |
+| 2026-08-07 | retrieval_regression | pre-mig109 / post-mig109 | bi-temporal read-path gate (TIER 1): N=97 · recall@5 **0.8144 → 0.8144** · nDCG@10 **0.6766 → 0.6766** · nDCG@5 0.6667 → 0.6667 → **PASS, bit-identical**. Expected: with `p_as_of` NULL and no probe memory carrying a closed `valid_to`, the new predicate admits exactly the old row set — the gate proves the filter is inert on current data, *not* that time travel works (that needs an as-of probe, see next steps). |
 | 2026-08-08 | retrieval_regression | int8-verify-20260808 | post-cutover gate on the live path (`RERANKER_URL` → `rerank-onnx`, INT8): N=97 · **nDCG@10 0.6769** vs trailing-7 median 0.6766 (delta +0.0%, floor 0.6427) · FCFR 0.000 → **PASS, no ranking regression** |
+| 2026-08-11 | grader calibrate | grader_calibration_20260811 | homebridge_alexa_cookie, Nemotron 120B, 2 reps × 5 fixtures: anchored **5/5**, llm **5/5**, llm parse rate **10/10** → **grader blocker CLOSED** |
 
 ## 2026-07-24 update (research rec 2 — close the retrieval-gate gap)
 - **nDCG@5/@10 added** to `retrieval_regression.py` (migration 072). recall@k is blind to
