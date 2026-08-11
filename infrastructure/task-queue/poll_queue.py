@@ -36,6 +36,37 @@ SUPABASE_KEY = _load_supabase_key()
 CLAUDE_CMD = os.environ.get("CLAUDE_CMD", "claude")
 HOSTNAME = socket.gethostname()
 
+
+# ── Claude invocation timeouts ───────────────────────────────────────────────
+# run_claude's stdout deadline was a hardcoded 1800s. Between 2026-07-28 and
+# 08-07, five "Review + implement research recommendations" runs died on it with
+# the byte-identical error "claude timed out after 1800s" — those tasks ask for a
+# full research review AND an implementation, which does not fit in 30 minutes.
+# Because mark_failed had no retry path (see below), each one then stopped dead at
+# attempt_count=1 and nothing ever picked it up again.
+#
+# CLAUDE_TIMEOUT_SECS is the stdout-progress deadline. CLAUDE_WALL_BACKSTOP_SECS is
+# the watchdog that SIGKILLs a subprocess whose stdout has gone silent entirely —
+# the deadline below can only fire when a line actually arrives, so a wedged claude
+# needs the separate backstop. Both are env-overridable from the unit file so one
+# oversized task can be given more room without another code edit.
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Int from env, falling back to default on unset/garbage, clamped to `minimum`.
+
+    `minimum` is per-call and NOT a blanket 60: this helper is used for both seconds
+    (where a 5-second timeout is a misconfiguration worth flooring) and days (where a
+    60 floor would silently turn a 7-day staleness window into a 60-day one).
+    """
+    try:
+        return max(minimum, int(os.environ.get(name) or default))
+    except (TypeError, ValueError):
+        return default
+
+CLAUDE_TIMEOUT_SECS = _env_int("CLAUDE_TIMEOUT_SECS", 5400, minimum=60)  # 90 min (was a hardcoded 1800)
+CLAUDE_WALL_BACKSTOP_SECS = _env_int(
+    "CLAUDE_WALL_BACKSTOP_SECS", int(CLAUDE_TIMEOUT_SECS * 1.5), minimum=60
+)
+
 # Model tiering — route tasks to the right model based on priority and tags.
 # Keep these in sync with system_rules.model_routing_primary.
 MODEL_DEFAULT = "claude-sonnet-5"            # medium/high (priority 1-2)
@@ -711,29 +742,73 @@ def mark_pending_eval(task_id, result, goal_id=None, original_task=None):
 
 
 def mark_failed(task_id, error, goal_id=None, original_task=None):
-    # Fetch current attempt_count so we can increment it
-    try:
-        rows = api_request("GET", "task_queue", params={"id": f"eq.{task_id}", "select": "attempt_count"})
-        current_attempts = (rows[0].get("attempt_count") or 0) if rows else 0
-    except Exception:
-        current_attempts = 0
+    """Record a failed run, retrying while attempts remain. Returns True if requeued.
 
-    api_request(
-        "PATCH",
-        f"task_queue?id=eq.{task_id}",
-        data={
-            "status": "failed",
-            "error": error[:500],
-            "attempt_count": current_attempts + 1,
-        },
-    )
+    Until 2026-08-11 this always wrote a terminal status='failed'. max_attempts
+    (default 3) has been on the row the whole time, but only argus's stall path ever
+    honoured it — a task that failed *inside* run_claude stopped dead at
+    attempt_count=1 and nothing looked at it again. That is how five research tasks
+    each burned exactly one 1800s timeout and then sat untouched for up to 12 days.
+
+    Now: attempts remaining → back to 'ready' for the next 5-min poll (build_prompt
+    already injects a fresh-start retry hint from attempt_count). Attempts exhausted
+    → terminal 'failed' plus a Discord escalation, because a task that failed
+    max_attempts times is a human's problem, not another retry's.
+    """
+    # Fetch current attempt_count / max_attempts so we can decide retry vs escalate
+    try:
+        rows = api_request(
+            "GET", "task_queue",
+            params={"id": f"eq.{task_id}", "select": "attempt_count,max_attempts,title"},
+        )
+        row = rows[0] if rows else {}
+    except Exception:
+        row = {}
+    attempts = (row.get("attempt_count") or 0) + 1
+    max_attempts = row.get("max_attempts") or 3
+    title = row.get("title") or (original_task or {}).get("title") or task_id[:8]
+    retrying = attempts < max_attempts
+
+    patch = {
+        "error": f"attempt {attempts}/{max_attempts}: {error}"[:500],
+        "attempt_count": attempts,
+    }
+    if retrying:
+        # Clear the claim too — a 'ready' row still holding claimed_by reads as
+        # in-flight to every dashboard and to recover_stuck_tasks.
+        patch.update({"status": "ready", "claimed_by": None, "claimed_at": None})
+    else:
+        patch["status"] = "failed"
+
+    api_request("PATCH", f"task_queue?id=eq.{task_id}", data=patch)
+
+    if retrying:
+        print(f"Task {task_id} failed (attempt {attempts}/{max_attempts}) — requeued as ready.")
+        log_activity("status", f"Retry {attempts}/{max_attempts} queued: {error[:100]}", task_id=task_id)
+        discord_notify(
+            f"🔁 **Retry {attempts}/{max_attempts}:** {title}\n"
+            f"Error: `{error[:120]}` — requeued, next poll picks it up."
+        )
+    else:
+        print(f"Task {task_id} failed permanently after {attempts} attempt(s).")
+        log_activity("error", f"Retries exhausted ({attempts}/{max_attempts})", task_id=task_id)
+        discord_notify(
+            f"🛑 **Retries exhausted:** {title}\n"
+            f"Failed {attempts}/{max_attempts} times. Last error: `{error[:150]}`\n"
+            f"Task `{task_id[:8]}` is now `failed` — needs a human."
+        )
     # Recurring tasks keep recurring even after a failed run — otherwise one
-    # bad day kills the whole schedule until a human notices.
-    if original_task:
+    # bad day kills the whole schedule until a human notices. Only on a TERMINAL
+    # failure though: this row is about to be retried in place, and requeueing the
+    # chain on every attempt would spawn a duplicate occurrence per retry.
+    if original_task and not retrying:
         requeue_recurring(original_task)
     if goal_id:
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        update_goal_notes(goal_id, f"Failed {date_str}: {error[:100]}")
+        state = f"Retry {attempts}/{max_attempts}" if retrying else "Failed"
+        update_goal_notes(goal_id, f"{state} {date_str}: {error[:100]}")
+
+    return retrying
 
 
 _CONTEXT_STRIP_KEYS = {"previous_output", "last_result", "full_transcript", "raw_output", "stdout"}
@@ -879,15 +954,21 @@ def build_prompt(task):
     )
 
 
-def run_claude(prompt, task_id=None, model=None, proc_register=None, max_runtime=5400):
+def run_claude(prompt, task_id=None, model=None, proc_register=None,
+               max_runtime=None, timeout=None):
     """Run claude with streaming output, writing events to agent_activity in real-time.
 
     proc_register: optional callable(subprocess.Popen) — invoked once with the spawned
                    process so the orchestrator (Argus) can SIGKILL it on stall.
+    timeout:       stdout-progress deadline in seconds. Defaults to
+                   CLAUDE_TIMEOUT_SECS; a task can override it via
+                   context.timeout_secs when it is genuinely long-running.
     max_runtime:   wall-clock backstop in seconds. A watchdog thread kills the
-                   subprocess after this many seconds even if stdout has gone silent.
-                   Default 5400s = 3× the per-line 1800s deadline.
+                   subprocess after this many seconds even if stdout has gone
+                   silent. Defaults to CLAUDE_WALL_BACKSTOP_SECS (1.5× timeout).
     """
+    timeout = timeout or CLAUDE_TIMEOUT_SECS
+    max_runtime = max_runtime or max(int(timeout * 1.5), CLAUDE_WALL_BACKSTOP_SECS)
     cmd = [CLAUDE_CMD, "--print", "--dangerously-skip-permissions",
            "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
     if model:
@@ -949,11 +1030,11 @@ def run_claude(prompt, task_id=None, model=None, proc_register=None, max_runtime
                 time.sleep(1)
     threading.Thread(target=_heartbeat_ticker, daemon=True).start()
 
-    deadline = time.time() + 1800
+    deadline = time.time() + timeout
     for raw_line in proc.stdout:
         if time.time() > deadline:
             proc.kill()
-            raise RuntimeError("claude timed out after 1800s")
+            raise RuntimeError(f"claude timed out after {timeout}s")
         raw_line = raw_line.strip()
         if not raw_line:
             continue
@@ -1533,6 +1614,123 @@ def recover_stuck_tasks():
         print(f"recover_stuck_tasks failed (non-fatal): {e}", file=sys.stderr)
 
 
+# ── Staleness sweep ──────────────────────────────────────────────────────────
+# Nothing in the system ever looked at old rows. Two Discord-delivery tasks sat at
+# status='ready' since 2026-04-30 — 103 days — because 'ready' is a perfectly healthy
+# status and no report ever aggregated by age. Same for pending_jeff_action, which is
+# a dead end unless Jeff happens to remember it, and for terminal 'failed'.
+#
+# The sweep is deliberately notify-only: it does NOT requeue or reopen anything. A row
+# that has been stale for 100 days is stale for a reason, and auto-retrying it here
+# would fight the retry logic in mark_failed. Surfacing it is the whole job.
+STALE_NOTIFIED_FILE = os.path.expanduser("~/.claude-queue/stale_notified.json")
+STALE_AFTER_DAYS = _env_int("STALE_AFTER_DAYS", 7)
+STALE_RENOTIFY_DAYS = _env_int("STALE_RENOTIFY_DAYS", 7)  # re-ping cadence per task
+# 'claimed'/'in_progress_agent' are deliberately absent — recover_stuck_tasks already
+# owns those and resets them after 30 min. 'pending_eval' is included because a row
+# waiting on Iris rots exactly like one waiting on Jeff.
+STALE_SWEEP_STATUSES = ("ready", "failed", "pending_jeff_action", "pending_eval")
+_STALE_MAX_LISTED = 10
+
+
+def _load_stale_notified() -> dict:
+    try:
+        with open(STALE_NOTIFIED_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_stale_notified(state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(STALE_NOTIFIED_FILE), exist_ok=True)
+        with open(STALE_NOTIFIED_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"_save_stale_notified failed (non-fatal): {e}", file=sys.stderr)
+
+
+def sweep_stale_tasks():
+    """Surface tasks rotting in ready/failed/pending_jeff_action to Discord.
+
+    Runs on every 5-min poll but only *speaks* when a task has not been reported in
+    STALE_RENOTIFY_DAYS — otherwise it would post the same seven rows 288 times a day
+    and get muted within a week, which is exactly how the queue went blind in the
+    first place. Best-effort: never raises, never blocks the poll.
+    """
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=STALE_AFTER_DAYS)).isoformat()
+        rows = api_request(
+            "GET",
+            "task_queue",
+            params={
+                "status": f"in.({','.join(STALE_SWEEP_STATUSES)})",
+                "created_at": f"lt.{cutoff}",
+                "order": "created_at.asc",
+                "limit": "50",
+                "select": "id,title,status,priority,target,attempt_count,created_at,tags",
+            },
+        )
+    except Exception as e:
+        print(f"sweep_stale_tasks fetch failed (non-fatal): {e}", file=sys.stderr)
+        return
+
+    rows = [r for r in (rows or []) if not _is_internal_housekeeping(r)]
+    state = _load_stale_notified()
+    now = datetime.now(timezone.utc)
+
+    # Drop bookkeeping for rows that are no longer stale, so a task that goes stale
+    # again months later gets reported immediately instead of being silently suppressed.
+    live_ids = {r["id"] for r in rows}
+    state = {k: v for k, v in state.items() if k in live_ids}
+
+    due = []
+    for r in rows:
+        last = state.get(r["id"])
+        if last:
+            try:
+                if (now - datetime.fromisoformat(last)).days < STALE_RENOTIFY_DAYS:
+                    continue
+            except ValueError:
+                pass  # unparseable timestamp — treat as never notified
+        due.append(r)
+
+    if not due:
+        _save_stale_notified(state)
+        return
+
+    def _age_days(row):
+        try:
+            created = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
+            return (now - created).days
+        except Exception:
+            return 0
+
+    due.sort(key=_age_days, reverse=True)
+    lines = [
+        f"• `{r['status']}` **{(r.get('title') or r['id'][:8])[:70]}** "
+        f"— {_age_days(r)}d old, P{r.get('priority', '?')}, "
+        f"{r.get('attempt_count') or 0} attempt(s), `{r['id'][:8]}`"
+        for r in due[:_STALE_MAX_LISTED]
+    ]
+    overflow = len(due) - len(lines)
+    if overflow > 0:
+        lines.append(f"• …and {overflow} more (query task_queue for the full list)")
+
+    discord_notify(
+        f"🧹 **Stale queue sweep — {len(due)} task(s) idle >{STALE_AFTER_DAYS}d:**\n"
+        + "\n".join(lines)
+        + f"\nNothing was requeued. Re-reported every {STALE_RENOTIFY_DAYS}d until resolved."
+    )
+    print(f"sweep_stale_tasks: reported {len(due)} stale task(s).")
+    log_activity("status", f"Stale sweep: {len(due)} task(s) idle >{STALE_AFTER_DAYS}d")
+
+    for r in due:
+        state[r["id"]] = now.isoformat()
+    _save_stale_notified(state)
+
+
 def main():
     print(f"[{datetime.now().isoformat()}] Polling task queue on {HOSTNAME}...")
 
@@ -1544,6 +1742,9 @@ def main():
 
     # Ping Discord if cowork tasks are pending
     notify_cowork_tasks()
+
+    # Surface rows rotting in ready/failed/pending_jeff_action
+    sweep_stale_tasks()
 
     write_heartbeat("active")
 
@@ -1573,7 +1774,9 @@ def main():
         model_label = model or "sonnet (default)"
         print(f"Running claude ({model_label}) for task: {title}")
         log_activity("thinking", f"Starting: {title} [model: {model_label}]", task_id=task_id)
-        result = run_claude(prompt, task_id=task_id, model=model)
+        task_ctx = task.get("context") or {}
+        task_timeout = task_ctx.get("timeout_secs") if isinstance(task_ctx, dict) else None
+        result = run_claude(prompt, task_id=task_id, model=model, timeout=task_timeout)
         summary = result.splitlines()[0][:120] if result else "done"
         goal_id = task.get("goal_id")
 
@@ -1620,11 +1823,14 @@ def main():
     except Exception as e:
         error_msg = str(e)
         print(f"Task {task_id} failed: {error_msg}", file=sys.stderr)
+        # mark_failed owns the Discord message now — it is the only caller that
+        # knows whether this was "retry 1/3" or "out of attempts".
         mark_failed(task_id, error_msg, goal_id=task.get("goal_id"), original_task=task)
         record_skill_outcome(task, False, error_msg)
         log_activity("error", error_msg[:200], task_id=task_id)
-        discord_notify(f"❌ Failed: {title} — {error_msg[:120]}")
         end_episode(episode_id, "failed", outcome=error_msg)
+        # Still exit non-zero on a retryable failure: the run genuinely failed, and
+        # a green unit would hide a task that is quietly burning its attempts.
         sys.exit(1)
 
 
