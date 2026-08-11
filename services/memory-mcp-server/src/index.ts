@@ -3332,8 +3332,10 @@ app.delete("/mcp", async (req: Request, res: Response) => {
 });
 
 app.listen(PORT, "0.0.0.0", async () => {
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 9;
-  console.log(`Memory MCP Server v5.12.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  // Must match the /health computation above — a banner that drifts from /health is
+  // how "28 tools" and "27 tools" ended up in different memories for the same build.
+  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 10;
+  console.log(`Memory MCP Server v${SERVER_VERSION} — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();
