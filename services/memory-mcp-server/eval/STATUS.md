@@ -24,6 +24,7 @@ measurement arm of the "make Claude an active participant in its memory" thread.
 - `scenario_eval.py` + `scenarios/*.json` — realistic **incident** scenarios across knowledge **substrates** (blind / well-documented-homelab / az-lab memory). Rubric-graded vs a gold fix, with replicates.
 - `retrieval_regression.py` — the nightly **retrieval** gate (separate concern from injection: zero LLM calls, seconds not minutes). `run` / `gate` / `trend` / `sweep` / `router`.
 - `falsify_fcfr.py` — **run this before trusting any FCFR number.** `--audit-only` reports how many probes declare a *reachable* forbidden id; the full run forces a violation through `score()` to prove the metric is wired. Written 2026-07-30 after FCFR read exactly 0 on six consecutive runs: the metric was wired, but 8 of 9 probes pointed only at `is_active=false` rows that `hybrid_recall` filters on every lane, so they could not fail. A metric that cannot fail is not a passing metric.
+- `falsify_idf_knob.py` — **run this before trusting any `recall_weights` A/B.** Same discipline as `falsify_fcfr.py`, applied to a tuning knob instead of a metric. Phase 1 recomputes the live tilt arithmetic per probe (no retrieval); phase 2 flips `idf_adaptive_enabled` on for real and diffs the *returned id lists* across off / on@lo / on@hi; phase 3 renders a verdict. It mutates exactly one `recall_weights` row and restores it in a `finally`, takes the eval lock, and deliberately does NOT write `eval_runs` (a diagnostic in the trend series would poison the gate median).
 - Retrieval = the real path: Ollama `nomic-embed-text` (768d) + `hybrid_recall` RPC.
 - LLM (agent+grader) = NemoClaw (NVIDIA NIM, Nemotron 120B). `EVAL_LLM_PROVIDER=anthropic` supported once a valid key exists (the one in `../.env` is 401).
 
@@ -32,6 +33,33 @@ measurement arm of the "make Claude an active participant in its memory" thread.
 - Headline: Recall@5 **0.835**, nDCG@10 **0.701**, Δ-over-no-memory **+0.686**, FCFR-live **0.500** (2 scorable probes).
 - The old 56 probes still score **1.00 in every category** while the 21 adversarial paraphrases score **9/21** — same golds, no shared distinctive tokens. Read that as label leakage in the original set, not as a ranker regression.
 - Adding probes is the lever that keeps this instrument alive. Write them as the SYMPTOM in the words someone hitting it would use, and check the wording against the gold for shared distinctive tokens before committing.
+
+## IDF-adaptive knob — WIRED AND SENSITIVE, 07-31 A/B retracted (2026-08-11)
+The 2026-07-31 A/B recorded strength **0.5** and **1.2** with bit-identical MRR
+`0.688185654008439` and nDCG `0.702632792830539` — to 15 decimals, over 79 probes — and
+concluded the tilt was inside noise and shipped it OFF. **That result is retracted.**
+`falsify_idf_knob.py` over the current 118 active probes
+(raw output: `eval/results/falsify_idf_knob_20260811.txt`, gitignored) found:
+
+| phase | result |
+|---|---|
+| 1 — arithmetic | effective lane weights differ at 0.5 vs 1.2 on **118/118** probes; **0** saturate the ±0.9 clamp; largest single-lane gap **0.442** |
+| 2 — ranking (flag actually ON) | off vs on@0.5 → **75/118** id lists changed; off vs on@1.2 → **100/118**; on@0.5 vs on@1.2 → **75/118** |
+| 2 — rank 1 only | **0**, **2** and **2** probes respectively |
+| 3 — verdict | **WIRED AND SENSITIVE** — not dead code |
+
+The knob reaches the arithmetic and it moves rankings. Rank 1 barely budges, which is why
+rank-1-weighted aggregates look flat — but 75 differing id lists cannot produce identical
+nDCG@10 to 15 decimals. So the 07-31 collision was a **harness fault**, not a property of
+the ranker: both arms almost certainly ran with `idf_adaptive_enabled=false`, i.e. the
+treatment was never applied. Note the tempting wrong reading — "the flag is off live, so
+of course the floats matched" — is also refuted by phase 2; the question is what the A/B
+*did*, not what the live row says now.
+
+`idf_adaptive_enabled` stays **OFF**: it is UNMEASURED, not measured-and-inert. Two rules
+follow for any future `recall_weights` A/B:
+1. Assert the flag is actually `true` **inside** the treatment arm and read it back.
+2. Diff returned id lists, not summary floats. Aggregates collide; lists don't.
 
 ## Current state (2026-07-13)
 - ✅ Both harnesses built, committed (az-lab beta `d1fea02`, `b3b6a57`).
