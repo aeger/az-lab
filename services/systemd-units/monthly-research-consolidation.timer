@@ -1,0 +1,13 @@
+[Unit]
+Description=Monthly daily-research consolidation check
+Requires=monthly-research-consolidation.service
+
+[Timer]
+# 2nd of the month, after the month has definitively closed and after the
+# nightly memory jobs (dreaming 02:15, contradiction 03:30, lifecycle 04:10,
+# eval 05:00) have finished moving rows around.
+OnCalendar=*-*-02 06:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

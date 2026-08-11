@@ -84,6 +84,20 @@ def build_report(h: dict) -> str:
     if ev:
         L.append(f"**Retrieval eval** ({ev['tag']}) recall@5 {ev['recall_at_5']:.3f} · MRR {ev['mrr']:.3f}")
 
+    # 2026-07-29 research rec 3c. `used` pools every evidence-of-use source
+    # (recall bump, replayed episode, attributed task) — use_count alone reads
+    # 4/33 while 9 skills demonstrably ran. The success rate counts LIVE outcomes
+    # only, excluding the migration-104 backfill, so a backfill can never green
+    # this line while the self-report loop is dead. `silent` is the number that
+    # matters: skills the fleet selects but never reports an outcome for.
+    sk = h.get("skills")
+    if sk:
+        live = (sk["live_success"] or 0) + (sk["live_fail"] or 0)
+        rate = f"{(100.0 * sk['live_success'] / live):.0f}%" if live else "no live outcomes"
+        silent = f" · ⚠️ {sk['silent']} used-but-silent" if sk["silent"] else ""
+        L.append(f"**Skills** {sk['used']}/{sk['total']} used · "
+                 f"{sk['reporting']} reporting · success {rate} ({live} live){silent}")
+
     writers = h.get("writers") or []
     if writers:
         w = " · ".join(f"{x['agent']} {x['n']}" for x in writers[:6])

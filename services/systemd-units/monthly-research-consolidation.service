@@ -1,0 +1,11 @@
+[Unit]
+Description=Detect unconsolidated daily-research months and queue a digest task
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/almty1/azlab/services/memory-mcp-server
+EnvironmentFile=/home/almty1/azlab/services/memory-mcp-server/.env
+ExecStart=/usr/bin/python3 /home/almty1/azlab/services/memory-mcp-server/monthly_research_consolidation.py
+StandardOutput=append:/home/almty1/azlab/services/memory-mcp-server/monthly_research_consolidation.log
+StandardError=append:/home/almty1/azlab/services/memory-mcp-server/monthly_research_consolidation.log

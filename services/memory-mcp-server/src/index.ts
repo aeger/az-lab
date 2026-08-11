@@ -2651,6 +2651,21 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
     }
   );
 
+  // THE single writer for skills.use_count / last_used_at on selection (migration
+  // 112, research REC 3a). This used to be an inline
+  // `.update({ use_count: (s.use_count || 0) + 1 })` repeated in all three
+  // recall_skill branches — a read-modify-write that silently loses bumps when two
+  // agents recall the same skill at once, which is how use_count ended up BELOW
+  // success_count (discord-azlab-mcp read 1 vs 32). The RPC increments in one
+  // statement and stamps last_used_at in the same UPDATE, so the two columns can
+  // no longer disagree. Outcome counters stay with record_skill_outcome (080).
+  async function bumpSkillUsage(ids: string[]): Promise<void> {
+    if (!ids?.length) return;
+    // Telemetry must never fail a recall — the caller wanted the skill, not the counter.
+    const { error } = await supabase.rpc("bump_skill_usage", { p_skill_ids: ids });
+    if (error) console.error(`bump_skill_usage failed for ${ids.length} skill(s): ${error.message}`);
+  }
+
   // ── Tool: recall_skill ───────────────────────────────────────────────────────
   server.tool(
     "recall_skill",
@@ -2666,7 +2681,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (name) {
         const { data, error } = await supabase.from("skills").select("*").eq("name", name).maybeSingle();
         if (error || !data) return { content: [{ type: "text" as const, text: `Skill "${name}" not found.` }] };
-        await supabase.from("skills").update({ use_count: (data.use_count || 0) + 1, last_used_at: new Date().toISOString() }).eq("id", data.id);
+        await bumpSkillUsage([data.id]);
         return { content: [{ type: "text" as const, text: `# ${data.title}\n_${data.description}_\n\n${data.content}` }] };
       }
 
@@ -2675,7 +2690,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (queryEmbedding) {
           const { data, error } = await supabase.rpc("match_skills", { query_embedding: JSON.stringify(queryEmbedding), match_count: maxResults });
           if (!error && data?.length > 0) {
-            for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used_at: new Date().toISOString() }).eq("id", s.id);
+            await bumpSkillUsage(data.map((s: any) => s.id));
             const results = data.map((s: any) => `# ${s.title} (${(s.similarity * 100).toFixed(0)}% match)\n_${s.description}_\n\n${s.content}`);
             return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
           }
@@ -2684,7 +2699,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const { data, error } = await supabase.from("skills").select("*")
           .or(`name.ilike.%${query}%,title.ilike.%${query}%,description.ilike.%${query}%`).limit(maxResults);
         if (error || !data?.length) return { content: [{ type: "text" as const, text: "No matching skills found." }] };
-        for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used_at: new Date().toISOString() }).eq("id", s.id);
+        await bumpSkillUsage(data.map((s: any) => s.id));
         const results = data.map((s: any) => `# ${s.title}\n_${s.description}_\n\n${s.content}`);
         return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
       }
