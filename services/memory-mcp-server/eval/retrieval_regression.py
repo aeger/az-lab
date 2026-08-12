@@ -283,8 +283,65 @@ def _fit_dims(vec: list) -> list:
     return [x / norm for x in out] if norm else out
 
 
+# ── Link-expansion backflow (migration 115) ─────────────────────────────────
+# Threshold is a CONTRACT shared with src/index.ts's SPREAD_ACTIVATION_THRESHOLD
+# and with migration 115's downweight floor. If the TS side raises its threshold
+# and this is not raised with it, the probe measures a bar the read path no longer
+# uses and reads 0 while leaking.
+SPREAD_ACTIVATION_THRESHOLD = float(os.environ.get("SPREAD_ACTIVATION_THRESHOLD", "0.72"))
+
+
+def backflow_stats() -> dict:
+    """Retired memories reachable by recall's spreading-activation step.
+
+    WHY THIS IS NOT COVERED BY FCFR (2026-08-12 research impl 2/3):
+      FCFR calls the hybrid_recall RPC directly — see retrieve() below. The bug this
+      measures lived ENTIRELY in the TypeScript layer ABOVE that RPC: recall expands
+      1-hop links from each top hit and injects up to 5 extra rows that never pass
+      through hybrid_recall at all. So every is_active predicate inside the RPC was
+      correct, FCFR read clean, and retired rows were still being served — with a
+      relevance BOOST, ranked above the live rows that superseded them.
+
+      That is the general lesson worth keeping: a probe that calls the RPC cannot
+      see a defect in the code that post-processes the RPC's output. This check
+      queries the GRAPH rather than the ranker, so it is blind to that same gap in
+      the opposite direction — the two are complements, not substitutes.
+
+    Measured 2026-08-12 before migration 115: 56 reachable edges (74 total) from 15
+    active entry points reaching 36 distinct retired rows. After: 0.
+
+    'Reachable' excludes edges whose SOURCE is itself retired — a retired source can
+    never appear in recall's top hits, so it can never activate anything.
+    """
+    rows = sb_rpc("link_backflow_stats", {"p_threshold": SPREAD_ACTIVATION_THRESHOLD})
+    return rows[0] if rows else {}
+
+
+def backflow_falsify() -> dict:
+    """Prove the backflow metric can still report a violation.
+
+    backflow_edges SHOULD read 0 forever, which makes it indistinguishable from a
+    metric that quietly stopped working — the exact trap FCFR fell into for six runs.
+    So every run injects a synthetic violation (active row -> retired row above
+    threshold), re-measures, and rolls back.
+
+    Safe to run on the nightly: the injection lives in a plpgsql subtransaction and
+    every trigger on memories/memory_links is pure in-transaction (audited 2026-08-12
+    — the one pg_net-looking match is a literal 'https?://' regex inside
+    extract_facts_from_content, not an outbound call). Nothing survives the rollback.
+    """
+    rows = sb_rpc("link_backflow_falsify", {})
+    return rows[0] if rows else {}
+
+
 def retrieve(question: str, topic_hint: str, k: int) -> list:
-    """The REAL recall path, same call the MCP recall tool makes."""
+    """The hybrid_recall RPC — the RANKER, not the whole recall path.
+
+    NOT the full MCP recall tool: that tool post-processes this result (staleness
+    haircut, rerank, and the link-expansion step that injects up to 5 extra rows).
+    Defects in that layer are invisible here by construction — see backflow_stats()
+    for one that was live for months behind a clean FCFR.
+    """
     emb = _fit_dims(embed(question))
     res = sb_rpc(RECALL_FN, {
         "p_query_text": question,
@@ -574,6 +631,15 @@ def cmd_run(args):
         print(f"  ! {failures}/{len(rows)} retrievals failed (within "
               f"{args.max_fail_pct:.0%} tolerance) — recording, but treat as noisy")
 
+    # Link-expansion backflow (migration 115). Query-independent — one call, not one
+    # per probe — so it costs nothing to carry on every run. Recorded even when it is
+    # zero: the point is that it becomes a SERIES, so a regression shows as a step off
+    # a long flat line rather than as a number nobody has a baseline for.
+    bf = backflow_stats()
+    m["backflow_edges"] = bf.get("reachable_edges")
+    # Self-check: a 0 that cannot become non-zero is not a pass, it is a broken gauge.
+    bf_falsify = backflow_falsify()
+
     run = sb_post("eval_runs", {
         "tag": args.tag, "git_sha": args.git_sha,
         "notes": (args.notes or "") + (f" [{failures} retrieval failures]" if failures else ""),
@@ -636,6 +702,28 @@ def cmd_run(args):
             print(f"             {fcf['n'] - fcf['n_scorable']} probe(s) vacuous "
                   f"(all forbidden ids is_active=false; retained as an is_active-filter "
                   f"regression test)")
+    # Link-expansion backflow (migration 115). Measures the STRUCTURE recall walks,
+    # not the ranking it produces — this is the lane FCFR structurally cannot see,
+    # because the leak is in the TS layer above the RPC that FCFR calls.
+    bf_n = m.get("backflow_edges")
+    if bf_n is None:
+        print("  BACKFLOW   n/a (link_backflow_stats unavailable — apply migration 115)")
+    elif bf_n == 0:
+        if bf_falsify.get("detects") is True:
+            print(f"  BACKFLOW   0        (no retired row reachable by spreading "
+                  f"activation at strength >= {SPREAD_ACTIVATION_THRESHOLD}; "
+                  f"falsifier confirms the gauge still moves: "
+                  f"{bf_falsify.get('before_edges')}→{bf_falsify.get('after_edges')} "
+                  f"on an injected violation)")
+        else:
+            print(f"  BACKFLOW   0        !! BUT THE GAUGE IS NOT WIRED — an injected "
+                  f"violation did NOT move it ({bf_falsify}). This 0 is meaningless. "
+                  f"Check link_backflow_stats/link_backflow_falsify (migration 115).")
+    else:
+        print(f"  BACKFLOW   {bf_n}  !! retired memories are reachable by spreading "
+              f"activation — recall can serve a superseded row WITH A RELEVANCE BOOST. "
+              f"Check the is_active filter on the linked-memory fetch in src/index.ts "
+              f"and migration 115's downweight in supersede_memory.")
     # Abstention (migration 096, REC 5). The ONLY probe class that can catch
     # over-retrieval: every other probe rewards returning something.
     if m["abstention_rate"] is None:
@@ -743,6 +831,26 @@ def cmd_run(args):
               f"superseded memories are being served. Check the is_active filter on "
               f"every hybrid_recall lane (migration 048b), supersession heuristic (073), "
               f"and trust-tier weighting.", file=sys.stderr)
+        return 1
+
+    # Backflow gates at 0 BY DEFAULT, unlike the metrics above. They are quality
+    # scores on a self-authored scoreset where the right ceiling is a judgement call;
+    # this one is a structural invariant with an unambiguous correct value, and it was
+    # measured at 56 before migration 115 rather than assumed to be zero.
+    bf_n = m.get("backflow_edges")
+    if args.max_backflow is not None and bf_n is not None and bf_n > args.max_backflow:
+        print(f"  FAIL: {bf_n} link-expansion backflow edge(s) > ceiling "
+              f"{args.max_backflow} — retired memories can re-enter recall through the "
+              f"link graph, boosted above the rows that superseded them. See "
+              f"migrations/115_link_expansion_backflow_guard.sql.", file=sys.stderr)
+        return 1
+    # A green backflow reading from a gauge that cannot detect a violation is worse
+    # than a red one — it actively asserts safety. Fail on it.
+    if args.max_backflow is not None and bf_falsify.get("detects") is not True:
+        print(f"  FAIL: the backflow gauge did not detect an INJECTED violation "
+              f"({bf_falsify}) — backflow_edges={bf_n} is not evidence of anything. "
+              f"Check link_backflow_stats/link_backflow_falsify (migration 115).",
+              file=sys.stderr)
         return 1
     return 0
 
@@ -1241,6 +1349,12 @@ def main():
                    help="hard ceiling on the false-carry-forward rate (migration 084). "
                         "Fails the run when superseded memories reach the top-10. "
                         "Not on by default — establish a baseline before gating.")
+    r.add_argument("--max-backflow", type=int, default=0,
+                   help="hard ceiling on link-expansion backflow edges (migration 115). "
+                        "Defaults to 0 and IS on by default, unlike the quality gates: "
+                        "a retired row reachable through the link graph is a structural "
+                        "defect with an unambiguous correct value, not a tuning choice. "
+                        "Pass a higher value only to record a known-bad baseline.")
     r.add_argument("--git-sha", default=os.environ.get("GIT_SHA"))
     r.add_argument("--no-control", action="store_true",
                    help="skip the MemDelta control arm (migration 091). The control "

@@ -218,6 +218,19 @@ const RERANK_TOP_K = parseInt(process.env.RERANK_TOP_K || "5", 10);
 // Multiplier applied to a staleness_candidate row's confidence at recall time.
 const STALE_CONFIDENCE_FACTOR = parseFloat(process.env.STALE_CONFIDENCE_FACTOR || "0.75");
 
+// ── Spreading activation (recall link expansion) ────────────────────────────
+// Minimum link strength for a 1-hop edge to activate its target. Migration 115
+// downweights inbound edges to a retired row BELOW this value, so the constant
+// is a contract shared with SQL — change it in both places or retired edges
+// climb back over the bar. eval/retrieval_regression.py asserts they agree.
+const SPREAD_ACTIVATION_THRESHOLD = parseFloat(process.env.SPREAD_ACTIVATION_THRESHOLD || "0.72");
+// Extra memories injected into the result set by link expansion.
+const SPREAD_EXTRA_LIMIT = parseInt(process.env.SPREAD_EXTRA_LIMIT || "5", 10);
+// Candidate pool gathered BEFORE the retirement/validity filter. Larger than
+// SPREAD_EXTRA_LIMIT on purpose: filtering has to happen against a wide pool so
+// retired candidates cannot starve live ones out of the extras budget.
+const SPREAD_CANDIDATE_CAP = parseInt(process.env.SPREAD_CANDIDATE_CAP || "50", 10);
+
 // ── Adaptive recall router (2026-07-26 research, tier 1) ────────────────────
 // Off by default. Set RECALL_ROUTER=1 to enable.
 const RECALL_ROUTER = process.env.RECALL_ROUTER === "1";
@@ -1937,27 +1950,53 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
                   .from("memory_links")
                   .select("target_id, link_type, strength")
                   .eq("source_id", m.id)
-                  .gte("strength", 0.72);
+                  .gte("strength", SPREAD_ACTIVATION_THRESHOLD);
                 return { sourceId: m.id, links: links || [] };
               })
             );
 
-            // Collect unique target IDs from spreading activation (cap at 5 extra memories)
-            const tcTargetIds: string[] = [];
+            // Collect unique candidate target IDs. Deliberately over-collect here and
+            // cap AFTER the retirement/validity filter below: capping at 5 during
+            // collection let retired rows consume the budget and starve live ones,
+            // so the fix has to widen the candidate pool, not just filter the output.
+            const tcCandidateIds: string[] = [];
             for (const { links } of linkFetches) {
               for (const link of links) {
-                if (!filteredIds.has(link.target_id) && !tcTargetIds.includes(link.target_id) && tcTargetIds.length < 5) {
-                  tcTargetIds.push(link.target_id);
+                if (!filteredIds.has(link.target_id) && !tcCandidateIds.includes(link.target_id)
+                    && tcCandidateIds.length < SPREAD_CANDIDATE_CAP) {
+                  tcCandidateIds.push(link.target_id);
                 }
               }
             }
 
-            // Fetch those extra memories and assign boosted scores
-            if (tcTargetIds.length > 0) {
+            // Fetch those extra memories and assign boosted scores.
+            //
+            // BACKFLOW GUARD: this fetch MUST carry the same retirement and bi-temporal
+            // predicates the primary path applies, or spreading activation becomes a
+            // side door around them. It previously had neither, so a row that
+            // supersede_memory deliberately retired could be pulled back into context
+            // through a link from a still-active row — and arrive with a RELEVANCE
+            // BOOST, ranked above the live rows it was superseded by. That is the
+            // "backflow" recontamination failure mode (arXiv 2602.17692, Agentic
+            // Unlearning): forgotten content persisting via a derived artifact (the
+            // link graph) and re-entering through the retrieval loop.
+            // Measured before the fix (2026-08-12): 56 edges from 15 active entry
+            // points reached 36 retired rows at or above the activation threshold.
+            // Hard forget was never affected — memory_links is ON DELETE CASCADE.
+            // Migration 115 is the other half: it stops NEW retirements from leaving
+            // high-strength inbound edges behind. This filter is the read-side backstop
+            // and stays even so — defence in depth, since edges are also hand-authored
+            // via add_memory_link and rewired by supersede_memory.
+            if (tcCandidateIds.length > 0) {
+              const validAt = as_of ?? new Date().toISOString();
               const { data: extraMems } = await supabase
                 .from("memories")
                 .select("id, type, name, description, content, tags, source, conflict_flagged")
-                .in("id", tcTargetIds);
+                .in("id", tcCandidateIds)
+                .not("is_active", "is", false)
+                .lte("valid_from", validAt)
+                .or(`valid_to.is.null,valid_to.gt.${validAt}`)
+                .limit(SPREAD_EXTRA_LIMIT);
               if (extraMems) {
                 for (const em of extraMems) {
                   // Find max boost from any temporal/causal link pointing to this memory
@@ -1974,10 +2013,33 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
               }
             }
 
-            // Fetch links for the top result to show in the link section
+            // Fetch links for the top result to show in the link section.
+            //
+            // get_linked_memories joins memories with NO is_active predicate and no
+            // strength floor at all, so it leaks retired rows independently of the
+            // spreading-activation path above — and independently of migration 115's
+            // downweight, which only moves edges below a threshold this display does
+            // not apply. It surfaces name + description rather than full content, so
+            // the blast radius is smaller, but it is the same backflow channel and an
+            // agent reads a retired row's summary as current. Filtered here rather
+            // than in the RPC because get_linked_memories is also called by callers
+            // that legitimately want lineage (which is retired rows by definition).
             let linkSection = "";
             const top = filtered[0];
-            const { data: linked } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
+            const { data: linkedRaw } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
+            let linked = linkedRaw as any[] | null;
+            if (linked?.length) {
+              const validAt = as_of ?? new Date().toISOString();
+              const { data: liveRows } = await supabase
+                .from("memories")
+                .select("id")
+                .in("id", linked.map((l: any) => l.id))
+                .not("is_active", "is", false)
+                .lte("valid_from", validAt)
+                .or(`valid_to.is.null,valid_to.gt.${validAt}`);
+              const liveIds = new Set((liveRows || []).map((r: any) => r.id));
+              linked = linked.filter((l: any) => liveIds.has(l.id));
+            }
             if (linked?.length) {
               // Fetch link_type for each linked memory from memory_links
               const { data: linkTypeRows } = await supabase
