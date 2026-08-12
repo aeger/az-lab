@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodic podman healthcheck-integrity audit
+Requires=container-health-audit.service
+
+[Timer]
+# Every 15 minutes. The failure this catches is static — a missing or orphaned
+# healthcheck timer stays missing until someone recreates the container — so
+# polling faster buys nothing. The 10m boot delay keeps the audit clear of the
+# start-up window, where `starting` is legitimate and every stack is still
+# settling; without it a reboot would post a burst of false findings.
+OnBootSec=10min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

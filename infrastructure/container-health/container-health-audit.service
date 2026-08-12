@@ -1,0 +1,10 @@
+[Unit]
+Description=Podman healthcheck-integrity audit (unscheduled/orphaned/stuck probes)
+Documentation=file:///home/almty1/azlab/infrastructure/container-health/container_health_audit.py
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/almty1/azlab/infrastructure/container-health/container_health_audit.py
+StandardOutput=journal
+StandardError=journal

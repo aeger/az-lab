@@ -153,7 +153,15 @@ services:
       # leaves `starting` while the service under it is answering 200s.
       # See eval/onnx_reranker/healthcheck.py. (curl/wget are absent from the
       # python:3.12-slim base, which is why this isn't the usual curl probe.)
-      test: ["CMD", "python3", "/app/healthcheck.py"]
+      #
+      # CMD-SHELL, not CMD: podman-compose 1.0.6 renders exec-form CMD by
+      # joining argv with a literal quote-space-quote and then handing the
+      # result to `--healthcheck-command /bin/sh -c ...`, so the stored Test
+      # reads `/bin/sh -c python3' '/app/healthcheck.py`. That survives by
+      # accident here (the quoted spaces re-concatenate into one word), but it
+      # breaks outright the moment any argv entry contains a real space.
+      # CMD-SHELL passes one already-quoted string through untouched.
+      test: ["CMD-SHELL", "python3 /app/healthcheck.py"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -187,7 +195,8 @@ services:
           cpus: '1.0'
           memory: 2G
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      # CMD-SHELL, not CMD — see the rerank-onnx healthcheck note above.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -222,7 +231,8 @@ services:
           cpus: '1.0'
           memory: 4G
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8081/health"]
+      # CMD-SHELL, not CMD — see the rerank-onnx healthcheck note above.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/health"]
       interval: 30s
       timeout: 10s
       retries: 3

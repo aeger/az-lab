@@ -54,6 +54,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -120,6 +121,56 @@ def excerpt_for(text, match):
 
 
 # ── Supabase ────────────────────────────────────────────────────────────────
+# Transient-failure policy.
+#
+# 2026-08-11 19:48:55Z: the weekly run died on batch 2 of 5 with an unretried
+# HTTP 500 from rpc/stamp_injection_scan and left the unit in `failed`. The
+# Postgres log for that exact second reads "deadlock detected" — the 200-row
+# `update memories ... where id = any(p_ids)` lost a deadlock against the
+# concurrent writers that a host reboot sets off all at once (rpc/
+# mark_consistency_checked took a 500 in the same window, four seconds earlier,
+# and there were 4-5s ShareLock waits either side of it). Nothing about the
+# request was wrong; it was simply unlucky about timing.
+#
+# Retrying is therefore the correct response, and it is safe: every write this
+# script performs is idempotent. upsert_findings merges on the table's unique
+# key and stamp_scanned sets two absolute bookkeeping columns, so replaying a
+# batch converges to the same state. Not retrying is what turns one unlucky
+# 40P01 into a silently skipped 800 rows of corpus coverage.
+RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+RETRY_ATTEMPTS = 5
+RETRY_BASE_S = 1.5
+
+
+def with_retry(label, fn):
+    """Call fn(), retrying transient transport/5xx failures with exponential backoff.
+
+    Deliberately does NOT retry 4xx (except 429): a malformed request or an RLS
+    denial will fail identically forever, and burning four more attempts on it
+    only delays a real error the operator needs to see.
+    """
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            r = fn()
+            if r.status_code in RETRY_STATUSES and attempt < RETRY_ATTEMPTS:
+                raise httpx.HTTPStatusError(
+                    f"retryable status {r.status_code}", request=r.request, response=r
+                )
+            r.raise_for_status()
+            return r
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            retryable = status is None or status in RETRY_STATUSES
+            if not retryable or attempt == RETRY_ATTEMPTS:
+                raise
+            delay = RETRY_BASE_S * (2 ** (attempt - 1))
+            log.warning(
+                "%s failed (%s) attempt %d/%d — retrying in %.1fs",
+                label, status or type(e).__name__, attempt, RETRY_ATTEMPTS, delay,
+            )
+            time.sleep(delay)
+
+
 def sb_headers(extra=None):
     h = {
         "apikey": SUPABASE_KEY,
@@ -145,13 +196,12 @@ def fetch_batch(client, version, scan_all, offset):
     if not scan_all:
         params["or"] = f"(scan_pattern_version.is.null,scan_pattern_version.lt.{version})"
 
-    r = client.get(
+    r = with_retry("fetch_batch", lambda: client.get(
         f"{SUPABASE_URL}/rest/v1/memories",
         params=params,
         headers=sb_headers({"Range-Unit": "items", "Range": f"{offset}-{offset + PAGE_SIZE - 1}"}),
         timeout=60,
-    )
-    r.raise_for_status()
+    ))
     return r.json()
 
 
@@ -164,14 +214,13 @@ def upsert_findings(client, findings):
     """
     if not findings:
         return 0
-    r = client.post(
+    r = with_retry("upsert_findings", lambda: client.post(
         f"{SUPABASE_URL}/rest/v1/memory_scan_findings",
         params={"on_conflict": "memory_id,field,threat_id"},
         json=findings,
         headers=sb_headers({"Prefer": "resolution=merge-duplicates,return=representation"}),
         timeout=60,
-    )
-    r.raise_for_status()
+    ))
     return len(r.json())
 
 
@@ -187,24 +236,30 @@ def stamp_scanned(client, memory_ids, version, scanned_at):
     """
     if not memory_ids:
         return 0
-    r = client.post(
+    # Sorted, so every caller of this RPC takes row locks in the same order.
+    # Postgres locks `where id = any(...)` in whatever order it reaches the
+    # rows, and two concurrent updaters walking the same ids in different
+    # orders is the textbook deadlock cycle — which is what killed the
+    # 2026-08-11 run. Sorting does not make deadlock impossible (other writers
+    # touch these rows by other paths, which is why with_retry wraps this too)
+    # but it removes the one cycle this script can cause by itself.
+    ordered = sorted(memory_ids)
+    r = with_retry("stamp_scanned", lambda: client.post(
         f"{SUPABASE_URL}/rest/v1/rpc/stamp_injection_scan",
-        json={"p_ids": memory_ids, "p_version": version, "p_scanned_at": scanned_at},
+        json={"p_ids": ordered, "p_version": version, "p_scanned_at": scanned_at},
         headers=sb_headers(),
         timeout=60,
-    )
-    r.raise_for_status()
+    ))
     return r.json()
 
 
 def coverage(client, version):
-    r = client.post(
+    r = with_retry("coverage", lambda: client.post(
         f"{SUPABASE_URL}/rest/v1/rpc/injection_scan_coverage",
         json={"p_current_version": version},
         headers=sb_headers(),
         timeout=30,
-    )
-    r.raise_for_status()
+    ))
     data = r.json()
     return data[0] if isinstance(data, list) and data else data
 
@@ -216,7 +271,7 @@ def notify_sentinel(client, summary):
     homelab corpus would train Jeff to ignore this notification inside a week.
     """
     high = summary["high_severity_matches"]
-    r = client.post(
+    r = with_retry("notify_sentinel", lambda: client.post(
         f"{SUPABASE_URL}/rest/v1/sentinel_notifications",
         json={
             "source": "services",
@@ -237,8 +292,7 @@ def notify_sentinel(client, summary):
         },
         headers=sb_headers(),
         timeout=20,
-    )
-    r.raise_for_status()
+    ))
     log.info("sentinel notification raised (%d high-severity)", high)
 
 

@@ -1,0 +1,22 @@
+[Unit]
+Description=Weekly memory injection rescan timer
+Requires=memory-injection-rescan.service
+
+[Timer]
+# Monday 04:00 UTC. Deliberately after memory-contradiction-scan (daily 03:30) and
+# episodic-distill (03:00) so the governance passes never interleave — the scan
+# reads name/description/content, which those jobs rewrite.
+OnCalendar=Mon *-*-* 04:00:00 UTC
+Persistent=true
+# Persistent=true means a missed weekly run fires immediately at the next boot —
+# which on 2026-08-11 put a 200-row `update memories` straight into the reboot
+# thundering herd and lost a deadlock (Postgres logged "deadlock detected" at
+# 19:48:55Z, the same second PostgREST returned the 500 that killed the run).
+# The catch-up is still wanted; it just must not land while every stack, agent
+# and poller on the host is contending for the same rows. injection_scan.py now
+# retries transient failures, so this delay is defence in depth rather than the
+# only guard.
+RandomizedDelaySec=20min
+
+[Install]
+WantedBy=timers.target

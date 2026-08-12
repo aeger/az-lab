@@ -1,0 +1,52 @@
+[Unit]
+Description=cAdvisor container metrics (Podman)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/podman rm -f cadvisor-host
+# --health-cmd is stated here even though the cadvisor image already ships a
+# HEALTHCHECK: podman 4.9.3 only creates the per-container healthcheck TIMER
+# when the probe is given on the command line. A healthcheck inherited from the
+# image populates .Config.Healthcheck but schedules nothing, so Health.Status
+# freezes at whatever the container was born with. cadvisor-host sat at
+# "starting" with Log:null from the 2026-08-11 19:48Z reboot until 08-12 —
+# FailingStreak stuck at 0, so nothing keying on `unhealthy` could ever fire.
+# The quotes matter: systemd splits ExecStart on whitespace, so the probe has
+# to be one quoted argument or podman receives `--health-cmd=wget` alone.
+ExecStart=/usr/bin/podman run \
+  --name=cadvisor-host \
+  --cpus=0.5 \
+  --cgroupns=host \
+  --security-opt=no-new-privileges \
+  --cap-drop=ALL \
+  --cap-add=SYS_PTRACE \
+  --cap-add=SYS_ADMIN \
+  --cap-add=DAC_READ_SEARCH \
+  --device=/dev/kmsg \
+  --label=traefik.enable=false \
+  --network=proxy \
+  --network-alias=cadvisor \
+  "--health-cmd=wget --quiet --tries=1 --spider http://localhost:8080/healthz || exit 1" \
+  --health-interval=30s \
+  --health-timeout=5s \
+  --health-retries=3 \
+  --health-start-period=30s \
+  -v /:/rootfs:ro \
+  -v /sys:/sys:ro \
+  -v /var/lib/containers:/var/lib/containers:ro \
+  -v /run/user/1000/podman/podman.sock:/tmp/podman.sock:ro \
+  gcr.io/cadvisor/cadvisor:latest \
+  --podman=unix:///tmp/podman.sock \
+  --housekeeping_interval=30s \
+  --global_housekeeping_interval=2m \
+  --store_container_labels=false \
+  --disable_metrics=tcp,udp,sched,process,hugetlb,referenced_memory,percpu,advtcp,cpu_topology,resctrl,memory_numa \
+  --v=1
+ExecStop=/usr/bin/podman stop cadvisor-host
+ExecStopPost=/usr/bin/podman rm -f cadvisor-host
+
+[Install]
+WantedBy=default.target
