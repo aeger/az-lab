@@ -1459,6 +1459,437 @@ def _ok_line(cur: dict, delta_pct, vals: list, ssv: int) -> str:
             f"{ctrl} · {forget}\n{hard} · {abstain}")
 
 
+# ── Supersession-consolidation probe (2026-08-13 research impl 2/3) ──────────
+#
+# WHAT THIS MEASURES, AND WHY IT IS NOT FCFR.
+#   FCFR (migration 084) is OBSERVATIONAL: it points at rows the corpus happens to
+#   have retired already and asks whether hybrid_recall serves them. It therefore
+#   inherits whatever the corpus gives it — which is how its denominator quietly
+#   drained from 4 to 3 (see _gate_forgetting_denominator). This probe is
+#   CONSTRUCTIVE: it manufactures the supersession itself, end to end, inside one
+#   run — assert a fact, assert its replacement, invoke supersede_memory, then ask
+#   the recall path for the fact and check that the RETIRED object never comes back.
+#   That is the az-lab analogue of MemoryAgentBench's FactConsolidation
+#   (arXiv 2507.05257), and the number it produces is the one MemStrata
+#   (arXiv 2606.26511) reports as 15-40% for undefended RAG.
+#
+# WHY IT GOES THROUGH THE MCP TOOL AND NOT JUST THE RPC.
+#   retrieve() above calls hybrid_recall directly. Every lane in that RPC filters
+#   `is_active IS NOT FALSE`, so a probe that stops there is close to tautological —
+#   it can only ever confirm a predicate we can read in the SQL. The exposure lives
+#   ABOVE the RPC, in the TypeScript that post-processes it: spreading activation
+#   injects up to 5 rows that never pass through hybrid_recall at all (that gap
+#   served 36 retired rows for months behind a clean FCFR — see backflow_stats),
+#   the linked-memories section joins with its own predicates, and the keyword
+#   FALLBACK path filters bi-temporally but has never filtered is_active at all
+#   (src/index.ts, "NOTE: this path has never filtered is_active either").
+#   So each case is measured at four layers and the layers are reported separately.
+#
+# WHAT IT DELIBERATELY DOES NOT DO.
+#   It does not derive supersession from a (subject, relation, object) key, and it
+#   does not gate. Supersession here is AGENT-INVOKED: nothing forces mutual
+#   exclusion between two live rows asserting the same (subject, relation), and this
+#   probe cannot see that class of failure at all — it only measures whether an
+#   INVOKED supersession is airtight. Whether to derive the key instead is a
+#   separate design call. Read a 0.0 here as "supersede_memory, once called, holds",
+#   NOT as "the corpus has no stale duplicates".
+#
+# COST/SAFETY. Seeds real rows in the real corpus (there is no staging DB), so it
+# takes the same eval_lock and access-stat snapshot as `run`, names everything with
+# CONSOL_PREFIX, and hard-deletes in a finally block. `consolidation --cleanup-only`
+# sweeps orphans from a crashed run.
+CONSOL_PREFIX = "consol-probe-"
+MCP_URL = os.environ.get("MEMORY_MCP_URL", "http://localhost:3100/mcp")
+
+# Each case is one (subject, relation) whose object changes exactly once.
+# `nonce` is a coined word so the probe's rows are the ONLY corpus rows that can
+# match the query — a leak is then unambiguous rather than a near-duplicate.
+# old_agent/new_agent are the point of cases 2 and 3: three agents share one pool,
+# so the supersession that retires wren's row is routinely NOT wren's.
+CONSOL_CASES = [
+    {"key": "same-agent", "nonce": "quillow",
+     "subject": "the quillow relay", "relation": "listens on port",
+     "old": "41871", "new": "55902",
+     "old_agent": "wren", "new_agent": "wren", "reader_agent": "iris"},
+    {"key": "cross-agent-iris-over-wren", "nonce": "brambit",
+     "subject": "the brambit collector", "relation": "runs on host",
+     "old": "192.168.1.144", "new": "192.168.1.199",
+     "old_agent": "wren", "new_agent": "iris", "reader_agent": "atlas"},
+    {"key": "cross-agent-atlas-over-iris", "nonce": "ferrowick",
+     "subject": "the ferrowick vault", "relation": "backs up to bucket",
+     "old": "ferrowick-cold-01", "new": "ferrowick-cold-07",
+     "old_agent": "iris", "new_agent": "atlas", "reader_agent": "wren"},
+    # Entry-point case: a LIVE row points at the row we are about to retire, at a
+    # strength above SPREAD_ACTIVATION_THRESHOLD. This is the only case that can
+    # exercise spreading activation, i.e. the layer FCFR structurally cannot see.
+    {"key": "linked-entry-point", "nonce": "tanglecap",
+     "subject": "the tanglecap scheduler", "relation": "fires at",
+     "old": "03:20 UTC", "new": "07:45 UTC",
+     "old_agent": "wren", "new_agent": "iris", "reader_agent": "atlas",
+     "link_entry": True},
+    # Private/agent-scoped case: retirement must hold on the private lane too,
+    # read back by the owning agent (the only reader who can see it at all).
+    {"key": "private-scope-cross-agent", "nonce": "mirevale",
+     "subject": "the mirevale token", "relation": "rotates every",
+     "old": "14 days", "new": "45 days",
+     "old_agent": "iris", "new_agent": "wren", "reader_agent": "iris",
+     "private": True},
+]
+
+
+class McpHttp:
+    """Minimal StreamableHTTP JSON-RPC client for the memory MCP server.
+
+    Exists because no eval script has ever called the MCP tool layer — they all
+    call the Postgres RPCs underneath it. That is precisely the blind spot this
+    probe is for, so it cannot reuse them."""
+
+    def __init__(self, url: str = MCP_URL):
+        self.url, self.sid, self._n = url, None, 0
+
+    def _rpc(self, method: str, params=None, notify: bool = False):
+        self._n += 1
+        body = {"jsonrpc": "2.0", "method": method}
+        if not notify:
+            body["id"] = self._n
+        if params is not None:
+            body["params"] = params
+        h = {"Content-Type": "application/json",
+             "Accept": "application/json, text/event-stream"}
+        if self.sid:
+            h["mcp-session-id"] = self.sid
+        r = httpx.post(self.url, headers=h, json=body, timeout=120)
+        r.raise_for_status()
+        self.sid = self.sid or r.headers.get("mcp-session-id")
+        if notify or not r.text.strip():
+            return None
+        # The transport answers as SSE by default; tolerate plain JSON too.
+        payload = None
+        if r.text.lstrip().startswith("{"):
+            payload = r.json()
+        else:
+            for line in r.text.splitlines():
+                if line.startswith("data:"):
+                    payload = json.loads(line[5:].strip())
+        if payload is None:
+            raise RuntimeError(f"MCP {method}: unparseable response {r.text[:200]!r}")
+        if "error" in payload:
+            raise RuntimeError(f"MCP {method}: {payload['error']}")
+        return payload.get("result")
+
+    def open(self):
+        self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                 "clientInfo": {"name": "consolidation-probe", "version": "1"}})
+        self._rpc("notifications/initialized", notify=True)
+        return self
+
+    def call(self, tool: str, arguments: dict) -> str:
+        res = self._rpc("tools/call", {"name": tool, "arguments": arguments}) or {}
+        return "\n".join(c.get("text", "") for c in res.get("content", []))
+
+    def close(self):
+        if not self.sid:
+            return
+        try:
+            httpx.request("DELETE", self.url, headers={"mcp-session-id": self.sid}, timeout=15)
+        except Exception:
+            pass
+
+
+def _consol_names(case: dict, run_tok: str) -> tuple:
+    base = f"{CONSOL_PREFIX}{case['key']}-{run_tok}"
+    return f"{base}-old", f"{base}-new", f"{base}-entry"
+
+
+def _consol_write(mcp: McpHttp, case: dict, run_tok: str) -> dict:
+    """Assert v1 and v2 and wire the entry edge — but do NOT supersede yet.
+
+    The supersede is a separate step (_consol_supersede) so the probe can measure
+    the SAME (case, layer) pair on both sides of it. See cmd_consolidation: the
+    pre-supersede pass is the positive control, and it is what stops this probe
+    from becoming another metric that prints a clean 0 because it stopped working.
+
+    Writes go through the MCP `remember` tool rather than a REST insert so the row
+    gets the real embedding, trust tier, writer_agent derivation and fact extraction
+    a real memory gets. A REST-inserted row with a hand-made embedding would be
+    testing a fixture, not the write path the three agents actually use."""
+    old_n, new_n, entry_n = _consol_names(case, run_tok)
+    subj, rel = case["subject"], case["relation"]
+    claim_old = f"{subj} {rel} {case['old']}"
+    claim_new = f"{subj} {rel} {case['new']}"
+    common = {"type": "reference", "tags": ["eval", "consolidation-probe", case["nonce"]],
+              "source": "claude-code", "importance_score": 0.5}
+
+    mcp.call("remember", {**common, "name": old_n, "agent_id": case["old_agent"],
+                          "description": f"{subj} — {rel} ({case['nonce']})",
+                          "content": f"{claim_old}. The {case['nonce']} value is "
+                                     f"{case['old']}. SENTINEL_OLD_{case['nonce'].upper()}.",
+                          **({"visibility": "private"} if case.get("private") else {})})
+    mcp.call("remember", {**common, "name": new_n, "agent_id": case["new_agent"],
+                          "description": f"{subj} — {rel} ({case['nonce']}, current)",
+                          "content": f"{claim_new}. The {case['nonce']} value is "
+                                     f"{case['new']}. SENTINEL_NEW_{case['nonce'].upper()}."})
+    if case.get("link_entry"):
+        mcp.call("remember", {**common, "name": entry_n, "agent_id": "wren",
+                              "description": f"operational note referencing {subj}",
+                              "content": f"Runbook note: check {subj} whenever the "
+                                         f"{case['nonce']} pipeline stalls."})
+
+    def snap():
+        return {m["name"]: m for m in sb_get("memories", {
+            "select": "id,name,is_active,superseded_by,valid_to,agent_id,writer_agent",
+            "name": f"like.{CONSOL_PREFIX}%{run_tok}%"})}
+
+    ids = snap()
+    if case.get("link_entry"):
+        if not (ids.get(entry_n) and ids.get(old_n)):
+            raise RuntimeError(f"{case['key']}: entry/old row missing, cannot build the "
+                               f"spreading-activation edge this case exists to test")
+        # Strength deliberately ABOVE SPREAD_ACTIVATION_THRESHOLD and created BEFORE
+        # the supersede — a weaker or later edge would make the case vacuous, since
+        # recall would never traverse it and migration 115's downweight (which fires
+        # inside supersede_memory) would never have an edge to act on.
+        mcp.call("add_memory_link", {"source_id": ids[entry_n]["id"],
+                                     "target_id": ids[old_n]["id"],
+                                     "relationship": "related_to", "link_type": "causal",
+                                     "strength": 0.95})
+        ids = snap()
+
+    old_row = ids.get(old_n)
+    if not old_row or not ids.get(new_n):
+        raise RuntimeError(f"{case['key']}: seed rows missing after write "
+                           f"(old={bool(old_row)}, new={bool(ids.get(new_n))})")
+    # remember() has a mem0 path that can auto-supersede a similar stale row. If it
+    # fired here the positive control is already gone and the case measures nothing.
+    if old_row["is_active"] is False:
+        raise RuntimeError(f"{case['key']}: {old_n} was retired before the probe "
+                           f"superseded it (auto-supersede on write?) — case unscorable")
+    return {"old": old_row, "new": ids.get(new_n), "entry": ids.get(entry_n),
+            "old_name": old_n, "new_name": new_n, "entry_name": entry_n, "_snap": snap}
+
+
+def _consol_supersede(mcp: McpHttp, case: dict, seeded: dict) -> dict:
+    """The step under test. Verifies the retirement actually landed.
+
+    A case whose supersession did not take is UNSCORABLE, not a pass — the same
+    vacated-denominator trap the forgetting lane fell into on 2026-08-11."""
+    mcp.call("supersede_memory", {"old_name": seeded["old_name"],
+                                  "new_name": seeded["new_name"],
+                                  "reason": f"consolidation probe: {case['relation']} "
+                                            f"changed {case['old']} -> {case['new']}"})
+    old_row = seeded["_snap"]().get(seeded["old_name"])
+    if not old_row:
+        raise RuntimeError(f"{case['key']}: {seeded['old_name']} vanished during supersede")
+    if old_row["is_active"] is not False or not old_row["superseded_by"]:
+        raise RuntimeError(f"{case['key']}: supersede_memory did not retire "
+                           f"{seeded['old_name']} (is_active={old_row['is_active']}, "
+                           f"superseded_by={old_row['superseded_by']}) — case unscorable")
+    seeded["old"] = old_row
+    return seeded
+
+
+def _served(text: str, case: dict, seeded: dict) -> bool:
+    """Did the retired row come back? Two tells, either one counts.
+
+    The sentinel alone would miss a leak that surfaces name + description WITHOUT
+    content — which is exactly what the linked-memories section does, and an agent
+    reads a retired row's summary as current. The name alone would miss nothing
+    today but costs nothing to keep as a second, independent tell.
+
+    Deliberately NOT matching the bare object string (`case["old"]`): recall returns
+    the top-k of the WHOLE corpus, and values like "14 days" occur in unrelated live
+    rows. That check would have manufactured leaks out of coincidence. Both tells
+    used here are unique to the retired row by construction."""
+    return (f"SENTINEL_OLD_{case['nonce'].upper()}" in text
+            or seeded["old_name"] in text)
+
+
+def _consol_probe(mcp: McpHttp, case: dict, seeded: dict, k: int) -> list:
+    """Four layers per case. Each returns (layer, served?, note)."""
+    q = f"what does {case['subject']} {case['relation']}?"
+    hint = f"{case['nonce']} {case['relation'].split()[0]}"
+    out = []
+
+    # L1 — the ranker alone. Near-tautological by design: it is the control that
+    # says the is_active predicate inside hybrid_recall is still wired.
+    try:
+        ids = retrieve(q, hint, k)
+        out.append(("ranker", seeded["old"]["id"] in ids,
+                    f"{len(ids)} ids, new@{ids.index(seeded['new']['id']) + 1}"
+                    if seeded["new"] and seeded["new"]["id"] in ids else f"{len(ids)} ids, new MISSING"))
+    except Exception as e:
+        out.append(("ranker", None, f"ERROR {e}"))
+
+    # L2/L3/L4 — the whole MCP recall tool: staleness haircut, rerank, spreading
+    # activation, linked-memories section, and the keyword fallback beneath them.
+    probes = [
+        ("recall/hybrid", {"query": q, "topic_hint": hint, "limit": k}),
+        # Exact-token lane. A unique nonce is the query most likely to drop out of
+        # the embedding lane and land on BM25/trigram — or fall through to keyword.
+        ("recall/lexical", {"query": f"{case['nonce']} {case['old']}", "topic_hint": hint,
+                            "limit": k, "recall_mode": "lexical"}),
+        # A DIFFERENT agent than either writer. Three agents share one pool, so the
+        # reader of a retired fact is usually not the agent that retired it.
+        ("recall/agent", {"query": q, "topic_hint": hint, "limit": k,
+                          "agent_id": case["reader_agent"]}),
+    ]
+    for label, arguments in probes:
+        try:
+            text = mcp.call("recall", arguments)
+            path = "keyword" if "(keyword)" in text else (
+                "spread" if "spreading-activation" in text else "hybrid")
+            out.append((label, _served(text, case, seeded), f"path={path}"))
+        except Exception as e:
+            out.append((label, None, f"ERROR {e}"))
+    return out
+
+
+def _consol_cleanup(run_tok: str = None) -> int:
+    """Hard-delete every probe row. memories cascades to memory_links, and
+    memory_log carries no FK to memories (verified 2026-08-13), so this leaves
+    the audit trail intact and the corpus unchanged."""
+    pat = f"like.{CONSOL_PREFIX}%{run_tok}%" if run_tok else f"like.{CONSOL_PREFIX}%"
+    rows = sb_get("memories", {"select": "id,name", "name": pat})
+    n = 0
+    for row in rows:
+        r = httpx.delete(f"{SUPABASE_URL}/rest/v1/memories",
+                         headers=SB_HEADERS, params={"id": f"eq.{row['id']}"}, timeout=30)
+        if r.status_code < 300:
+            n += 1
+        else:
+            print(f"  ! could not delete {row['name']}: {r.status_code} {r.text[:120]}",
+                  file=sys.stderr)
+    return n
+
+
+def _retired_without_valid_to() -> dict:
+    """Corpus census, not part of the rate — reported because the keyword FALLBACK
+    path filters bi-temporally but NOT on is_active. supersede_memory always stamps
+    valid_to, so its retirements are covered; a row retired by any OTHER path with
+    valid_to still NULL is reachable there. This counts that population so the
+    number is on the record rather than inferred from reading the TypeScript."""
+    def cnt(params):
+        r = httpx.get(f"{SUPABASE_URL}/rest/v1/memories",
+                      headers={**SB_HEADERS, "Prefer": "count=exact",
+                               "Range-Unit": "items", "Range": "0-0"},
+                      params={"select": "id", **params}, timeout=30)
+        r.raise_for_status()
+        return int(r.headers.get("content-range", "*/0").split("/")[-1])
+    return {"retired": cnt({"is_active": "is.false"}),
+            "retired_no_valid_to": cnt({"is_active": "is.false", "valid_to": "is.null"})}
+
+
+def cmd_consolidation(args):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        die("SUPABASE_URL / SUPABASE_SECRET_KEY missing (expected in ../.env)")
+
+    if args.cleanup_only:
+        n = _consol_cleanup(None)
+        print(f"swept {n} orphaned {CONSOL_PREFIX}* row(s)")
+        return 0
+
+    mcp = McpHttp()
+
+    run_tok = (args.run_token or f"{int(os.getpid())}{len(CONSOL_CASES)}")[:12]
+    cases = [c for c in CONSOL_CASES if not args.only or c["key"] in args.only.split(",")]
+    if not cases:
+        die(f"--only matched no case; known keys: {', '.join(c['key'] for c in CONSOL_CASES)}")
+
+    census = _retired_without_valid_to()
+    rows, unscorable = [], []
+
+    with eval_lock(f"consolidation --run-token {run_tok}"):
+        snapped = sb_rpc("eval_access_snapshot_take", {})
+        print(f"access-stat snapshot taken ({snapped} rows)")
+        try:
+            mcp.open()
+            print(f"Seeding {len(cases)} supersession case(s) as {CONSOL_PREFIX}*-{run_tok} …")
+            for case in cases:
+                try:
+                    seeded = _consol_write(mcp, case, run_tok)
+                    # PRE pass — the positive control. Every (case, layer) pair that
+                    # does NOT return the value here is UNARMED: the layer could not
+                    # see the row even while it was live, so its post-supersede
+                    # silence proves nothing and it is excluded from the denominator.
+                    pre = _consol_probe(mcp, case, seeded, args.k)
+                    seeded = _consol_supersede(mcp, case, seeded)
+                    post = _consol_probe(mcp, case, seeded, args.k)
+                except Exception as e:
+                    print(f"  ! {case['key']}: UNSCORABLE — {e}", file=sys.stderr)
+                    unscorable.append((case["key"], str(e)))
+                    continue
+                pre_by_layer = {layer: served for layer, served, _ in pre}
+                for layer, served, note in post:
+                    rows.append({"case": case["key"], "layer": layer,
+                                 "armed": pre_by_layer.get(layer) is True,
+                                 "pre_served": pre_by_layer.get(layer),
+                                 "served": served, "note": note,
+                                 "old_agent": case["old_agent"], "new_agent": case["new_agent"],
+                                 "reader_agent": case["reader_agent"],
+                                 "old_id": seeded["old"]["id"]})
+        finally:
+            deleted = _consol_cleanup(run_tok)
+            mcp.close()
+            repaired = sb_rpc("eval_access_snapshot_restore", {})
+            print(f"cleanup: {deleted} probe row(s) deleted; "
+                  f"access stats restored ({repaired} rows perturbed)")
+
+    # DENOMINATOR = ARMED pairs only. An unarmed pair is the consolidation-probe
+    # equivalent of a forgetting probe whose forbidden rows are all inactive: it
+    # cannot fail, so counting it only drags the rate toward zero. That dilution is
+    # exactly what hid FCFR for six runs — see annotate_reachability.
+    armed = [r for r in rows if r["armed"] and r["served"] is not None]
+    unarmed = [r for r in rows if not r["armed"]]
+    errored = [r for r in rows if r["served"] is None]
+    leaks = [r for r in armed if r["served"]]
+    rate = (len(leaks) / len(armed)) if armed else None
+
+    print(f"\n=== consolidation probe ({run_tok}) ===")
+    print(f"  cases     {len(cases) - len(unscorable)}/{len(cases)} scorable"
+          + (f"  ({len(unscorable)} UNSCORABLE)" if unscorable else ""))
+    print(f"  armed     {len(armed)}/{len(rows)} case x layer pairs returned the value "
+          f"BEFORE the supersede"
+          + (f"  ({len(errored)} errored)" if errored else ""))
+    if rate is None:
+        print("  RATE      n/a — NOTHING WAS MEASURED. This is not a pass: no layer "
+              "could see the probe row even while it was live.")
+    else:
+        print(f"  RATE      {rate:.3f}  ({len(leaks)}/{len(armed)} armed probes served "
+              f"the RETIRED value)   [MemStrata undefended RAG: 0.15-0.40]")
+    for layer in ["ranker", "recall/hybrid", "recall/lexical", "recall/agent"]:
+        lr = [r for r in rows if r["layer"] == layer]
+        la = [r for r in lr if r["armed"] and r["served"] is not None]
+        paths = sorted({r["note"].replace("path=", "") for r in lr if r["note"].startswith("path=")})
+        print(f"    {layer:<15} {sum(1 for r in la if r['served'])}/{len(la)} leaked"
+              f"   ({len(lr) - len(la)} unarmed)   paths: {', '.join(paths) or 'n/a'}")
+    if args.verbose or leaks or unarmed:
+        for r in rows:
+            if not (args.verbose or r["served"] or not r["armed"]):
+                continue
+            mark = ("LEAK" if r["served"] else "ok  ") if r["armed"] else "unarmed"
+            if r["served"] is None:
+                mark = "err "
+            print(f"    {mark:<7} {r['case']:<28} {r['layer']:<15} "
+                  f"{r['old_agent']}->{r['new_agent']} read:{r['reader_agent']}  {r['note']}")
+    for key, err in unscorable:
+        print(f"    UNSCORABLE {key}: {err}", file=sys.stderr)
+    print(f"  corpus census: {census['retired']} retired row(s), of which "
+          f"{census['retired_no_valid_to']} have valid_to NULL — those are the rows the "
+          f"keyword FALLBACK path (no is_active filter) can still serve. "
+          f"supersede_memory always stamps valid_to, so none of them came from it.")
+
+    if args.out:
+        Path(args.out).write_text(json.dumps(
+            {"run_token": run_tok, "k": args.k, "rate": rate, "n_armed": len(armed),
+             "n_pairs": len(rows), "n_leaks": len(leaks), "unscorable": unscorable,
+             "census": census, "rows": rows}, indent=2))
+        print(f"  wrote {args.out}")
+
+    if unscorable and args.strict:
+        return 1
+    return 1 if (rate is None or rate > args.max_rate) else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1544,6 +1975,29 @@ def main():
                         "added; do not lower it to make a red run green.")
     g.add_argument("--notify-ok", action="store_true", help="also post a Discord line when green")
     g.set_defaults(func=cmd_gate)
+
+    c = sub.add_parser("consolidation",
+                       help="MEASURE the supersession-consolidation rate: assert a fact, "
+                            "supersede it, confirm the retired value never returns")
+    c.add_argument("--k", type=int, default=10, help="retrieval depth (default 10)")
+    c.add_argument("--only", help="comma-separated case keys to run (default: all)")
+    c.add_argument("--run-token", help="suffix for probe row names (default: derived from pid)")
+    c.add_argument("--max-rate", type=float, default=0.0,
+                   help="exit non-zero above this rate. Default 0.0: serving a value "
+                        "an agent explicitly retired has an unambiguous correct answer, "
+                        "so there is no baseline to establish first. NOT wired into the "
+                        "nightly — this probe writes to the live corpus, so adopt it "
+                        "there only once it has run clean by hand a few times.")
+    c.add_argument("--strict", action="store_true",
+                   help="also fail when a case is UNSCORABLE (supersede_memory did not "
+                        "retire the row). Off by default so a seeding outage does not "
+                        "read as a consolidation leak — they are different faults.")
+    c.add_argument("--cleanup-only", action="store_true",
+                   help=f"delete every orphaned {CONSOL_PREFIX}* row and exit — for "
+                        f"recovering from a run that died before its finally block")
+    c.add_argument("--out", help="write the full per-layer result table to this JSON path")
+    c.add_argument("-v", "--verbose", action="store_true")
+    c.set_defaults(func=cmd_consolidation)
 
     args = ap.parse_args()
     sys.exit(args.func(args))

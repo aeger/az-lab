@@ -130,6 +130,62 @@ needs no model and so survives whatever the grader model does next quarter.
 Re-run before trusting any scenario number:
 `python3 grader.py calibrate` (add `--anchored-only` for the free, no-API arm).
 
+## Supersession consolidation — MEASURED 0.000, question closed (2026-08-13)
+
+`retrieval_regression.py consolidation` — the az-lab analogue of MemoryAgentBench
+FactConsolidation (arXiv 2507.05257). MemStrata (arXiv 2606.26511) reports undefended RAG
+serving superseded values **15–40%** of the time; we had no number at all.
+
+Constructive, not observational: each case asserts a fact, asserts its replacement, calls
+`supersede_memory`, then asks for the fact back. Unlike FCFR it does not depend on what the
+corpus happens to have retired, so its denominator cannot silently drain.
+
+**Result — 0/20 armed pairs, twice (`full1`, `full2`), rate 0.000.** Raw:
+`results/consolidation/20260813-full{1,2}.json`.
+
+| layer | leaked | what it covers |
+|---|---|---|
+| `ranker` | 0/5 | `hybrid_recall` RPC alone — the control; confirms the `is_active` predicate is wired |
+| `recall/hybrid` | 0/5 | full MCP tool: staleness haircut, rerank, spreading activation, linked-memories section |
+| `recall/lexical` | 0/5 | BM25/trigram lane, exact-token query |
+| `recall/agent` | 0/5 | same, read by a **third** agent that wrote neither row |
+
+5 cases: same-agent, iris-over-wren, atlas-over-iris, a linked entry point (edge at strength
+0.95, above `SPREAD_ACTIVATION_THRESHOLD`), and a private/agent-scoped row. **3 of 5 are
+cross-agent** — three agents share one pool, so the agent that retires a row is usually not
+the one that wrote it.
+
+**The number is only worth anything because of the positive control.** Every (case, layer)
+pair is probed on BOTH sides of the supersede. All 20 returned the value *before* it and
+none after; a pair that fails the pre-check is `unarmed` and leaves the denominator, so a
+"clean 0" produced by a probe that stopped working reports as `armed 0/20`, not as a pass.
+This is the lesson from FCFR reading 0.0000 for six runs over an unreachable denominator.
+`path=spread` appears in the layer table, so spreading activation — the layer FCFR
+structurally cannot see — really was exercised.
+
+**Scope, and what 0.000 does NOT mean.** Supersession here is *agent-invoked*, not derived
+from a `(subject, relation, object)` key: nothing forces mutual exclusion between two live
+rows asserting the same `(subject, relation)`. This probe measures only whether an **invoked**
+supersession is airtight. It says nothing about pairs where no agent ever called
+`supersede_memory` — that population is invisible to it by construction. Deriving the key
+vs keeping it agent-invoked is a **separate design call**, deliberately not taken here.
+
+**One adjacent exposure, on the record but not in the rate.** The recall tool's keyword
+FALLBACK path filters bi-temporally but has never filtered `is_active` (noted in
+`src/index.ts`). `supersede_memory` always stamps `valid_to`, so nothing it retires is
+reachable there — but **44 of 194 retired rows have `valid_to` NULL** (retired by some other
+path) and are. The probe prints this census every run.
+
+Not wired into the nightly: it writes to the live corpus. It takes the same `eval_lock` and
+access-stat snapshot as `run` and hard-deletes in a `finally`; `consolidation --cleanup-only`
+sweeps orphans. Verified after both runs: 0 leftover rows, 0 orphan links, corpus counts
+unchanged.
+
+**No fixture contention with the forgetting-probe work.** This probe seeds and deletes its
+own rows within a single run and never touches the `eval_queries` table. The flip side is
+that it adds **no** FCFR denominator headroom — an `eval_queries` forgetting probe needs a
+*persistent* `forbidden_memory_ids` target, and these rows are gone by the time the run ends.
+
 ## Findings so far (what the runs actually taught us)
 1. ~~**Grader reliability is the #1 blocker.**~~ **CLOSED 2026-08-11** — see "Grader blocker CLOSED" above. The root cause was the harness parser encoding a parse failure as a score of 0, not the model. Kept here because the *lesson* generalises: a scoring path that maps "I could not read this" onto the worst legal score will manufacture a confident wrong number every time.
 2. **Retrieval is brittle to query framing.** A user report phrased "…on Home Assistant" steered `hybrid_recall` to HA memories; the relevant in-store memory (`homebridge-host-location`) never surfaced even at k=12.
