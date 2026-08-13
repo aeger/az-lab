@@ -94,6 +94,15 @@ fi
 # Without it the forgetting lane and the control arm are invisible unless they
 # breach — and FCFR sat at 0.0000 for six runs precisely because nothing ever
 # printed it where Jeff would see it.
+#
+# The gate also enforces --min-fcfr-probes (default 4) on n_forgetting_scorable,
+# the FCFR DENOMINATOR, and that default is deliberately not spelled out here so
+# there is one place to raise it. Why it exists (2026-08-13): the denominator fell
+# 4 -> 3 at 2026-08-11 21:16 when a forgetting probe's only forbidden row was
+# retired, the run stayed green, and the 0.333 that followed was one real leak over
+# a denominator that had shrunk underneath it. --max-fcfr reads a ratio and cannot
+# tell "nothing leaked" from "nothing was measurable"; a denominator at 0 used to
+# fall straight through to a pass.
 python3 retrieval_regression.py gate --tag "$TAG" --window 7 --drop-pct 5.0 --notify-ok
 GATE_RC=$?
 

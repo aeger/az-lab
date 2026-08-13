@@ -410,6 +410,11 @@ def score(rows: list, k: int, verbose: bool, control: list = None,
     # denominator is what hid the metric for six runs.
     n_forgetting_scorable = 0
     carry_forward_hits_scorable = 0
+    # WHICH probes, not just how many (2026-08-13). n_forgetting_scorable silently
+    # fell 4 -> 3 on 2026-08-11 21:16 when probe a9e67c59's only forbidden row was
+    # retired, and the count alone gave nobody a way to ask which one went dark.
+    forgetting_scorable_ids = []   # forbidden rows still reachable -> probe is live
+    forgetting_vacated_ids = []    # every forbidden row unreachable -> probe measures nothing
     # Control arm (query-independent corpus prior), scored over the SAME probes.
     ctrl_hits5, ctrl_ndcg10_total = 0, 0.0
 
@@ -491,6 +496,9 @@ def score(rows: list, k: int, verbose: bool, control: list = None,
                 n_forgetting += 1
                 if reachable:
                     n_forgetting_scorable += 1
+                    forgetting_scorable_ids.append(q["id"])
+                else:
+                    forgetting_vacated_ids.append(q["id"])
                 if carried:
                     carry_forward_hits += 1
                     if reachable:
@@ -569,6 +577,8 @@ def score(rows: list, k: int, verbose: bool, control: list = None,
     return results, metrics, failures, {"n": n_forgetting, "hits": carry_forward_hits,
                                         "n_scorable": n_forgetting_scorable,
                                         "hits_scorable": carry_forward_hits_scorable,
+                                        "scorable_ids": forgetting_scorable_ids,
+                                        "vacated_ids": forgetting_vacated_ids,
                                         "violations": violations,
                                         "n_distractor": n_distractor,
                                         "distractor_hits": distractor_hits,
@@ -698,6 +708,15 @@ def cmd_run(args):
         print(f"  FCFR-live  {m['fcfr_scorable']:.3f}  "
               f"({fcf['hits_scorable']}/{fcf['n_scorable']} probes whose forbidden rows "
               f"are still active — the number to gate on)")
+    # NAME THE DENOMINATOR (2026-08-13). The ratio and the count are two different
+    # gauges and only one of them was ever printed with its members. A probe whose
+    # forbidden rows all get retired leaves the denominator quietly, and the run it
+    # leaves on looks identical to a run where nothing happened.
+    print(f"  live probes {' '.join(i[:8] for i in fcf['scorable_ids']) or '(none)'}")
+    if fcf["vacated_ids"]:
+        print(f"  ! VACATED   {len(fcf['vacated_ids'])} forgetting probe(s) declare only "
+              f"UNREACHABLE forbidden rows and score nothing: "
+              f"{' '.join(i[:8] for i in fcf['vacated_ids'])}")
         if fcf["n"] > fcf["n_scorable"]:
             print(f"             {fcf['n'] - fcf['n_scorable']} probe(s) vacuous "
                   f"(all forbidden ids is_active=false; retained as an is_active-filter "
@@ -1182,6 +1201,121 @@ def cmd_router(args):
     return 1
 
 
+def _tag_family(tag: str) -> str:
+    """Strip a trailing date/sequence suffix so `nightly-20260813` and
+    `nightly-20260812` compare as one series.
+
+    The denominator gate below asks "did this run measure fewer probes than the
+    LAST one", which is only meaningful within a series. A one-off tag
+    (`fcfr-verify-20260812`) has no predecessor and correctly falls back to the
+    absolute floor alone rather than comparing itself to an unrelated run."""
+    return re.sub(r"[-_](?:\d{6,8}|\d+)$", "", tag or "")
+
+
+def forgetting_probe_reachability():
+    """(scorable_ids, vacated_ids) for the CURRENT probe set — no retrieval.
+
+    cmd_gate reads counts out of eval_runs, which stores numbers and not members.
+    That is exactly the gap that let n_forgetting_scorable go 4 -> 3 unremarked:
+    the number moved, nothing named the probe that left. Two REST calls, so the
+    gate can print the offender instead of a delta."""
+    rows = [q for q in load_queries() if q["category"] == FORGETTING_CATEGORY
+            and (q.get("forbidden_memory_ids") or [])]
+    annotate_reachability(rows)
+    live = [q["id"] for q in rows if q.get("_reachable_forbidden")]
+    dead = [q["id"] for q in rows if not q.get("_reachable_forbidden")]
+    return live, dead
+
+
+def _gate_forgetting_denominator(cur: dict, args) -> int:
+    """Gate the FCFR DENOMINATOR, not just the ratio (2026-08-13).
+
+    THE DEFECT THIS CLOSES. --max-fcfr reads a ratio. A ratio cannot distinguish
+    "no retired fact was served" from "there is no longer anything to serve".
+    Measured: n_forgetting_scorable held at 4 from 08-07 through 08-11 19:51,
+    fell to 3 at 08-11 21:44 when probe a9e67c59's only forbidden row
+    (0936fb28, `Daily Self-Improvement Research - 2026-07-31`) was retired at
+    21:16, and nothing alarmed. The 0.333 that followed was 1/3 — one real leak
+    over a denominator that had just shrunk under it, and the two events were
+    indistinguishable in the alert.
+
+    Two failure modes, both FAIL, both with their own message:
+      1. n_forgetting_scorable == 0 — the lane is DISARMED. Previously this path
+         printed a warning to stderr and fell through to `return 0`, because
+         fcfr_scorable is NULL and the ratio gate skips NULLs. A gate that cannot
+         fail is not a gate; its symptom is a green build.
+      2. n_forgetting_scorable below the floor, or below the previous run in the
+         same tag family — probes are draining out of the denominator. Governance
+         retiring a forbidden row is CORRECT behaviour; silently measuring less
+         because of it is not.
+
+    Deliberately not a Discord duplicate of the FCFR alert: the remediation is to
+    repoint a probe at a reachable stale row, not to go looking at hybrid_recall."""
+    n_sc = cur.get("n_forgetting_scorable")
+    if n_sc is None:
+        n_sc = 0
+    tag = cur.get("tag") or ""
+
+    prev_n, prev_tag = None, None
+    fam = _tag_family(tag)
+    if fam:
+        prev = sb_get("eval_runs", {
+            "select": "tag,created_at,n_forgetting_scorable",
+            "tag": f"like.{fam}*",
+            "n_forgetting_scorable": "not.is.null",
+            "scoreset_version": f"eq.{cur.get('scoreset_version') or 1}",
+            "created_at": f"lt.{cur['created_at']}",
+            "order": "created_at.desc", "limit": "1",
+        })
+        if prev:
+            prev_n, prev_tag = prev[0]["n_forgetting_scorable"], prev[0]["tag"]
+
+    print(f"  forgetting denominator {n_sc} live probe(s) "
+          f"(floor {args.min_fcfr_probes}"
+          + (f", previous `{prev_tag}` {prev_n}" if prev_n is not None else ", no prior in series")
+          + ")")
+
+    if n_sc > 0 and n_sc >= args.min_fcfr_probes and (prev_n is None or n_sc >= prev_n):
+        return 0
+
+    # Name the offenders. "3 probes" is not actionable; the probe that went dark is.
+    try:
+        live_ids, dead_ids = forgetting_probe_reachability()
+    except Exception as e:  # never let the diagnostic turn a real failure into a crash
+        print(f"  ! could not enumerate probe reachability: {e}", file=sys.stderr)
+        live_ids, dead_ids = [], []
+    live_s = " ".join(i[:8] for i in live_ids) or "(none)"
+    dead_s = " ".join(i[:8] for i in dead_ids) or "(none)"
+
+    if n_sc == 0:
+        head = ("🚨 **Forgetting gate DISARMED** — eval `{}`\n"
+                "`n_forgetting_scorable` is **0**: not one probe declares a forbidden "
+                "row that `hybrid_recall` could still return, so FCFR is NULL and the "
+                "carry-forward ceiling cannot fail. This is a green build that "
+                "measured nothing.").format(tag)
+    else:
+        why = []
+        if n_sc < args.min_fcfr_probes:
+            why.append(f"below the floor of {args.min_fcfr_probes}")
+        if prev_n is not None and n_sc < prev_n:
+            why.append(f"down from **{prev_n}** on `{prev_tag}`")
+        head = ("🔻 **Forgetting probes are draining** — eval `{}`\n"
+                "`n_forgetting_scorable` **{}** ({}). This is NOT a carry-forward leak: "
+                "no retired fact was served. Probes stopped being able to fail, because "
+                "their forbidden rows are no longer reachable.").format(
+                    tag, n_sc, " and ".join(why))
+
+    msg = (f"{head}\n"
+           f"live probes: `{live_s}`\nvacated probes: `{dead_s}`\n"
+           f"Fix by REPOINTING a vacated probe at a stale claim that is still "
+           f"`is_active` — do not touch the ranker. Audit: "
+           f"`python3 eval/falsify_fcfr.py --audit-only`")
+    print("  FORGETTING DENOMINATOR GATE FAILED — alerting Discord", file=sys.stderr)
+    print(f"    live: {live_s}\n    vacated: {dead_s}", file=sys.stderr)
+    discord(msg)
+    return 1
+
+
 def cmd_gate(args):
     """Regression gate over the trailing median (2026-07-28 research tier 1).
 
@@ -1263,10 +1397,14 @@ def cmd_gate(args):
     # hybrid_recall lane; those probes cannot fail, so they only push the rate
     # toward zero. That dilution is precisely why FCFR read 0.0000 for six runs
     # while the lane was never actually exercised.
+    # DENOMINATOR FIRST, ratio second. The ratio is only interpretable once the
+    # denominator is known to be intact — 0.333 over 3 probes and 0.250 over 4 are
+    # the same one leak, and NULL over 0 is not a pass at all. See
+    # _gate_forgetting_denominator: this is the branch that used to fall through.
+    if _gate_forgetting_denominator(cur, args):
+        return 1
+
     fcfr = cur.get("fcfr_scorable")
-    if fcfr is None and cur.get("n_forgetting_scorable") == 0:
-        print("  ! forgetting lane NOT MEASURED — no probe declares a reachable "
-              "forbidden id (run eval/falsify_fcfr.py --audit-only)", file=sys.stderr)
     if fcfr is not None:
         print(f"  false-carry-forward (scorable) {fcfr:.3f} over "
               f"{cur.get('n_forgetting_scorable')} probe(s) (ceiling {args.max_fcfr})")
@@ -1396,6 +1534,14 @@ def main():
                    help="absolute ceiling on false-carry-forward rate (default 0.0 — "
                         "any superseded memory in the top-10 alerts). Not medianed: "
                         "serving a retired fact is wrong at any baseline.")
+    g.add_argument("--min-fcfr-probes", type=int, default=4,
+                   help="absolute FLOOR on n_forgetting_scorable, the FCFR "
+                        "denominator (default 4, the value held 08-07..08-11). "
+                        "--max-fcfr gates a ratio and cannot tell 'nothing leaked' "
+                        "from 'nothing was measurable'. Fails when the denominator "
+                        "is below this floor, below the previous run in the same tag "
+                        "family, or 0 (a disarmed gate). Raise it as probes are "
+                        "added; do not lower it to make a red run green.")
     g.add_argument("--notify-ok", action="store_true", help="also post a Discord line when green")
     g.set_defaults(func=cmd_gate)
 
