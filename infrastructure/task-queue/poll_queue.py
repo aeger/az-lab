@@ -731,13 +731,40 @@ def start_episode(task):
     return None
 
 
+# agent_episodes.status is constrained to these four (agent_episodes_status_check).
+# task_queue statuses are a DIFFERENT vocabulary and passing one here used to reject
+# the whole close-out PATCH with 23514 — status, ended_at, summary AND outcome all
+# lost, leaving the row at in_progress forever. 109 of 287 episodes were stranded
+# that way, which starved refresh_memory_outcome_utility() (it only counts consults
+# on status='completed') and left the A-MAC fifth term with no input. See migration
+# 116. A queue gate is not a failure and not a success: it maps to 'partial'.
+_EPISODE_STATUSES = {"in_progress", "completed", "failed", "partial"}
+_EPISODE_STATUS_MAP = {
+    "pending_jeff_action": "partial",
+    "pending_eval": "partial",
+    "paused": "partial",
+    "blocked": "partial",
+    "escalated": "partial",
+}
+
+
 def end_episode(episode_id, status, summary=None, outcome=None, learnings=None):
     """Close an agent_episodes row with final status. Best-effort — never raises."""
     if not episode_id:
         return
     try:
+        ep_status = status if status in _EPISODE_STATUSES else _EPISODE_STATUS_MAP.get(status)
+        if ep_status is None:
+            # Unknown status: still close the row. A 'partial' episode with the real
+            # status recorded in the outcome is strictly better than an open one,
+            # because an open episode can never contribute an outcome edge.
+            print(f"end_episode: unmapped status {status!r} -> 'partial'", file=sys.stderr)
+            ep_status = "partial"
+        if ep_status != status:
+            # Keep the queue-side status legible in the episode record.
+            outcome = f"[{status}] {outcome}" if outcome else f"[{status}]"
         patch = {
-            "status": status,
+            "status": ep_status,
             "ended_at": datetime.now(timezone.utc).isoformat(),
         }
         if summary:

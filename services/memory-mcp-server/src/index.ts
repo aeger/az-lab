@@ -1392,7 +1392,28 @@ function startEmbeddingBackfillJob(supabase: any): void {
 // package.json. Two separate literals used to carry this — the MCP handshake and
 // GET /health — and on 2026-08-05 the /health one was missed on a version bump,
 // so the endpoint every dashboard and research run reads was a release behind.
-const SERVER_VERSION = "5.16.0";
+const SERVER_VERSION = "5.17.0";
+
+// ── Episode claim registry ───────────────────────────────────────────────────
+// Keyed by episode id, NOT a shared consult buffer — the consult ids themselves
+// never leave their own session. This exists because agent identity alone is not
+// a unique key when the queue poller has overlapping runs: three agent='wren'
+// episodes were open at once on 2026-08-14 and a recall from one run attached to
+// another's episode. A session claims an episode on its first recall and other
+// sessions then skip it, so concurrent same-agent runs cannot steal each other's
+// edges. Entries expire on the same 6h window the lookup uses, so the map cannot
+// grow and a crashed session cannot hold an episode hostage.
+const EPISODE_CLAIM_TTL_MS = 6 * 60 * 60 * 1000;
+const episodeClaims = new Map<string, { session: string; ts: number }>();
+function claimEpisodesHeldByOthers(sessionKey: string): string[] {
+  const now = Date.now();
+  const held: string[] = [];
+  for (const [epId, claim] of episodeClaims) {
+    if (now - claim.ts > EPISODE_CLAIM_TTL_MS) episodeClaims.delete(epId);
+    else if (claim.session !== sessionKey) held.push(epId);
+  }
+  return held;
+}
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
 function createMcpServer(callerIdentity: string | null = null): McpServer {
@@ -1410,10 +1431,53 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
   // with no keying and no cross-caller leakage. It is a best-effort correlation
   // signal for retention scoring, NOT an audit log — a restart drops it, and the
   // worst case is an episode with no consult edge, i.e. exactly today's behaviour.
+  //
+  // MEASURED 2026-08-14, two days after the v5.16.0 deploy: 1 of 37 new episodes
+  // had a consult edge. The buffer alone cannot work, because the two ends of an
+  // episode never meet in an MCP session — poll_queue.py opens and closes episodes
+  // directly over PostgREST (start_episode/end_episode), so record_episode is not
+  // in the loop at all and the buffer is discarded at session teardown with nothing
+  // to attach to. So the buffer is now a fallback for agents that DO drive their own
+  // episodes through record_episode, and the primary path is attach_episode_consults
+  // (migration 116): recall writes what it served straight onto the caller's open
+  // episode row. That crosses the session boundary because the state lives in the DB,
+  // and it keeps the same scoping — the RPC matches on `agent`, so a recall can only
+  // ever land on its own caller's episode, never another agent's.
   const CONSULT_BUFFER_MAX = 64;
   let consultBuffer: string[] = [];
+  // Unauthenticated local callers (the queue poller's Claude Code sessions connect
+  // over plain http with no AIP token) have no verified identity; they are the wren
+  // runs that own every episode in the table. Override via env if that changes.
+  const DEFAULT_EPISODE_AGENT = process.env.EPISODE_CONSULT_AGENT || "wren";
+  const sessionKey = crypto.randomUUID();
+  let boundEpisode: string | null = null;
   const recordConsults = (ids: string[]) => {
-    if (ids.length) consultBuffer = [...new Set([...ids, ...consultBuffer])].slice(0, CONSULT_BUFFER_MAX);
+    if (!ids.length) return;
+    consultBuffer = [...new Set([...ids, ...consultBuffer])].slice(0, CONSULT_BUFFER_MAX);
+    // Best-effort and non-blocking: a retention signal must never fail a recall.
+    void (async () => {
+      try {
+        const { data, error } = await supabase.rpc("attach_episode_consults", {
+          p_agent: callerIdentity || DEFAULT_EPISODE_AGENT,
+          p_ids: ids,
+          p_episode_id: boundEpisode,
+          p_exclude: claimEpisodesHeldByOthers(sessionKey),
+        });
+        if (error) return console.warn("[consults] attach failed:", error.message);
+        if (data) {
+          boundEpisode = data;
+          episodeClaims.set(data, { session: sessionKey, ts: Date.now() });
+          console.log(`[consults] attached ${ids.length} to episode ${data}`);
+        } else if (boundEpisode) {
+          // The bound episode closed (the poller reached end_episode). Release it so
+          // the next recall in this session can bind to whatever run is live now.
+          episodeClaims.delete(boundEpisode);
+          boundEpisode = null;
+        }
+      } catch (err: any) {
+        console.warn("[consults] attach threw:", err?.message || err);
+      }
+    })();
   };
 
   const server = new McpServer({
@@ -3359,8 +3423,14 @@ app.use((req: Request, res: Response, next: () => void) => {
 
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
+let cachedToolCount: number | null = null;
+
+function getToolCount(server: McpServer): number {
+  return Object.keys((server as any)._registeredTools).length;
+}
+
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 10; // +10: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant + check_stale_context + update_read_watermark; r2: remember_file, recall_file, forget_file, store_file, get_file
+  const toolCount = cachedToolCount ?? 0;
   res.json({ status: "ok", service: "memory-mcp-server", version: SERVER_VERSION, tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
@@ -3393,6 +3463,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
   // New session — new server instance with verified caller identity bound
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
   const server = createMcpServer(callerIdentity);
+  if (!cachedToolCount) cachedToolCount = getToolCount(server);
 
   transport.onclose = () => {
     const sid = (transport as any).sessionId;
@@ -3430,10 +3501,12 @@ app.delete("/mcp", async (req: Request, res: Response) => {
   res.status(400).json({ error: "No session found." });
 });
 
+// Pre-compute tool count at startup by creating a template server
+const templateServer = createMcpServer(null);
+cachedToolCount = getToolCount(templateServer);
+
 app.listen(PORT, "0.0.0.0", async () => {
-  // Must match the /health computation above — a banner that drifts from /health is
-  // how "28 tools" and "27 tools" ended up in different memories for the same build.
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 10;
+  const toolCount = cachedToolCount!;
   console.log(`Memory MCP Server v${SERVER_VERSION} — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
