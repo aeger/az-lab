@@ -943,9 +943,13 @@ IRIS_EVAL_GUIDANCE = """
 **Iris — Eval Actions** (update task_queue directly via execute_sql or Supabase MCP):
 - **Approve**: Set status → `completed`
 - **Split** (task too large): Create subtasks with `parent_task_id='{task_id}'`, then set this task → `completed` with result "Split into N subtasks"
-- **Needs changes**: Set status → `review_needed`, add notes in result
-- **Send back**: Set status → `ready`
+- **Needs changes / Send back**: Set status → `ready`, add notes in result — the poller re-claims `ready` on the next 5-min cycle and build_prompt injects the notes.
 - **Reject**: Set status → `cancelled`, add reason in result
+
+Do NOT use `review_needed`. Retired 2026-08-15: nothing claims it (the poller
+takes ready/pending/delegated), nothing sweeps it, and task_queue_attention did
+not surface it — so a row set to review_needed was done-but-open forever and
+silently understated the delegation success rate. It duplicated `ready` anyway.
 """
 
 
