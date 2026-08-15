@@ -57,6 +57,19 @@
 --   signal to fit adaptive coefficients against, and it would be unfalsifiable.
 --   Weights here stay hand-set and auditable.
 --
+-- COVERAGE CAVEAT ADDED 2026-08-15 (see migration 119 for the full reasoning):
+--   This term samples WREN POLLER RUNS ONLY. Audited live on 2026-08-15: all 295
+--   agent_episodes rows are agent=wren, because poll_queue.py is the only caller
+--   of record_episode — Atlas and Iris have never opened an episode. Every
+--   consult edge this migration's refresh consumes therefore comes from one
+--   agent running short queue tasks. Fleet-wide episode opening was considered
+--   and DECLINED: interactive surfaces have no deterministic session-close hook,
+--   so it would mostly produce stranded traces for 117's reaper, which contribute
+--   0 utility anyway. The monotone guarantee above still holds — under-coverage
+--   costs a memory a bonus, never its life — but RELATIVE standing and tier
+--   assignment do skew toward poller-adjacent memories. Read outcome_utility as
+--   "the Wren poller found this useful", not as fleet utility.
+--
 -- ALSO FIXED HERE: prune_decayed_memories carried its own INLINE copy of the
 --   composite (migration 013), which migration 065 called out as a copy-paste
 --   hazard when it factored amac_standing_value() but did not convert this caller.
@@ -76,6 +89,8 @@ COMMENT ON COLUMN memories.outcome_utility IS
   'consulted this memory, normalized to [0,1]. Refreshed by '
   'refresh_memory_outcome_utility(). 0.0 = no outcome evidence, which scores '
   'identically to pre-114 behaviour.';
+-- NOTE: migration 119 replaces this comment with a longer one carrying the
+-- Wren-poller-only coverage caveat. 119 is the live text; this is the original.
 
 -- memories_consulted is a uuid[]; the refresh unnests it and the ANY() lookups
 -- want containment. GIN is the right index for both.
