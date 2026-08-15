@@ -158,6 +158,21 @@ def render_block(health, gt, disk_head):
         v = run.get(key)
         return fmt.format(v) if isinstance(v, (int, float)) else "n/a"
 
+    # Consult capture is ALWAYS rendered as numerator/denominator, never as a bare
+    # count. Migration 116 verified attach_episode_consults() with "11 captured,
+    # materially above 0" and that read as success at a true rate of 0.0258 — the
+    # v16.2/v16.3 mistake for the third time. Printing the fraction makes the
+    # denominator impossible to forget to ask for.
+    cc = gt.get("consult_capture") or {}
+
+    def ratio(numer_key, denom_key, rate_key):
+        n, d = cc.get(numer_key), cc.get(denom_key)
+        if not isinstance(n, (int, float)) or not isinstance(d, (int, float)) or not d:
+            return f"{n if n is not None else '?'}/{d if d is not None else '?'} (no denominator)"
+        r = cc.get(rate_key)
+        r_str = f"{float(r):.4f}" if isinstance(r, (int, float)) else "n/a"
+        return f"{n}/{d} = {r_str}"
+
     lines = [
         BEGIN_MARK,
         "Rewritten nightly by refresh_state_memory.py (via memory-eval-nightly.service).",
@@ -184,6 +199,13 @@ def render_block(health, gt, disk_head):
         f"  hard tier n={run.get('n_hard','?')} recall@5 {num('hard_recall_at_5')} nDCG@10 {num('hard_ndcg_at_10')} · "
         f"abstention n={run.get('n_abstention','?')} rate {num('abstention_rate')} · fcfr_scorable {num('fcfr_scorable')}",
         "",
+        f"**Consult capture ({cc.get('window_days','?')}d):** "
+        f"consults/memories touched {ratio('consults_captured','memories_touched','capture_rate')} · "
+        f"episodes carrying consults {ratio('episodes_with_consults','episodes_open','episode_attach_rate')} · "
+        f"all-time {cc.get('episodes_with_consults_alltime','?')}/{cc.get('episodes_alltime','?')} episodes",
+        "  NOTE: an OPTIMISTIC BOUND. last_accessed_at is a last-write-wins snapshot, not an",
+        "  access log, so a past day's denominator can only shrink. Per-day: `v_consult_capture_daily`.",
+        "",
         f"**Injection scan (OWASP ASI06 point 4):** pattern version {inj.get('pattern_version')} · "
         f"{inj.get('scanned_active')} active rows scanned, {inj.get('never_scanned_active')} never scanned · "
         f"last {inj.get('last_scan_at')}",
@@ -206,10 +228,20 @@ def render_description(health, gt):
     structurally impossible rather than a thing to remember to update."""
     run = gt.get("latest_eval_run") or {}
     corpus = gt["corpus"]
+    cc = gt.get("consult_capture") or {}
 
     def num(key, fmt="{:.4f}"):
         v = run.get(key)
         return fmt.format(v) if isinstance(v, (int, float)) else "n/a"
+
+    # Carried here too, as a fraction: this is the half recall() ranks and shows,
+    # so it is the half a research run reads before it reads anything else.
+    cc_n, cc_d = cc.get("consults_captured"), cc.get("memories_touched")
+    cc_r = cc.get("capture_rate")
+    cc_str = (
+        f"{cc_n}/{cc_d} = {float(cc_r):.4f}"
+        if isinstance(cc_r, (int, float)) else f"{cc_n}/{cc_d} (no denominator)"
+    )
 
     return (
         f"memory-mcp-server LIVE STATE, regenerated nightly by refresh_state_memory.py "
@@ -218,7 +250,8 @@ def render_description(health, gt):
         f"corpus {corpus['total']} ({corpus['active']} active) · "
         f"eval {run.get('tag', 'n/a')} scoreset v{run.get('scoreset_version', '?')} "
         f"recall@5 {num('recall_at_5')} nDCG@10 {num('ndcg_at_10')} "
-        f"hard recall@5 {num('hard_recall_at_5')}. "
+        f"hard recall@5 {num('hard_recall_at_5')} · "
+        f"consult capture {cc.get('window_days','?')}d {cc_str} (optimistic bound). "
         f"Do not hand-edit the description or the marked block — both are overwritten."
     )[:1000]
 
