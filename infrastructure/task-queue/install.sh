@@ -10,10 +10,22 @@ SYSTEMD_DIR="$HOME/.config/systemd/user"
 
 echo "Installing Claude task queue poller for $USER"
 
-# Install poller script
+# Link (do NOT copy) the poller script.
+#
+# This used to be `install -m 755`, i.e. a copy. On 2026-08-16 that copy was
+# found to be two days stale: the running poller predated migration 118 and was
+# still telling Iris to use the retired `review_needed` status, which is how
+# task f07163d0 got stuck in a status 118 had already removed. A copy means
+# every commit to the repo file silently does nothing until someone remembers
+# to re-run this script. A symlink makes the repo the only content, so the
+# split-brain cannot re-form.
+#
+# Safe because poll_queue.py imports stdlib only and never reads __file__ —
+# nothing depends on its on-disk location. Re-check that before adding a
+# sibling-module import.
 mkdir -p "$QUEUE_DIR"
-install -m 755 "$SCRIPT_DIR/poll_queue.py" "$QUEUE_DIR/poll_queue.py"
-echo "Installed poll_queue.py -> $QUEUE_DIR/poll_queue.py"
+ln -sfn "$SCRIPT_DIR/poll_queue.py" "$QUEUE_DIR/poll_queue.py"
+echo "Linked poll_queue.py -> $SCRIPT_DIR/poll_queue.py"
 
 # Install systemd user units
 mkdir -p "$SYSTEMD_DIR"
