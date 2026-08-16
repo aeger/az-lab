@@ -30,6 +30,11 @@ echo "=== memory-mcp-server migration runner ==="
 echo "DB: ${DB_HOST}:${DB_PORT}/${DB_NAME}"
 echo ""
 
+# Fail fast if two migrations share a numeric prefix — that makes the
+# "highest number = deployed schema" read ambiguous for every later reader.
+"${SCRIPT_DIR}/check-migration-numbering.sh" "${MIGRATIONS_DIR}"
+echo ""
+
 check_migration() {
   local name="$1"
   local rpc="$2"
