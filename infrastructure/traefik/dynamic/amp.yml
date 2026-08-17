@@ -15,4 +15,5 @@ http:
     amp-service:
       loadBalancer:
         servers:
-          - url: "http://192.168.1.130:8080"
+          # AMP moved to LXC 106 on VLAN30; 192.168.1.130 was stale and caused 504s.
+          - url: "http://192.168.30.10:8080"
