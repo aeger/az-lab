@@ -659,9 +659,11 @@ def _supabase_get(path: str) -> list | None:
 def _has_open_audit_task(name: str) -> bool:
     """Return True if an open audit task already exists for this backup name."""
     title_q = urllib.parse.quote(f"%backup failure: {name}%")
+    # review_needed dropped 2026-08-17 (migration 121): the status is gone from
+    # task_queue_status_check, so listing it here can only ever match zero rows.
     rows = _supabase_get(
         f"task_queue?select=id,status,title"
-        f"&status=in.(ready,in_progress_agent,in_progress_jeff,pending_jeff_action,review_needed,blocked,pending,claimed)"
+        f"&status=in.(ready,in_progress_agent,in_progress_jeff,pending_jeff_action,blocked,pending,claimed)"
         f"&title=ilike.{title_q}"
         f"&limit=1"
     )
