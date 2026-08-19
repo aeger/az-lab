@@ -26,12 +26,31 @@ WHY THIS EXISTS
     reader (human or agent) sees the bytes git produced, not a summary of them.
     Anything else here — ageing, thresholds, Discord — is secondary to that.
 
+    AGE IS NOT THE ONLY AXIS (added 2026-08-19, third occurrence)
+    The 08-19 run PRINTED `?? .../122_*.sql` and `?? .../123_*.sql` and then
+    filtered both out of its own findings: they were 1.9d old and
+    DIRTY_MAX_AGE_D is 3. Both were already APPLIED to production — the live
+    schema's ground truth read migration_head_applied = 123. An applied
+    migration is an irreversible schema change from minute zero, so the grace
+    period that is correct for a half-written config file is, for this class,
+    a three-day window in which the only copy of the DDL behind the running
+    database sits on one disk, outside git and outside r2_backup (which
+    excludes .git/objects). Same shape as 109 in v10.5. So severity is now a
+    function of CLASS as well as age: an applied migration is a finding at
+    age 0 and bypasses the age axis entirely. Everything else keeps it.
+
+    The run also printed only its raw INPUT, which is why a reader could not
+    tell whether a line had been considered and dismissed or never looked at.
+    Every porcelain line now prints its DECISION and the reason for it.
+
 WHAT IT REPORTS
-    UNPUSHED        commits ahead of the remote, older than UNPUSHED_MAX_AGE_D
-    DIRTY           tracked file modified and uncommitted for > DIRTY_MAX_AGE_D
-    UNTRACKED       untracked path present for > DIRTY_MAX_AGE_D (not ignored)
-    NO_UPSTREAM     branch has no remote-tracking ref — nothing to be ahead OF
-    FETCH_FAILED    could not reach the remote, so the ahead-count is unproven
+    UNPUSHED           commits ahead of the remote, older than UNPUSHED_MAX_AGE_D
+    DIRTY              tracked file modified and uncommitted for > DIRTY_MAX_AGE_D
+    UNTRACKED          untracked path present for > DIRTY_MAX_AGE_D (not ignored)
+    APPLIED_MIGRATION  a migration ALREADY APPLIED to prod is dirty/untracked —
+                       reported at age 0, no grace period
+    NO_UPSTREAM        branch has no remote-tracking ref — nothing to be ahead OF
+    FETCH_FAILED       could not reach the remote, so the ahead-count is unproven
 
     `git fetch` runs first. Without it the ahead-count is measured against a
     cached remote ref and can read 0 while the real remote is far behind — the
@@ -45,9 +64,12 @@ WHAT IT REPORTS
 """
 
 import json
+import os
+import re
 import subprocess
 import sys
 import importlib.util
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,7 +87,21 @@ REPOS = [Path.home() / "azlab", Path.home() / "dashboard"]
 DIRTY_MAX_AGE_D = 3
 UNPUSHED_MAX_AGE_D = 2
 
+# ── the class that has no grace period ──────────────────────────────────────
+# Repo -> repo-relative dirs whose NNN_*.sql files are covered by an applied-
+# migration ledger we can actually query. Explicit, for the same reason REPOS
+# is explicit: a glob for */migrations/* would sweep in vendored schema dirs
+# whose apply-state we have no ledger for and could only guess at.
+LEDGERED_MIGRATION_DIRS = {
+    "azlab": ("services/memory-mcp-server/migrations/",),
+}
+MIGRATION_FILE_RE = re.compile(r"(\d{3})[^/]*\.sql$")
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://ogqjjlbupqnvlcyrfnxi.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
+
 _NOTIFY = None
+_HEAD = None  # (int|None, source_str) — the ledger is queried at most once/run
 
 
 def post(msg: str) -> None:
@@ -90,18 +126,99 @@ def post(msg: str) -> None:
     print("would have posted:", msg)
 
 
-def git(repo: Path, *args, timeout=60):
+def git(repo: Path, *args, timeout=60, raw=False):
     """Run git and return (rc, stdout). stderr is surfaced on the journal only
-    when it matters, so a routine 'not a git repository' does not read as noise."""
+    when it matters, so a routine 'not a git repository' does not read as noise.
+
+    raw=True strips only the TRAILING newline. `git status --porcelain` encodes
+    state in column 1, so a worktree-only modification is " M path" — and a
+    blanket .strip() ate that leading space on the FIRST line only, shifting it
+    left so line[3:] chopped a character off the path. The stat then failed and
+    the line was dropped. Whichever dirty file sorted first was therefore
+    unreportable, silently, since v1: the same class of bug as the one this
+    whole script exists to catch, one layer down.
+    """
     p = subprocess.run(
         ["git", "-C", str(repo), *args],
         capture_output=True, text=True, timeout=timeout,
     )
-    return p.returncode, p.stdout.strip(), p.stderr.strip()
+    out = p.stdout.rstrip("\n") if raw else p.stdout.strip()
+    return p.returncode, out, p.stderr.strip()
 
 
 def age_days(ts: float) -> float:
     return (datetime.now(timezone.utc).timestamp() - ts) / 86400.0
+
+
+def applied_migration_head():
+    """(head_number, human-readable source) from the LIVE schema's ledger.
+
+    memory_state_ground_truth() reads supabase_migrations.schema_migrations,
+    which is the database's own record of what it has actually run — the same
+    ground truth staterefresh publishes. Deliberately NOT the highest file on
+    disk: a file in the repo is not evidence the DB has it (076/077/078,
+    2026-07-27), and here the whole question is which of those two it is.
+
+    Returns (None, why) when the ledger cannot be reached. Callers must fail
+    CLOSED on that: mistakenly flagging an unapplied migration costs one commit,
+    while missing an applied one is the failure this class exists to catch.
+
+    Caveat, stated rather than hidden: the ledger exposes a HEAD, not a set, so
+    membership is inferred as seq <= head. Migrations apply in version order, so
+    this is exact in every normal case; the one way it errs is an out-of-order
+    apply (124 applied while 123 was skipped), where it over-reports 123. That
+    direction is the safe one.
+    """
+    global _HEAD
+    if _HEAD is not None:
+        return _HEAD
+    if not SUPABASE_KEY:
+        _HEAD = (None, "SUPABASE_SECRET_KEY unset")
+        return _HEAD
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/rpc/memory_state_ground_truth",
+        data=b"{}",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            gt = json.loads(r.read().decode())
+        head = str(gt.get("migration_head_applied") or "")
+        _HEAD = ((int(head[:3]), f"applied head {head}") if head[:3].isdigit()
+                 else (None, f"ledger head unparseable: {head!r}"))
+    except Exception as e:
+        _HEAD = (None, f"ledger query failed: {e}")
+    return _HEAD
+
+
+def ledgered_migrations_under(repo: Path, name: str, path: str) -> list:
+    """Every (relpath, seq) ledgered migration a porcelain line covers.
+
+    git collapses a wholly-untracked directory into one `?? dir/` line, so an
+    entry that IS a directory has to be expanded — otherwise an untracked
+    migrations/ tree would classify as a single unremarkable directory.
+    """
+    prefixes = LEDGERED_MIGRATION_DIRS.get(name, ())
+    if not prefixes:
+        return []
+    target = repo / path
+    try:
+        cand = ([str(p.relative_to(repo)) for p in sorted(target.rglob("*.sql"))]
+                if target.is_dir() else [path])
+    except OSError:
+        return []
+    out = []
+    for c in cand:
+        if any(c.startswith(pre) for pre in prefixes):
+            m = MIGRATION_FILE_RE.search(c)
+            if m:
+                out.append((c, int(m.group(1))))
+    return out
 
 
 def audit_repo(repo: Path) -> list:
@@ -132,7 +249,7 @@ def audit_repo(repo: Path) -> list:
         })
 
     # ---- the two commands whose absence caused this, printed verbatim ----
-    rc, porcelain, _ = git(repo, "status", "--porcelain")
+    rc, porcelain, _ = git(repo, "status", "--porcelain", raw=True)
     print("$ git status --porcelain")
     print(porcelain if porcelain else "(empty — working tree clean)")
 
@@ -161,26 +278,74 @@ def audit_repo(repo: Path) -> list:
         age = age_days(float(first)) if first else 0.0
         print(f"oldest unpushed commit: {age:.1f}d old")
         if age > UNPUSHED_MAX_AGE_D:
+            print(f"  -> FINDING   UNPUSHED — {age:.1f}d > UNPUSHED_MAX_AGE_D={UNPUSHED_MAX_AGE_D}d")
             findings.append({
                 "kind": "UNPUSHED", "repo": name,
                 "detail": f"{ahead} commit(s) ahead of origin/{branch}; "
                           f"oldest is {age:.1f}d old and exists only on this disk",
             })
+        else:
+            print(f"  -> ok        {age:.1f}d <= UNPUSHED_MAX_AGE_D={UNPUSHED_MAX_AGE_D}d")
 
+    # ---- classify: CLASS first, then age. Every line records its decision ----
+    decisions = []  # (code, path, verdict, why) — printed below, always
     for line in porcelain.splitlines():
         code, path = line[:2], line[3:].strip().strip('"')
-        target = repo / path
-        try:
-            age = age_days(target.stat().st_mtime)
-        except OSError:
-            continue  # deleted, or a directory entry we cannot stat
-        if age <= DIRTY_MAX_AGE_D:
-            continue
         kind = "UNTRACKED" if code.strip() == "??" else "DIRTY"
+        try:
+            age = age_days((repo / path).stat().st_mtime)
+        except OSError:
+            decisions.append((code, path, "skip", "cannot stat — deleted, or unreadable"))
+            continue
+
+        # CLASS AXIS. An applied migration has already changed the live schema,
+        # irreversibly, so there is no age at which it is merely work-in-progress.
+        promoted = False
+        for mpath, seq in ledgered_migrations_under(repo, name, path):
+            head, src = applied_migration_head()
+            if head is None:
+                why = (f"ledger UNAVAILABLE ({src}) — failing closed; an applied "
+                       f"migration is unrecoverable, an unapplied one costs a commit")
+            elif seq <= head:
+                why = f"APPLIED to production ({src} >= {seq})"
+            else:
+                decisions.append((code, mpath, "age-axis",
+                                  f"migration {seq} NOT applied ({src}) — ordinary age rule"))
+                continue
+            promoted = True
+            decisions.append((code, mpath, "FINDING",
+                              f"APPLIED_MIGRATION — {why}; age {age:.1f}d IGNORED "
+                              f"(class bypasses DIRTY_MAX_AGE_D={DIRTY_MAX_AGE_D}d)"))
+            findings.append({
+                "kind": "APPLIED_MIGRATION", "repo": name,
+                "detail": f"{mpath} — {kind.lower()} but {why}; {age:.1f}d old. The DDL "
+                          f"behind the live schema exists only on this disk",
+            })
+        if promoted:
+            continue
+
+        # AGE AXIS, unchanged, for everything that is not that class.
+        if age <= DIRTY_MAX_AGE_D:
+            decisions.append((code, path, "ok",
+                              f"{kind} {age:.1f}d <= DIRTY_MAX_AGE_D={DIRTY_MAX_AGE_D}d "
+                              f"— work in progress, not a durability problem"))
+            continue
+        decisions.append((code, path, "FINDING",
+                          f"{kind} — {age:.1f}d > DIRTY_MAX_AGE_D={DIRTY_MAX_AGE_D}d"))
         findings.append({
             "kind": kind, "repo": name,
             "detail": f"{path} — uncommitted for {age:.0f}d",
         })
+
+    # Printing the raw input was the whole point of v1, but input alone cannot
+    # tell a reader whether a line was considered and dismissed or never looked
+    # at — which is exactly how 122/123 were printed and silently dropped. So
+    # the DERIVATION prints too, every run.
+    print("$ finding-set decision")
+    for code, path, verdict, why in decisions or []:
+        print(f"  [{code}] {verdict:<9} {path} — {why}")
+    if not decisions:
+        print("  (no porcelain lines to classify)")
 
     return findings
 
@@ -197,7 +362,7 @@ def main() -> int:
 
     print("\n===== findings =====")
     for f in findings:
-        print(f"{f['kind']:<13} {f['repo']:<12} {f['detail']}")
+        print(f"{f['kind']:<18} {f['repo']:<12} {f['detail']}")
     if not findings:
         print("all repos pushed and clean")
 

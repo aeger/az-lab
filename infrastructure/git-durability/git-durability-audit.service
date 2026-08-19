@@ -14,6 +14,12 @@ Type=oneshot
 # point of the unit: on 2026-08-15 and 08-16 the daily research run recorded
 # "Working tree CLEAN" while five files had been dirty for 24-36 days, because
 # the check was a claim in a report and never a command whose output was read.
+# Supabase creds: the applied-migration ledger (supabase_migrations.schema_migrations,
+# via memory_state_ground_truth) is what lets an APPLIED migration be a finding at
+# age 0. Optional (leading '-') on purpose — the raw-print contract must survive a
+# missing .env — and the script fails CLOSED without it, flagging any dirty
+# migration file rather than assuming it is unapplied.
+EnvironmentFile=-/home/almty1/azlab/services/memory-mcp-server/.env
 ExecStart=/usr/bin/python3 /home/almty1/azlab/infrastructure/git-durability/git_durability_audit.py
 StandardOutput=journal
 StandardError=journal
