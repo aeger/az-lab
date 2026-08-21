@@ -23,6 +23,34 @@ let agentStatus: AgentStatus = {
   securityScore: null,
 };
 
+// MV3 recycles this service worker after ~30s idle, which resets `agentStatus`
+// above to all-disconnected. Neither onInstalled nor onStartup fires on a bare
+// respawn, so without this marker GET_STATUS answers "disconnected" from a
+// freshly-zeroed struct and the dots lie until the next heartbeat alarm.
+let statusProbedAt = 0;
+const STATUS_MAX_AGE_MS = 90_000;
+
+// Single source of truth for the dots — probes every backend and updates
+// `agentStatus` in place. Called by the heartbeat alarm and on-demand by
+// GET_STATUS when the in-memory copy is unprobed or stale.
+async function refreshStatus(): Promise<AgentStatus> {
+  const [mcpOk, busOk, supaOk, security] = await Promise.allSettled([
+    mcpHealthCheck(),
+    busHealthCheck(),
+    supabaseHealthCheck(),
+    busGetSecurity(),
+  ]);
+  agentStatus.memoryMcp = (mcpOk.status === 'fulfilled' && mcpOk.value) ? 'connected' : 'disconnected';
+  agentStatus.agentBus = (busOk.status === 'fulfilled' && busOk.value) ? 'connected' : 'disconnected';
+  agentStatus.supabase = (supaOk.status === 'fulfilled' && supaOk.value) ? 'connected' : 'disconnected';
+  if (security.status === 'fulfilled') {
+    agentStatus.security = security.value.level;
+    agentStatus.securityScore = security.value.score;
+  }
+  statusProbedAt = Date.now();
+  return agentStatus;
+}
+
 // --- Install & Startup ---
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -52,6 +80,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   // Run startup
   const result = await runStartup();
   agentStatus = result.status;
+  statusProbedAt = Date.now();
 });
 
 chrome.runtime.onStartup.addListener(async () => {
@@ -59,6 +88,7 @@ chrome.runtime.onStartup.addListener(async () => {
   await loadChatHistory();
   const result = await runStartup();
   agentStatus = result.status;
+  statusProbedAt = Date.now();
 });
 
 // --- Alarms ---
@@ -66,19 +96,7 @@ chrome.runtime.onStartup.addListener(async () => {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARMS.heartbeat) {
     // Lightweight connectivity check
-    const [mcpOk, busOk, supaOk, security] = await Promise.allSettled([
-      mcpHealthCheck(),
-      busHealthCheck(),
-      supabaseHealthCheck(),
-      busGetSecurity(),
-    ]);
-    agentStatus.memoryMcp = (mcpOk.status === 'fulfilled' && mcpOk.value) ? 'connected' : 'disconnected';
-    agentStatus.agentBus = (busOk.status === 'fulfilled' && busOk.value) ? 'connected' : 'disconnected';
-    agentStatus.supabase = (supaOk.status === 'fulfilled' && supaOk.value) ? 'connected' : 'disconnected';
-    if (security.status === 'fulfilled') {
-      agentStatus.security = security.value.level;
-      agentStatus.securityScore = security.value.score;
-    }
+    await refreshStatus();
   }
 
   if (alarm.name === ALARMS.taskPoll) {
@@ -144,6 +162,11 @@ chrome.runtime.onMessage.addListener((message: LumenMessage, _sender, sendRespon
 async function handleMessage(message: LumenMessage): Promise<BackgroundResponse> {
   switch (message.type) {
     case 'GET_STATUS':
+      // Re-probe if this SW instance has never probed (fresh respawn) or the
+      // last probe aged out — otherwise the sidebar renders zeroed defaults.
+      if (Date.now() - statusProbedAt > STATUS_MAX_AGE_MS) {
+        await refreshStatus();
+      }
       return { type: 'STATUS', payload: agentStatus };
 
     case 'GET_CHAT_HISTORY':
@@ -242,6 +265,7 @@ async function handleMessage(message: LumenMessage): Promise<BackgroundResponse>
     case 'RUN_STARTUP': {
       const result = await runStartup();
       agentStatus = result.status;
+      statusProbedAt = Date.now();
       return { type: 'STATUS', payload: agentStatus };
     }
 
