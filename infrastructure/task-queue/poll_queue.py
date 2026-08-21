@@ -1776,9 +1776,32 @@ def _needs_jeff_input(text: str) -> tuple[bool, str]:
     return False, ""
 
 
+def _notify_summary(result: str, max_chars: int = 600) -> str:
+    """Short Discord summary of a task result.
+
+    Was `result.splitlines()[0][:120]`, which silently dropped everything after
+    the first line — a result listing several follow-ups showed up as one. Keep
+    the leading paragraph instead, and say so when there is more to read.
+    """
+    if not result:
+        return "done"
+    text = result.strip()
+    # Leading paragraph, not just the first line.
+    para = text.split("\n\n", 1)[0].strip()
+    clipped = len(para) < len(text)
+    if len(para) > max_chars:
+        para = para[:max_chars].rstrip()
+        clipped = True
+    return para + ("\n… (full result in the task row)" if clipped else "")
+
+
 def mark_pending_jeff_action(task_id: str, result: str, reason: str, title: str = "", goal_id: str | None = None) -> None:
     """Transition task to pending_jeff_action and notify Jeff via Discord."""
-    stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
+    stored_result = result
+    if result and len(result) > _RESULT_MAX_CHARS:
+        stored_result = result[:_RESULT_MAX_CHARS] + (
+            f"\n... [truncated from {len(result)} chars — full text in the task row]"
+        )
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
@@ -1786,10 +1809,16 @@ def mark_pending_jeff_action(task_id: str, result: str, reason: str, title: str 
     )
     log_activity("status", f"Pending Jeff action: {reason[:100]}", task_id=task_id)
     display = title or task_id
+    # Send the FULL result body, not just the signal snippet. Jeff reads this in
+    # Discord and acts on it — if the agent asked for three things, he has to see
+    # all three. notify.send() splits anything over Discord's 2000-char cap into
+    # numbered parts, so a long body is delivered whole rather than clipped.
+    body = (stored_result or "").strip()
     discord_notify(
         f"🙋 **Jeff input needed:** {display}\n"
         f"**Signal:** `{reason[:120]}`\n"
-        f"Set task status back to `ready` once you've provided direction."
+        + (f"\n{body}\n" if body else "")
+        + "\nSet task status back to `ready` once you've provided direction."
     )
     print(f"Task {task_id} transitioned to pending_jeff_action.")
 
@@ -2014,7 +2043,7 @@ def main():
         task_ctx = task.get("context") or {}
         task_timeout = task_ctx.get("timeout_secs") if isinstance(task_ctx, dict) else None
         result = run_claude(prompt, task_id=task_id, model=model, timeout=task_timeout)
-        summary = result.splitlines()[0][:120] if result else "done"
+        summary = _notify_summary(result)
         goal_id = task.get("goal_id")
 
         # JeffLoop: auto-detect if result signals Jeff input is needed.
