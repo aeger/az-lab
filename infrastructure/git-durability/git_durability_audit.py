@@ -43,12 +43,41 @@ WHY THIS EXISTS
     tell whether a line had been considered and dismissed or never looked at.
     Every porcelain line now prints its DECISION and the reason for it.
 
+    ONE CLASS IS NOT THE PROPERTY (added 2026-08-21, fourth occurrence)
+    The 08-19 fix was correct and enumerated exactly one class. The 08-21 run
+    scored `[ M] ok services/memory-mcp-server/dreaming_consolidate.py — DIRTY
+    0.4d <= DIRTY_MAX_AGE_D=3d — work in progress`. It was not work in progress.
+    Those +159 lines (a new fetch_state_of_lab over goals, memory_conflicts and
+    stale_memories_review_queue) were EXECUTED by
+    memory-dreaming-consolidate.service at 02:15:16Z, thirty minutes after the
+    edit, and last committed 864f572 on 2026-06-28. The consolidation they
+    produced is downstream in Supabase; the source that produced it is on one
+    disk, outside git, outside r2_backup.
+
+    So the property the bypass encodes is not "is a migration" but "production
+    has ALREADY EXECUTED this, irreversibly or unreproducibly". An applied
+    migration is one member of that class. An ExecStart target that has run is
+    another, and the age axis is as meaningless for it as for the migration:
+    at 0.4d old it had already run once.
+
+    ENABLED IS NOT THE SET THAT RUNS. Taking "every enabled unit" literally
+    resolves 14 services on this box and misses dreaming_consolidate.py — the
+    file that motivated this — because memory-dreaming-consolidate.service is
+    `static`; only its .timer is enabled. Nearly every periodic job here is
+    shaped that way, so an enabled .timer/.socket/.path is followed through
+    Unit=/Triggers= to the service it actually starts: 57 services, 26 of them
+    executing repo files. Stopping at `is-enabled` would have enumerated the
+    wrong 14 and re-scored dreaming_consolidate.py ok, which is the bug.
+
 WHAT IT REPORTS
     UNPUSHED           commits ahead of the remote, older than UNPUSHED_MAX_AGE_D
     DIRTY              tracked file modified and uncommitted for > DIRTY_MAX_AGE_D
     UNTRACKED          untracked path present for > DIRTY_MAX_AGE_D (not ignored)
     APPLIED_MIGRATION  a migration ALREADY APPLIED to prod is dirty/untracked —
                        reported at age 0, no grace period
+    EXECUTING_UNCOMMITTED
+                       a file systemd already RAN is dirty/untracked — reported
+                       at age 0, no grace period
     NO_UPSTREAM        branch has no remote-tracking ref — nothing to be ahead OF
     FETCH_FAILED       could not reach the remote, so the ahead-count is unproven
 
@@ -97,11 +126,25 @@ LEDGERED_MIGRATION_DIRS = {
 }
 MIGRATION_FILE_RE = re.compile(r"(\d{3})[^/]*\.sql$")
 
+# ── the same bypass, generalised to what production already ran ─────────────
+# ExecStart is read from systemd's RESOLVED view (`systemctl show`), not by
+# parsing unit files: specifiers (%i, %h), drop-in overrides and Environment=
+# expansion are systemd's job, and a hand-rolled parser of ~/.config/systemd
+# would silently disagree with what actually executed. ExecStartPre/Post count
+# too — a pre-hook that ran, ran.
+EXEC_PROPS = ("ExecStart", "ExecStartPre", "ExecStartPost")
+# `systemctl show` renders each Exec line as `{ path=... ; argv[]=a b c ; ... }`
+# on ONE line. The argv is the whole command, so `python3 /path/script.py` puts
+# the interesting file in a token, not in path=.
+ARGV_RE = re.compile(r"argv\[\]=([^;}]*)")
+UNIT_ID_RE = re.compile(r"^Id=(.+)$", re.M)
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://ogqjjlbupqnvlcyrfnxi.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
 
 _NOTIFY = None
 _HEAD = None  # (int|None, source_str) — the ledger is queried at most once/run
+_EXEC_TARGETS = None  # {realpath: {unit}} — systemd is enumerated once/run
 
 
 def post(msg: str) -> None:
@@ -221,6 +264,127 @@ def ledgered_migrations_under(repo: Path, name: str, path: str) -> list:
     return out
 
 
+def _systemctl(*args, timeout=60):
+    p = subprocess.run(
+        ["systemctl", "--user", *args], capture_output=True, text=True, timeout=timeout,
+    )
+    return p.returncode, p.stdout
+
+
+def execstart_targets() -> dict:
+    """{absolute realpath: {unit, ...}} for every repo file systemd executes.
+
+    Resolved once per run, and scoped to REPOS: an interpreter at /usr/bin/
+    python3 is an argv token like any other, but it is not work that could be
+    lost, and keeping it out makes the printed target set readable.
+
+    Degrades to {} on any failure rather than raising. This is an ADDITIONAL
+    promotion axis; if systemd cannot be enumerated, the age axis and the raw
+    porcelain print — the parts this script exists for — must still run. Unlike
+    the migration ledger there is no fail-closed option here: without a unit
+    list there is no candidate set to fail closed ABOUT, so the loss is printed
+    instead, and a reader sees that the class was not evaluated.
+    """
+    global _EXEC_TARGETS
+    if _EXEC_TARGETS is not None:
+        return _EXEC_TARGETS
+    _EXEC_TARGETS = {}
+    roots = []
+    for r in REPOS:
+        try:
+            roots.append(r.resolve())
+        except OSError:
+            pass
+    try:
+        rc, out = _systemctl(
+            "list-unit-files", "--state=enabled,enabled-runtime", "--no-legend",
+        )
+        if rc != 0:
+            print("systemctl list-unit-files failed — EXECUTING_UNCOMMITTED not evaluated",
+                  file=sys.stderr)
+            return _EXEC_TARGETS
+
+        # An enabled .timer/.socket/.path is a TRIGGER, not the thing that runs.
+        # Follow it to its service or the whole class collapses to the handful
+        # of units that happen to be enabled in their own right.
+        services, seen = [], set()
+        for ln in out.splitlines():
+            parts = ln.split()
+            if not parts:
+                continue
+            u = parts[0]
+            if u.endswith(".service"):
+                cand = [u]
+            elif u.endswith((".timer", ".socket", ".path")):
+                _, tv = _systemctl("show", u, "-p", "Unit", "-p", "Triggers", "--value")
+                cand = [t for t in tv.split() if t.endswith(".service")]
+            else:
+                continue
+            for c in cand:
+                if c not in seen:
+                    seen.add(c)
+                    services.append(c)
+        if not services:
+            return _EXEC_TARGETS
+
+        props = []
+        for p in EXEC_PROPS:
+            props += ["-p", p]
+        rc, out = _systemctl("show", *services, "-p", "Id", *props, timeout=120)
+        # Blocks are blank-line separated and each carries its own Id=, so a
+        # unit with two ExecStart lines still attributes both correctly.
+        for block in out.split("\n\n"):
+            m = UNIT_ID_RE.search(block)
+            if not m:
+                continue
+            unit = m.group(1).strip()
+            for argv in ARGV_RE.findall(block):
+                for tok in argv.split():
+                    if not tok.startswith("/"):
+                        continue
+                    try:
+                        rp = Path(tok).resolve()
+                        if not rp.is_file():
+                            continue
+                    except OSError:
+                        continue
+                    if any(r == rp or r in rp.parents for r in roots):
+                        _EXEC_TARGETS.setdefault(str(rp), set()).add(unit)
+    except Exception as e:
+        print(f"execstart enumeration failed: {e} — EXECUTING_UNCOMMITTED not evaluated",
+              file=sys.stderr)
+    return _EXEC_TARGETS
+
+
+def is_execstart_target(repo: Path, path: str) -> list:
+    """Every (relpath, [unit, ...]) ExecStart target a porcelain line covers.
+
+    Same directory problem ledgered_migrations_under has: git collapses a
+    wholly-untracked directory into one `?? dir/` line, so a dir entry is tested
+    against every target BENEATH it rather than compared as a path. Both sides
+    are realpaths, so a symlinked unit target still matches the file in the repo.
+    """
+    targets = execstart_targets()
+    if not targets:
+        return []
+    try:
+        root = repo.resolve()
+        full = (repo / path).resolve()
+        is_dir = full.is_dir()
+    except OSError:
+        return []
+    hits = []
+    for t, units in targets.items():
+        tp = Path(t)
+        if tp != full and not (is_dir and full in tp.parents):
+            continue
+        try:
+            hits.append((str(tp.relative_to(root)), sorted(units)))
+        except ValueError:
+            continue
+    return sorted(hits)
+
+
 def audit_repo(repo: Path) -> list:
     """Audit one repo. PRINTS the raw git output first, then derives findings."""
     name = repo.name
@@ -298,8 +462,10 @@ def audit_repo(repo: Path) -> list:
             decisions.append((code, path, "skip", "cannot stat — deleted, or unreadable"))
             continue
 
-        # CLASS AXIS. An applied migration has already changed the live schema,
-        # irreversibly, so there is no age at which it is merely work-in-progress.
+        # CLASS AXIS. An applied migration has already changed the live schema;
+        # a script systemd already ran has already had its effect somewhere
+        # downstream. In both cases production consumed bytes that exist only on
+        # this disk, so there is no age at which either is work-in-progress.
         promoted = False
         for mpath, seq in ledgered_migrations_under(repo, name, path):
             head, src = applied_migration_head()
@@ -321,6 +487,26 @@ def audit_repo(repo: Path) -> list:
                 "detail": f"{mpath} — {kind.lower()} but {why}; {age:.1f}d old. The DDL "
                           f"behind the live schema exists only on this disk",
             })
+        for tpath, units in is_execstart_target(repo, path):
+            promoted = True
+            # A dir line covers targets with their own mtimes; report the
+            # target's, not the directory's.
+            try:
+                tage = age_days((repo / tpath).stat().st_mtime)
+            except OSError:
+                tage = age
+            unit_s = ", ".join(units)
+            decisions.append((code, tpath, "FINDING",
+                              f"EXECUTING_UNCOMMITTED — ExecStart of {unit_s}; "
+                              f"age {tage:.1f}d IGNORED (class bypasses "
+                              f"DIRTY_MAX_AGE_D={DIRTY_MAX_AGE_D}d)"))
+            findings.append({
+                "kind": "EXECUTING_UNCOMMITTED", "repo": name,
+                "detail": f"{tpath} — {kind.lower()} and is ExecStart of {unit_s}; "
+                          f"{tage:.1f}d old. Production is executing source that "
+                          f"exists only on this disk",
+            })
+
         if promoted:
             continue
 
@@ -351,6 +537,16 @@ def audit_repo(repo: Path) -> list:
 
 
 def main() -> int:
+    # The bypass class's INPUT, printed for the same reason the porcelain is:
+    # a promotion nobody can see the basis of is a claim, not a check. An empty
+    # set here means the class was not evaluated, and says so.
+    targets = execstart_targets()
+    print("$ systemd ExecStart targets under audited repos")
+    for t in sorted(targets):
+        print(f"  {t} <- {', '.join(sorted(targets[t]))}")
+    if not targets:
+        print("  (none resolved — EXECUTING_UNCOMMITTED not evaluated this run)")
+
     findings = []
     for repo in REPOS:
         try:
