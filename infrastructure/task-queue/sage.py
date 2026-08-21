@@ -129,6 +129,16 @@ _VERIFICATION_SIGNALS = [
     "rollout complete", "service is up", "container healthy", "health check passed",
     "screenshot", "loaded successfully", "render confirmed", "tested in production",
     "git push", "merged into main", "merged to main", "live on home.az-lab",
+    # Timer/script-class proof. The signals above are all HTTP/UI-shaped, so a
+    # systemd-timer or CLI-script change could never satisfy the gate and looped
+    # forever — see the git-durability audit task (2026-08-19 [2/4]), re-gated on
+    # 08-21 despite a journal-backed run + three live probes. These are all
+    # command-output-shaped (things you only quote if you ran the command),
+    # not prose an agent would write while merely claiming success.
+    "journalctl", "systemctl status", "systemctl --user", "list-timers",
+    "result=success", "activestate=active", "substate=running",
+    "exit code 0", "exited with 0", "needdaemonreload=no",
+    "timer ran", "timer fired", "probe confirmed",
 ]
 
 # Complexity thresholds for pre-dispatch tagging
@@ -379,10 +389,15 @@ def _is_deployable_change(task: dict, result: str) -> tuple[bool, str]:
 
 
 def _has_verification_proof(result: str) -> bool:
-    """True when the result text shows the agent actually verified the change is live."""
+    """True when the result text shows the agent actually verified the change is live.
+
+    Boilerplate is stripped first for the same reason as in _is_deployable_change,
+    but in the opposite direction: the verify-gate note itself contains the phrase
+    'curl/HTTP 200', so scanning the raw result let a previously-gated task clear
+    its own gate on the next pass purely on Sage's own words."""
     if not result:
         return False
-    lower = result.lower()
+    lower = (_strip_eval_boilerplate(result) or "").lower()
     return any(sig in lower for sig in _VERIFICATION_SIGNALS)
 
 
