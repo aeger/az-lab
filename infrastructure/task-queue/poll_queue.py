@@ -1052,6 +1052,10 @@ _CONTEXT_STRIP_KEYS = {"previous_output", "last_result", "full_transcript", "raw
 _CONTEXT_MAX_CHARS = 3000
 _CONTEXT_COMPRESS_THRESHOLD = 6000   # compress when serialized context exceeds this
 _RESULT_MAX_CHARS = 2000
+# pending_jeff_action rows are the durable copy Jeff reads and acts on, so they
+# are NOT clipped to _RESULT_MAX_CHARS. This cap only exists to stop a runaway
+# result from bloating the row.
+_JEFF_RESULT_MAX_CHARS = 20000
 _DESC_MAX_CHARS = 4000
 _DESC_COMPRESS_THRESHOLD = 8000      # compress descriptions above this before hard-capping
 
@@ -1797,10 +1801,13 @@ def _notify_summary(result: str, max_chars: int = 600) -> str:
 
 def mark_pending_jeff_action(task_id: str, result: str, reason: str, title: str = "", goal_id: str | None = None) -> None:
     """Transition task to pending_jeff_action and notify Jeff via Discord."""
+    # The row is the full text — do not clip it to _RESULT_MAX_CHARS and then
+    # point at "the task row" for the rest, because this IS the task row and the
+    # tail is gone the moment this process exits. Only the runaway cap applies.
     stored_result = result
-    if result and len(result) > _RESULT_MAX_CHARS:
-        stored_result = result[:_RESULT_MAX_CHARS] + (
-            f"\n... [truncated from {len(result)} chars — full text in the task row]"
+    if result and len(result) > _JEFF_RESULT_MAX_CHARS:
+        stored_result = result[:_JEFF_RESULT_MAX_CHARS] + (
+            f"\n... [truncated from {len(result)} chars — remainder not retained]"
         )
     api_request(
         "PATCH",
