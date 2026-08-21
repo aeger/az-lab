@@ -145,6 +145,160 @@ def write_summary(client, key, rows, name):
     return r.json()
 
 
+def fetch_state_of_lab(client):
+    """Fetch current state of lab: open goals, unresolved conflicts, stale queue, last eval delta."""
+    state = {}
+
+    # Open goals
+    r = client.get(
+        f"{SUPABASE_URL}/rest/v1/goals",
+        params={
+            "select": "id,title,status,priority,target_date",
+            "status": "in.(active,planned,paused)",
+            "order": "priority.asc,target_date.asc",
+        },
+        headers=sb_headers(),
+        timeout=15,
+    )
+    r.raise_for_status()
+    state["open_goals"] = r.json()
+
+    # Unresolved conflicts
+    r = client.get(
+        f"{SUPABASE_URL}/rest/v1/memory_conflicts",
+        params={
+            "select": "id,conflict_type,description,created_at",
+            "resolved": "eq.false",
+            "order": "created_at.desc",
+        },
+        headers=sb_headers(),
+        timeout=15,
+    )
+    r.raise_for_status()
+    state["unresolved_conflicts"] = r.json()
+
+    # Stale review queue (sample: top 10 by review_rank)
+    r = client.get(
+        f"{SUPABASE_URL}/rest/v1/stale_memories_review_queue",
+        params={
+            "select": "id,name,type,expires_at,review_rank",
+            "order": "review_rank.desc",
+            "limit": "10",
+        },
+        headers=sb_headers(),
+        timeout=15,
+    )
+    r.raise_for_status()
+    state["stale_queue_sample"] = r.json()
+
+    # Latest eval delta
+    r = client.get(
+        f"{SUPABASE_URL}/rest/v1/eval_runs",
+        params={
+            "select": "tag,delta_over_no_memory,created_at",
+            "delta_over_no_memory": "not.is.null",
+            "order": "created_at.desc",
+            "limit": "1",
+        },
+        headers=sb_headers(),
+        timeout=15,
+    )
+    r.raise_for_status()
+    last_eval = r.json()
+    state["last_eval_run"] = last_eval[0] if last_eval else None
+
+    return state
+
+
+def write_state_of_lab_digest(client, state):
+    """Write a state-of-lab digest memory for morning warm-start."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    name = f"State of Lab — {today}"
+
+    body_lines = [
+        "# Morning Digest",
+        "",
+        "## Open Goals",
+    ]
+
+    goals = state.get("open_goals") or []
+    if goals:
+        by_status = {}
+        for g in goals:
+            status = g.get("status", "unknown")
+            by_status.setdefault(status, []).append(g)
+        for status in ("active", "planned", "paused"):
+            if status in by_status:
+                body_lines.append(f"\n### {status.title()} ({len(by_status[status])})")
+                for g in by_status[status][:5]:  # Cap at 5 per status
+                    target = g.get("target_date") or "—"
+                    body_lines.append(f"- [{g['id']}] {g['title']} (target: {target})")
+                if len(by_status[status]) > 5:
+                    body_lines.append(f"  …and {len(by_status[status]) - 5} more")
+    else:
+        body_lines.append("(none)")
+
+    conflicts = state.get("unresolved_conflicts") or []
+    body_lines.append(f"\n## Unresolved Conflicts ({len(conflicts)})")
+    if conflicts:
+        for c in conflicts[:5]:  # Cap at 5
+            body_lines.append(f"- [{c['id']}] {c['conflict_type']}: {c['description']}")
+            body_lines.append(f"  (since {c['created_at']})")
+        if len(conflicts) > 5:
+            body_lines.append(f"…and {len(conflicts) - 5} more")
+    else:
+        body_lines.append("(none)")
+
+    stale_queue = state.get("stale_queue_sample") or []
+    body_lines.append(f"\n## Stale Review Queue (top 10 by rank)")
+    if stale_queue:
+        for item in stale_queue:
+            expires = item.get("expires_at") or "—"
+            body_lines.append(f"- {item['name']} (expires: {expires})")
+    else:
+        body_lines.append("(empty)")
+
+    last_eval = state.get("last_eval_run")
+    body_lines.append(f"\n## Last Eval Run")
+    if last_eval:
+        delta = last_eval.get("delta_over_no_memory")
+        tag = last_eval.get("tag")
+        ts = last_eval.get("created_at")
+        body_lines.append(f"- Tag: {tag}")
+        body_lines.append(f"- Delta over no-memory: {delta:.4f}" if delta else "- Delta: —")
+        body_lines.append(f"- Run: {ts}")
+    else:
+        body_lines.append("(no evaluations yet)")
+
+    payload = {
+        "type": "project",
+        "name": name,
+        "description": "Nightly state-of-lab digest: open goals, conflicts, stale queue, eval performance",
+        "content": "\n".join(body_lines),
+        "tags": ["state_of_lab", "auto", "digest", "nightly"],
+        "source": "dreaming_consolidate",
+        "memory_class": "semantic",
+        "confidence": 0.8,
+    }
+
+    if DRY_RUN:
+        log.info("DRY: would write state-of-lab digest")
+        return None
+
+    r = client.post(
+        f"{SUPABASE_URL}/rest/v1/memories",
+        headers=sb_headers(),
+        json=payload,
+        timeout=20,
+    )
+    if r.status_code >= 300:
+        log.warning("state-of-lab insert failed %s: %s", r.status_code, r.text[:200])
+        return None
+    res = r.json()
+    log.info("wrote state-of-lab digest: %s", name)
+    return res
+
+
 def main():
     if not SUPABASE_KEY:
         log.error("SUPABASE_SECRET_KEY missing")
@@ -169,6 +323,11 @@ def main():
             if res:
                 written += 1
                 log.info("wrote %s", name)
+
+        # T3: Materialize state-of-lab digest
+        state = fetch_state_of_lab(client)
+        write_state_of_lab_digest(client, state)
+
         log.info("done. summaries_written=%d", written)
 
 
