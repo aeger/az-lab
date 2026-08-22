@@ -81,6 +81,10 @@ WHAT IT REPORTS
     NO_UPSTREAM        branch has no remote-tracking ref — nothing to be ahead OF
     FETCH_FAILED       could not reach the remote, so the ahead-count is unproven
 
+    Any finding still present after ESCALATE_AFTER_RUNS consecutive runs is
+    additionally queued to Supabase task_queue for wren, once per
+    ESCALATE_COOLDOWN_D. See escalate().
+
     `git fetch` runs first. Without it the ahead-count is measured against a
     cached remote ref and can read 0 while the real remote is far behind — the
     same false-clean this script exists to prevent.
@@ -88,8 +92,32 @@ WHAT IT REPORTS
     Findings are a FINDING, not a unit failure: the script always exits 0, so a
     dirty tree does not also show up as a broken systemd unit (same convention
     as container_health_audit.py). Alerts post through the canonical agent-bus
-    notifier and only on a CHANGE in the finding set, so a condition that
-    persists for days does not repost every run.
+    notifier and only on a CHANGE in the finding SET.
+
+    A CORRECT FINDING NOBODY CONSUMES (added 2026-08-22, fifth occurrence)
+    The first four fixes were all about the detector's ACCURACY — which lines it
+    prints, which it promotes, which class bypasses the age axis. The 08-22 run
+    got every one of those right and still changed nothing: it printed
+    `UNTRACKED dashboard .claude/ -- uncommitted for 41d`, correctly, for the
+    41st consecutive day. Inside was a 46M tree of live git worktrees plus a
+    settings.local.json carrying the dashboard feeds API bearer token. Nobody
+    had looked, because the output had become weather.
+
+    Two defects, one shape. First, the dedup key was
+    "{kind}:{repo}:{detail}" and detail carries the age, so the key changed
+    every midnight and the "only alert on a CHANGE" contract above never held —
+    it reposted to Discord daily, which is how a real finding trains its
+    reader to ignore it. Identity is now the stable ident (kind, repo, path);
+    age lives in the message, not the comparison.
+
+    Second and larger: printing is not a consumer. A finding that recurs
+    UNCHANGED across runs is itself evidence that no print will ever be acted
+    on, so after ESCALATE_AFTER_RUNS it stops being a print and becomes a
+    task_queue row that the poller picks up — two runs for the bypass classes,
+    which never had a grace period, four for everything else. Escalation is
+    idempotent against both the state file and an already-open task row, and
+    re-fires after ESCALATE_COOLDOWN_D so that "escalated once, ignored
+    forever" cannot rebuild this same failure one layer up.
 """
 
 import json
@@ -98,12 +126,15 @@ import re
 import subprocess
 import sys
 import importlib.util
+import urllib.parse
 import urllib.request
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
 
 NOTIFY_PY = Path.home() / "claude/agent-bus/notify.py"
 STATE = Path.home() / ".wren-watchdog/git_durability_audit.json"
+HOST = socket.gethostname()
 
 # Repos whose only off-box copy is their git remote. Keep this list explicit
 # rather than globbing for .git dirs: a scan would sweep up vendored checkouts
@@ -115,6 +146,30 @@ REPOS = [Path.home() / "azlab", Path.home() / "dashboard"]
 # failure would actually lose something.
 DIRTY_MAX_AGE_D = 3
 UNPUSHED_MAX_AGE_D = 2
+
+# ── how long a finding may go unactioned before it stops being a print ──────
+# The timer runs every 6h, so these are counts of CONSECUTIVE runs in which the
+# same ident was still present. Four runs is one full day of recurrence on top
+# of whatever grace the age axis already granted; the two bypass classes get two
+# runs because they had no grace period to begin with — production has already
+# executed those bytes, so a day of thinking about it is a day too long.
+ESCALATE_AFTER_RUNS = {
+    "APPLIED_MIGRATION": 2,
+    "EXECUTING_UNCOMMITTED": 2,
+}
+ESCALATE_AFTER_RUNS_DEFAULT = 4
+
+# An escalation that fires once and is then permanently silent rebuilds the very
+# failure this is fixing, one layer up. If the queued task is still not resolved
+# after this long, escalate again rather than assume someone is on it.
+ESCALATE_COOLDOWN_D = 14
+
+# task_queue statuses that mean "this is already someone's problem" — an open
+# row suppresses a duplicate even if the local state file was lost.
+OPEN_TASK_STATUSES = (
+    "backlog,ready,in_progress_agent,in_progress_jeff,pending_jeff_action,"
+    "blocked,paused,pending,claimed,escalated,hand_back"
+)
 
 # ── the class that has no grace period ──────────────────────────────────────
 # Repo -> repo-relative dirs whose NNN_*.sql files are covered by an applied-
@@ -167,6 +222,97 @@ def post(msg: str) -> None:
         except Exception as e:
             print(f"notify.send failed: {e}", file=sys.stderr)
     print("would have posted:", msg)
+
+
+def _supabase(method: str, path: str, payload=None, timeout=15):
+    """Minimal PostgREST call. Returns parsed JSON, or None on any failure —
+    a queue that is unreachable must never mask or crash the audit itself."""
+    if not SUPABASE_KEY:
+        return None
+    try:
+        req = urllib.request.Request(
+            f"{SUPABASE_URL.rstrip('/')}/rest/v1/{path}",
+            data=json.dumps(payload, default=str).encode() if payload is not None else None,
+            headers={
+                "Content-Type": "application/json",
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Prefer": "return=representation",
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode()
+        return json.loads(body) if body.strip() else []
+    except Exception as e:
+        print(f"task_queue {method} {path} failed: {e}", file=sys.stderr)
+        return None
+
+
+def escalate(f: dict, runs: int, threshold: int) -> bool:
+    """Turn a finding that has recurred unchanged into a task_queue row.
+
+    WHY THIS EXISTS
+        On 2026-08-22 the dashboard repo's `?? .claude/` had been promoted to a
+        FINDING on every run for 41 days. The detector was correct, its output
+        was correct, and it was delivered to the journal and to Discord every
+        single day. Nothing changed, because printing is not a consumer. A
+        finding that recurs unchanged is evidence of exactly one thing — that
+        nobody is going to act on it from a print — so at that point it has to
+        become a row that somebody's poller picks up.
+
+    Idempotent twice over: the caller stamps escalated_at so a live state file
+    only fires once per cooldown, and an open task_queue row on the same stable
+    title suppresses a duplicate even if that state file is deleted.
+    """
+    title = f"Git durability: {f['ident']} unresolved"
+    existing = _supabase(
+        "GET",
+        f"task_queue?select=id,status&status=in.({OPEN_TASK_STATUSES})"
+        f"&title=eq.{urllib.parse.quote(title, safe='')}",
+    )
+    if existing:
+        print("  escalation SUPPRESSED — task_queue row already open: "
+              f"{existing[0].get('id', '?')}")
+        return True
+    if existing is None:
+        print("  escalation DEFERRED — task_queue unreachable; will retry next run")
+        return False
+
+    row = _supabase("POST", "task_queue", {
+        "title": title,
+        "description": (
+            f"git-durability-audit has reported this finding unchanged for "
+            f"{runs} consecutive runs (threshold {threshold}), and it is still "
+            f"present:\n\n"
+            f"    {f['kind']}  {f['repo']}  {f['detail']}\n\n"
+            f"The detector is working; what is missing is a decision. Resolve the "
+            f"CONTENT — commit it, .gitignore it, or push it — rather than "
+            f"silencing the check. Look at what the path actually holds first.\n\n"
+            f"    journalctl --user -u git-durability-audit.service -n 120\n"
+            f"    git -C ~/{f['repo']} status --porcelain"
+        ),
+        "context": {
+            "ident": f["ident"], "kind": f["kind"], "repo": f["repo"],
+            "detail": f["detail"], "consecutive_runs": runs,
+            "detector": "git-durability-audit.service", "host": HOST,
+        },
+        "priority": 0 if f["kind"] in ESCALATE_AFTER_RUNS else 1,
+        "status": "ready",
+        "source": "system",
+        "target": "wren",
+        "tags": ["git-durability", "audit", "auto-created", "escalated"],
+    })
+    if row is None:
+        print("  escalation FAILED — task_queue insert rejected; will retry next run")
+        return False
+    print(f"  ESCALATED -> task_queue {row[0].get('id', '?') if row else '(created)'}")
+    post(
+        f"🔺 **Git durability — ESCALATED after {runs} runs**\n"
+        f"- **{f['kind']}** `{f['repo']}` — {f['detail']}\n"
+        f"Queued for wren; printing it daily was not making it go away."
+    )
+    return True
 
 
 def git(repo: Path, *args, timeout=60, raw=False):
@@ -409,6 +555,7 @@ def audit_repo(repo: Path) -> list:
         print(f"git fetch FAILED: {err or 'unknown error'}")
         findings.append({
             "kind": "FETCH_FAILED", "repo": name,
+            "ident": f"FETCH_FAILED:{name}:origin/{branch}",
             "detail": f"could not fetch origin/{branch}; ahead-count below is unproven",
         })
 
@@ -423,6 +570,7 @@ def audit_repo(repo: Path) -> list:
         print("(no such remote ref)")
         findings.append({
             "kind": "NO_UPSTREAM", "repo": name,
+            "ident": f"NO_UPSTREAM:{name}:{branch}",
             "detail": f"branch {branch} has no origin/{branch} — work has no remote copy",
         })
         ahead = None
@@ -445,6 +593,7 @@ def audit_repo(repo: Path) -> list:
             print(f"  -> FINDING   UNPUSHED — {age:.1f}d > UNPUSHED_MAX_AGE_D={UNPUSHED_MAX_AGE_D}d")
             findings.append({
                 "kind": "UNPUSHED", "repo": name,
+                "ident": f"UNPUSHED:{name}:{branch}",
                 "detail": f"{ahead} commit(s) ahead of origin/{branch}; "
                           f"oldest is {age:.1f}d old and exists only on this disk",
             })
@@ -484,6 +633,7 @@ def audit_repo(repo: Path) -> list:
                               f"(class bypasses DIRTY_MAX_AGE_D={DIRTY_MAX_AGE_D}d)"))
             findings.append({
                 "kind": "APPLIED_MIGRATION", "repo": name,
+                "ident": f"APPLIED_MIGRATION:{name}:{mpath}",
                 "detail": f"{mpath} — {kind.lower()} but {why}; {age:.1f}d old. The DDL "
                           f"behind the live schema exists only on this disk",
             })
@@ -502,6 +652,7 @@ def audit_repo(repo: Path) -> list:
                               f"DIRTY_MAX_AGE_D={DIRTY_MAX_AGE_D}d)"))
             findings.append({
                 "kind": "EXECUTING_UNCOMMITTED", "repo": name,
+                "ident": f"EXECUTING_UNCOMMITTED:{name}:{tpath}",
                 "detail": f"{tpath} — {kind.lower()} and is ExecStart of {unit_s}; "
                           f"{tage:.1f}d old. Production is executing source that "
                           f"exists only on this disk",
@@ -520,6 +671,7 @@ def audit_repo(repo: Path) -> list:
                           f"{kind} — {age:.1f}d > DIRTY_MAX_AGE_D={DIRTY_MAX_AGE_D}d"))
         findings.append({
             "kind": kind, "repo": name,
+            "ident": f"{kind}:{name}:{path}",
             "detail": f"{path} — uncommitted for {age:.0f}d",
         })
 
@@ -562,24 +714,80 @@ def main() -> int:
     if not findings:
         print("all repos pushed and clean")
 
-    key = sorted(f"{f['kind']}:{f['repo']}:{f['detail']}" for f in findings)
+    # ── persistence, then escalation ────────────────────────────────────────
+    # The v1 key was "{kind}:{repo}:{detail}", and detail carries the age
+    # ("uncommitted for 41d"). That number ticks every day, so the key was never
+    # equal to prev and the "only alert on a CHANGE" contract in the docstring
+    # never actually held: `.claude/` reposted to Discord daily for 41 days.
+    # Identity is now the ident — kind, repo, path — with age kept in the
+    # message but out of the comparison.
+    now = datetime.now(timezone.utc)
     STATE.parent.mkdir(parents=True, exist_ok=True)
     try:
-        prev = json.loads(STATE.read_text()).get("key", [])
+        state = json.loads(STATE.read_text())
     except Exception:
-        prev = []
+        state = {}
+    prev_seen = state.get("seen") or {}
+    # v1 state had only "key", whose entries embed the age. They will not equal
+    # any v2 ident, so on the single transition run a still-present finding
+    # reposts once and a resolved one correctly posts the ✅ instead of being
+    # swallowed as "nothing was outstanding".
+    prev_idents = sorted(prev_seen) if prev_seen else sorted(state.get("key") or [])
 
-    if key != prev:
+    seen = {}
+    for f in findings:
+        was = prev_seen.get(f["ident"], {})
+        seen[f["ident"]] = {
+            "kind": f["kind"], "repo": f["repo"], "detail": f["detail"],
+            "runs": int(was.get("runs", 0)) + 1,
+            "first_seen": was.get("first_seen", now.isoformat()),
+            "last_seen": now.isoformat(),
+            "escalated_at": was.get("escalated_at"),
+        }
+    idents = sorted(seen)
+
+    print("\n===== persistence =====")
+    for ident in idents:
+        e = seen[ident]
+        thr = ESCALATE_AFTER_RUNS.get(e["kind"], ESCALATE_AFTER_RUNS_DEFAULT)
+        esc = f", escalated {e['escalated_at']}" if e["escalated_at"] else ""
+        print(f"  {ident} — run {e['runs']}/{thr} since {e['first_seen']}{esc}")
+    if not idents:
+        print("  (nothing outstanding)")
+
+    # Alert on a change in the IDENT SET, which is what the docstring always
+    # meant. A persisting condition now goes quiet here and loud in escalate().
+    if idents != prev_idents:
         if findings:
             lines = "\n".join(
                 f"- **{f['kind']}** `{f['repo']}` — {f['detail']}" for f in findings
             )
             post(f"⚠️ **Git durability** ({len(findings)} finding(s))\n{lines}")
-        elif prev:
+        elif prev_idents:
             post("✅ **Git durability** — all repos pushed and clean.")
-        STATE.write_text(json.dumps({
-            "key": key, "at": datetime.now(timezone.utc).isoformat(), "findings": findings,
-        }, indent=2))
+
+    for f in findings:
+        e = seen[f["ident"]]
+        thr = ESCALATE_AFTER_RUNS.get(f["kind"], ESCALATE_AFTER_RUNS_DEFAULT)
+        if e["runs"] < thr:
+            continue
+        if e["escalated_at"]:
+            try:
+                since = (now - datetime.fromisoformat(e["escalated_at"])).days
+            except Exception:
+                since = 0
+            if since < ESCALATE_COOLDOWN_D:
+                continue
+            print(f"  {f['ident']} — escalated {since}d ago and still open, re-escalating")
+        if escalate(f, e["runs"], thr):
+            e["escalated_at"] = now.isoformat()
+
+    STATE.write_text(json.dumps({
+        "seen": seen,
+        "key": idents,   # retained for anything reading the old field
+        "at": now.isoformat(),
+        "findings": findings,
+    }, indent=2))
 
     return 0
 
