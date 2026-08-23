@@ -527,6 +527,17 @@ function embedInput(name: string, description: string, content: string): string 
   return `${name}: ${description}\n\n${content}`.slice(0, 4000);
 }
 
+// Skill embed input. Triggers are part of the vector, not just poll_queue.py's
+// keyword matcher. Before 2026-08-23 they fed NOTHING on the recall path — a skill
+// could carry perfect triggers and rank no better for them — so the only consumer
+// was _match_skill, and the nightly gate's "unreachable" count was the only place
+// an empty triggers array ever showed up. Now an author who writes good triggers
+// improves both retrieval paths.
+function skillEmbedInput(name: string, description: string, content: string, triggers?: string[] | null): string {
+  const trig = triggers?.length ? `\nTriggers: ${triggers.join(", ")}` : "";
+  return `${name}: ${description}${trig}\n\n${content}`.slice(0, 4000);
+}
+
 // Episode embed input (migration 059, MemRL pattern): summary + outcome + learnings
 // are the retrieval-relevant fields — actions/input are noise for "what happened
 // last time I did something like this?" queries.
@@ -1392,7 +1403,7 @@ function startEmbeddingBackfillJob(supabase: any): void {
 // package.json. Two separate literals used to carry this — the MCP handshake and
 // GET /health — and on 2026-08-05 the /health one was missed on a version bump,
 // so the endpoint every dashboard and research run reads was a release behind.
-const SERVER_VERSION = "5.17.0";
+const SERVER_VERSION = "5.18.0";
 
 // ── Episode claim registry ───────────────────────────────────────────────────
 // Keyed by episode id, NOT a shared consult buffer — the consult ids themselves
@@ -2672,11 +2683,21 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (threat) return { content: [{ type: "text" as const, text: `Blocked: ${field} matches threat pattern '${threat}'. Skill not saved.` }] };
       }
 
+      // A skill with no triggers is invisible to poll_queue.py::_match_skill, which
+      // scores triggers and nothing else. It can never be auto-attributed to a task
+      // no matter how often it is used, so it silently drops out of the outcome loop.
+      // Reject rather than warn: a warning in a tool result is advisory text an agent
+      // routinely ignores, and six months of ignoring it produced 12 unreachable
+      // duplicates of one skill. Rejecting is recoverable in one retry.
+      const skillTriggers = (triggers || []).map((t) => (t || "").trim()).filter(Boolean);
+      if (skillTriggers.length === 0) {
+        return { content: [{ type: "text" as const, text: `Refused: skill "${name}" has no triggers. A trigger-less skill cannot be matched to a task by poll_queue.py::_match_skill and will be reported as unreachable by the nightly skill gate. Re-call save_skill with triggers — 3-6 phrases an agent would plausibly have in a task title/description, e.g. ['daily research run', 'self-improvement research']. Multi-word phrases score higher (len(words)^2, min score 4), so prefer 'deploy podman service' over 'deploy'.` }] };
+      }
+
       // AIP: verified caller identity overrides client-supplied source
       const src = callerIdentity || source || "claude-code";
-      const skillTriggers = triggers || [];
       const skillPlatforms = platforms || [];
-      const embedding = await embed(embedInput(name, description, content));
+      const embedding = await embed(skillEmbedInput(name, description, content, skillTriggers));
 
       const { data: existing } = await supabase.from("skills").select("id").eq("name", name).maybeSingle();
 
@@ -2778,26 +2799,74 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       }
 
       // ── Check if skill already exists ───────────────────────────────────────
-      const { data: existingSkill } = await supabase.from("skills").select("id").eq("name", autoName).maybeSingle();
-      const skillEmbedding = await embed(embedInput(autoName, task_summary, skillContent));
+      // An exact-name lookup is not enough. autoName is the first five content words
+      // of task_summary, so a recurring task whose summary shifts by one word mints a
+      // NEW row every run: the daily research task produced twelve of them between
+      // 2026-05-13 and 2026-08-21 ("...-task", "...-run", "...-fleet", "...-found",
+      // "...-atlas"), each a one-line log of a single day rather than a reusable
+      // procedure. When the caller did not pin skill_name, fall back to a name-token
+      // overlap match so those land on one row.
+      //
+      // Threshold is >=4 shared tokens out of at most 5. That is deliberately strict:
+      // a false merge destroys a distinct skill, while a missed merge only leaves a
+      // duplicate for a human to fold in later. On the twelve real rows it merges the
+      // six "daily-self-improvement-research-*" variants and correctly declines to
+      // merge "research-review-verified-all-tiers" (2 shared tokens).
+      let existingSkill: { id: string; name: string } | null = null;
+      {
+        const exact = await supabase.from("skills").select("id, name").eq("name", autoName).maybeSingle();
+        existingSkill = exact.data ?? null;
+      }
+      let mergedFrom: string | null = null;
+      if (!existingSkill && !skill_name) {
+        const autoTokens = new Set(autoName.split("-").filter(Boolean));
+        const { data: allSkills } = await supabase.from("skills").select("id, name");
+        for (const cand of allSkills || []) {
+          const shared = cand.name.split("-").filter((t: string) => autoTokens.has(t)).length;
+          if (shared >= 4) { existingSkill = { id: cand.id, name: cand.name }; mergedFrom = autoName; break; }
+        }
+      }
+
+      const targetName = existingSkill?.name || autoName;
+
+      // Never write triggers: [] — that is what made all twelve rows unreachable to
+      // poll_queue.py::_match_skill. Derive them from the summary's own words so an
+      // auto-captured skill is at least matchable, then let a human refine via
+      // save_skill. A 2-word and a 3-word phrase clear the min score of 4 on their own.
+      const derivedTriggers = autoWords.length >= 2
+        ? Array.from(new Set([
+            autoWords.slice(0, 2).join(" "),
+            autoWords.slice(0, 3).join(" "),
+            autoWords.slice(0, 4).join(" "),
+          ].filter((t) => t.split(" ").length >= 2)))
+        : [];
+
+      const skillEmbedding = await embed(skillEmbedInput(targetName, task_summary, skillContent, derivedTriggers));
 
       if (existingSkill) {
+        // Only backfill triggers on an existing row; never overwrite curated ones.
+        const { data: cur } = await supabase.from("skills").select("triggers").eq("id", existingSkill.id).maybeSingle();
         const upd: Record<string, unknown> = { description: task_summary, content: skillContent, source: src };
+        if (!cur?.triggers?.length && derivedTriggers.length) upd.triggers = derivedTriggers;
         if (skillEmbedding) upd.embedding = JSON.stringify(skillEmbedding);
         const { error } = await supabase.from("skills").update(upd).eq("id", existingSkill.id);
         if (error) return { content: [{ type: "text" as const, text: `Auto-capture failed (update): ${error.message}` }] };
-        return { content: [{ type: "text" as const, text: `Auto-updated skill "${autoName}" (${tool_count} tool calls, ${src}). Review with list_skills.` }] };
+        const note = mergedFrom ? ` (merged from proposed name "${mergedFrom}" — >=4 shared name tokens)` : "";
+        return { content: [{ type: "text" as const, text: `Auto-updated skill "${existingSkill.name}"${note} (${tool_count} tool calls, ${src}). Review with list_skills.` }] };
       }
 
       const ins: Record<string, unknown> = {
         name: autoName, title: task_summary, description: task_summary,
-        content: skillContent, source: src, triggers: [], platforms: [],
+        content: skillContent, source: src, triggers: derivedTriggers, platforms: [],
       };
       if (skillEmbedding) ins.embedding = JSON.stringify(skillEmbedding);
 
       const { error } = await supabase.from("skills").insert(ins);
       if (error) return { content: [{ type: "text" as const, text: `Auto-capture failed (insert): ${error.message}` }] };
-      return { content: [{ type: "text" as const, text: `Auto-captured skill "${autoName}" from ${tool_count}-tool-call task. Review and refine with list_skills / save_skill.` }] };
+      const trigNote = derivedTriggers.length
+        ? ` Derived triggers: [${derivedTriggers.join(", ")}] — refine with save_skill.`
+        : ` WARNING: no triggers could be derived; this skill is unreachable to _match_skill until you set some with save_skill.`;
+      return { content: [{ type: "text" as const, text: `Auto-captured skill "${autoName}" from ${tool_count}-tool-call task.${trigNote}` }] };
     }
   );
 
@@ -2839,6 +2908,14 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const queryEmbedding = await embed(query);
         if (queryEmbedding) {
           const { data, error } = await supabase.rpc("match_skills", { query_embedding: JSON.stringify(queryEmbedding), match_count: maxResults });
+          // Log the RPC error. This `if (!error && ...)` used to fall through in
+          // silence, and on 2026-08-23 that silence was found to have been hiding a
+          // TOTAL outage: match_skills had lost `extensions` from its search_path, so
+          // every call raised 42883 and every recall_skill quietly degraded to the
+          // ILIKE substring fallback below. Semantic skill recall was dead and the
+          // tool still answered, so nothing ever went red. Migration 127 fixed the
+          // function; this line is what makes the next such failure visible.
+          if (error) console.warn(`[skills] match_skills RPC failed — falling back to substring match: ${error.message}`);
           if (!error && data?.length > 0) {
             await bumpSkillUsage(data.map((s: any) => s.id));
             const results = data.map((s: any) => `# ${s.title} (${(s.similarity * 100).toFixed(0)}% match)\n_${s.description}_\n\n${s.content}`);
