@@ -2844,15 +2844,54 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       const skillEmbedding = await embed(skillEmbedInput(targetName, task_summary, skillContent, derivedTriggers));
 
       if (existingSkill) {
-        // Only backfill triggers on an existing row; never overwrite curated ones.
-        const { data: cur } = await supabase.from("skills").select("triggers").eq("id", existingSkill.id).maybeSingle();
-        const upd: Record<string, unknown> = { description: task_summary, content: skillContent, source: src };
+        const { data: cur } = await supabase.from("skills")
+          .select("triggers, description, content").eq("id", existingSkill.id).maybeSingle();
+
+        // NEVER replace a curated body with a one-line task summary. This update used
+        // to be `content: skillContent`, which meant every auto-capture onto an
+        // existing skill overwrote the procedure with "what I did today". That is the
+        // other half of why six months of daily-research knowledge was useless to the
+        // next run: not just twelve rows, but each row holding a day's log where a
+        // reusable procedure should have been. Verified the hard way on 2026-08-23 —
+        // this very call flattened a 4.5k-char consolidated procedure to 445 chars.
+        //
+        // A run IS worth recording, so append it to a bounded run log instead of
+        // discarding it. The curated prose above the log is never touched.
+        const RUN_LOG_HEADING = "## Run log (auto-captured — newest first, last 10)";
+        const RUN_LOG_MAX = 10;
+        const today = new Date().toISOString().slice(0, 10);
+        const entry = `- **${today}** (${src}, ${tool_count} calls): ${task_summary.replace(/\s+/g, " ").trim()}`;
+
+        const prior: string = cur?.content || "";
+        const idx = prior.indexOf(RUN_LOG_HEADING);
+        const body = (idx === -1 ? prior : prior.slice(0, idx)).replace(/\s+$/, "");
+        const priorEntries = idx === -1
+          ? []
+          : prior.slice(idx + RUN_LOG_HEADING.length).split("\n").map((l) => l.trim()).filter((l) => l.startsWith("- "));
+        const entries = [entry, ...priorEntries].slice(0, RUN_LOG_MAX);
+
+        // If the row has no curated body yet (a bare auto-captured stub), seed it with
+        // this run's content so the skill is not just a log with nothing above it.
+        const newBody = body.length > 0 ? body : skillContent;
+        const newContent = `${newBody}\n\n${RUN_LOG_HEADING}\n${entries.join("\n")}\n`;
+
+        const upd: Record<string, unknown> = { content: newContent, source: src };
+        // Same rule for description and triggers: backfill only, never clobber.
+        if (!cur?.description?.trim()) upd.description = task_summary;
         if (!cur?.triggers?.length && derivedTriggers.length) upd.triggers = derivedTriggers;
-        if (skillEmbedding) upd.embedding = JSON.stringify(skillEmbedding);
+
+        const reEmbed = await embed(skillEmbedInput(
+          existingSkill.name,
+          (cur?.description?.trim() || task_summary),
+          newContent,
+          cur?.triggers?.length ? cur.triggers : derivedTriggers,
+        ));
+        if (reEmbed) upd.embedding = JSON.stringify(reEmbed);
+
         const { error } = await supabase.from("skills").update(upd).eq("id", existingSkill.id);
         if (error) return { content: [{ type: "text" as const, text: `Auto-capture failed (update): ${error.message}` }] };
         const note = mergedFrom ? ` (merged from proposed name "${mergedFrom}" — >=4 shared name tokens)` : "";
-        return { content: [{ type: "text" as const, text: `Auto-updated skill "${existingSkill.name}"${note} (${tool_count} tool calls, ${src}). Review with list_skills.` }] };
+        return { content: [{ type: "text" as const, text: `Appended run-log entry to skill "${existingSkill.name}"${note} (${tool_count} tool calls, ${src}). Curated body preserved. Review with list_skills.` }] };
       }
 
       const ins: Record<string, unknown> = {
