@@ -1801,18 +1801,32 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
 
-      // Apply deferred supersessions now that we have the new id
+      // Deferred mem0 DELETE decisions are now NON-DESTRUCTIVE (2026-08-24).
+      //
+      // INCIDENT: mem0Resolve issues DELETE on topical overlap alone — cosine
+      // 0.72-0.87 between facts that merely share vocabulary ("research",
+      // "gmail", "task queue"). Every one of the 23 auto-supersedes ever
+      // written to this database was a false positive; 17 live memories were
+      // silently retired, several of them is_point_in_time=true dated logs,
+      // which by definition CANNOT be superseded by a later fact. The blast
+      // radius was invisible: the audit insert inside supersede_memory() had
+      // been failing silently since migration 063 (see migrations 131/132).
+      //
+      // Retiring a row is not a decision this synchronous path has the evidence
+      // to make — same reasoning as the tentative belief-commit above. Flag the
+      // pair and let the 03:30 contradiction scan / resolve_conflict_auto
+      // adjudicate it. Explicit supersede_memory() callers (monthly research
+      // consolidation, the supersede_memory tool) are UNAFFECTED.
       for (const sup of toSupersede) {
-        const { error: supErr } = await supabase.rpc("supersede_memory", {
-          p_old_id: sup.id, p_new_id: inserted.id, p_reason: `mem0: ${sup.rationale}`,
-        });
-        if (supErr) {
-          console.warn(`[mem0] supersede_memory(${sup.id}, ${inserted.id}) failed: ${supErr.message}`);
-          mem0Note += ` Could not supersede stale "${sup.name}": ${supErr.message}.`;
-        } else {
-          console.log(`[mem0] SUPERSEDE "${sup.name}" → "${name}": ${sup.rationale}`);
-          mem0Note += ` Superseded stale memory "${sup.name}" (preserved for audit).`;
+        const { error: flagErr } = await supabase
+          .from("memories")
+          .update({ conflict_flagged: true })
+          .eq("id", sup.id);
+        if (flagErr) {
+          console.warn(`[mem0] conflict_flagged(${sup.id}) failed: ${flagErr.message}`);
         }
+        console.log(`[mem0] SUPERSEDE SUPPRESSED "${sup.name}" → "${name}": ${sup.rationale}`);
+        mem0Note += ` Flagged possible-stale memory "${sup.name}" for review (NOT retired — mem0 auto-supersede is non-destructive as of 2026-08-24).`;
       }
 
       // Auto-link
