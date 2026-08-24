@@ -174,6 +174,25 @@ ABSTENTION_CATEGORY = "abstention"
 # Treat abstention_rate as an instrument under construction until a calibrated
 # signal replaces the floor (top1-vs-top5 margin, or the TEI cross-encoder score,
 # which unlike hybrid_score IS query-conditioned).
+#
+# RE-MEASURED 2026-08-24 at 941 active rows (n=97 answerable vs n=8 unanswerable,
+# top_score from eval_run_results). CLOSED AS WON'T-FIX -- do not tune this floor.
+#   answerable   0.7690 - 1.0651     unanswerable 0.8411 - 1.0651
+#   the unanswerable range is FULLY CONTAINED in the answerable one; both maxima are
+#   the identical 1.0651. Mann-Whitney AUC = 0.7023, max Youden J = 0.4923 @ 1.0061.
+# Cost of catching the two standing confabulations, swept over every observed score:
+#   1.0061 (J-opt) 6/8 abstain, 72/97 answered, 16 correct rank-1 suppressed
+#   1.0263 (below) 6/8 abstain, 49/97 answered, 24 correct rank-1 suppressed
+#   1.0342         7/8 abstain, 15/97 answered, 41 correct rank-1 suppressed
+#   >1.0651        8/8 abstain,  0/97 answered, 49 correct rank-1 suppressed
+# Killing both confabulations costs the ENTIRE answerable set. No interior operating
+# point exists. abstention_rate was 0.750 byte-identical across 10 consecutive nightly
+# runs (08-15 -> 08-24) while ndcg_at_10 moved 0.6667 -> 0.6543 -- the inputs to this
+# threshold do not move, so it is not calibrated against anything.
+# Cause: hybrid_score is a fused RRF RANK score, not a query-conditioned relevance
+# probability; it cannot express "nothing here answers this", so no monotone cut on it
+# can. Re-opening requires a signal with AUC materially above 0.7023 measured FIRST.
+# See memory [[abstention-floor-not-separable-wont-fix]].
 ABSTENTION_FLOOR = float(os.environ.get("ABSTENTION_FLOOR", "1.0263"))
 
 # Bump whenever the active probe set changes (migration 091). cmd_gate only
