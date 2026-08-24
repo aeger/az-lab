@@ -279,6 +279,14 @@ def write_state_of_lab_digest(client, state):
         "source": "dreaming_consolidate",
         "memory_class": "semantic",
         "confidence": 0.8,
+        # Explicit, not left to the migration-087 trigger. A dated nightly digest
+        # is immutable history, and until migration 134 taught
+        # memory_is_log_series() this slug the trigger defaulted it to FALSE --
+        # so the 2026-08-24 03:30Z conflict sweep read three consecutive nights
+        # as three standing claims that disagreed and retired 08-21..08-23 by
+        # last_writer_wins. State the flag here so the writer's intent does not
+        # depend on a regex in another file.
+        "is_point_in_time": True,
     }
 
     if DRY_RUN:

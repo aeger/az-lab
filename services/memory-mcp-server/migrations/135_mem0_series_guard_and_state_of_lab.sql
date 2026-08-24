@@ -75,7 +75,7 @@ GRANT EXECUTE ON FUNCTION public.memory_names_are_series(uuid[]) TO service_role
 -- Patches the LIVE definition by inserting one alternative, so unrelated drift
 -- since 087 (the 'semantic:'/'weekly-ref:' prefix stripping added later) is
 -- preserved rather than silently reverted. Raises if the anchor moved.
-DO $mig134$
+DO $mig135$
 DECLARE
   v_def    text;
   v_anchor text := $a$        OR slug ~ '^dreaming(_summary)?_'$a$;
@@ -87,31 +87,31 @@ BEGIN
    WHERE p.proname = 'memory_is_log_series' AND n.nspname = 'public';
 
   IF v_def IS NULL THEN
-    RAISE EXCEPTION 'migration 134: memory_is_log_series not found';
+    RAISE EXCEPTION 'migration 135: memory_is_log_series not found';
   END IF;
   IF position('state_of_lab' in v_def) > 0 THEN
-    RAISE NOTICE 'migration 134: state_of_lab pattern already present, skipping';
+    RAISE NOTICE 'migration 135: state_of_lab pattern already present, skipping';
   ELSE
     IF position(v_anchor in v_def) = 0 THEN
-      RAISE EXCEPTION 'migration 134: dreaming anchor not found -- memory_is_log_series drifted, patch by hand';
+      RAISE EXCEPTION 'migration 135: dreaming anchor not found -- memory_is_log_series drifted, patch by hand';
     END IF;
     EXECUTE replace(v_def, v_anchor, v_add);
-    RAISE NOTICE 'migration 134: state_of_lab pattern added to memory_is_log_series';
+    RAISE NOTICE 'migration 135: state_of_lab pattern added to memory_is_log_series';
   END IF;
 END
-$mig134$;
+$mig135$;
 
 -- Receipt: the pattern must actually match the live names.
-DO $check134$
+DO $check135$
 BEGIN
   IF NOT public.memory_is_log_series('State of Lab — 2026-08-24') THEN
-    RAISE EXCEPTION 'migration 134: state_of_lab pattern does not match the live name format';
+    RAISE EXCEPTION 'migration 135: state_of_lab pattern does not match the live name format';
   END IF;
   IF public.memory_is_log_series('lab-degradation-incident-2026-07-02') THEN
-    RAISE EXCEPTION 'migration 134: state_of_lab pattern over-matches one-off dated incident notes';
+    RAISE EXCEPTION 'migration 135: state_of_lab pattern over-matches one-off dated incident notes';
   END IF;
 END
-$check134$;
+$check135$;
 
 -- ── PART 2b: backfill the flag on the existing series ───────────────────────
 UPDATE public.memories
@@ -140,7 +140,7 @@ WITH bad AS (
   INSERT INTO public.memory_log (memory_id, action, source, details)
   SELECT r.id, 'unsupersede', 'system',
          jsonb_build_object(
-           'actor', 'migration-134',
+           'actor', 'migration-135',
            'name', r.name,
            'reason', 'restored — State of Lab is a dated point-in-time series, not three '
                      'standing claims that disagree. Retired 2026-08-24 03:30Z by '

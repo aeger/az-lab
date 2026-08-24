@@ -354,7 +354,35 @@ function ttlToExpiresAt(days?: number): string | undefined {
   return new Date(Date.now() + days * 86400000).toISOString();
 }
 
-type Mem0Action = "ADD" | "UPDATE" | "DELETE" | "NOOP";
+// 2026-08-24: there is no DELETE. mem0 ran DELETE→supersede_memory from
+// migration 048 until commit 690f7df, and EVERY auto-supersede it ever wrote —
+// 23 of 23 — was a false positive. The synchronous write path sees one
+// embedding and no adjudication evidence; retiring a row is not a decision it
+// can make. CONFLICT is what that branch was always actually entitled to do:
+// flag the pair and hand it to the 03:30 contradiction scan. Renamed rather
+// than suppressed so nothing here reads as dormant-but-revivable.
+type Mem0Action = "ADD" | "UPDATE" | "CONFLICT" | "NOOP";
+
+// Floor for emitting CONFLICT. The old DELETE branch fired at 0.72, which is
+// topical overlap ("research", "gmail", "task queue"), not disagreement — that
+// is how a Gmail-OAuth write retired a DNS memory. 0.90 is the same floor the
+// 03:30 deterministic scan uses for a high-confidence contradiction
+// (CONTRA_HIGH_CONF_SIM), so the two paths agree on what "rival claim" means.
+const MEM0_CONFLICT_FLOOR = Number(process.env.MEM0_CONFLICT_FLOOR ?? 0.90);
+// Candidate retrieval floor. Was 0.72; UPDATE needs >= 0.88 and NOOP >= 0.95,
+// so everything under 0.80 was noise fed to the LLM classifier and nothing else.
+const MEM0_CANDIDATE_FLOOR = Number(process.env.MEM0_CANDIDATE_FLOOR ?? 0.80);
+
+// Candidates carry the guard inputs (is_point_in_time, registered-series) so the
+// deferred loop can gate on them WITHOUT a second round-trip per decision.
+interface Mem0Candidate {
+  id: string;
+  name: string;
+  content: string;
+  similarity: number;
+  is_point_in_time: boolean;
+  is_series: boolean;   // registered research producer OR canonical dated log series
+}
 
 interface Mem0Decision {
   action: Mem0Action;
@@ -392,7 +420,7 @@ function levenshtein(a: string, b: string): number {
 function heuristicMem0(
   newName: string,
   newContent: string,
-  candidates: Array<{ id: string; name: string; content: string; similarity: number }>
+  candidates: Mem0Candidate[]
 ): Mem0Decision[] {
   const decisions: Mem0Decision[] = [];
 
@@ -408,10 +436,10 @@ function heuristicMem0(
     const nameSimilar = levenshtein(c.name.toLowerCase(), newName.toLowerCase()) <= 3;
     const contradicts = mightContradict(newContent, c.content);
 
-    if (contradicts && sim >= 0.72) {
-      // Contradicted/stale → DELETE the old one; new content will be ADDed after
-      decisions.push({ action: "DELETE", target_id: c.id, target_name: c.name,
-        rationale: `Contradicts stale memory "${c.name}" (sim=${(sim * 100).toFixed(0)}%)` });
+    if (contradicts && sim >= MEM0_CONFLICT_FLOOR) {
+      // Apparent contradiction → FLAG the pair. The old row is NOT retired.
+      decisions.push({ action: "CONFLICT", target_id: c.id, target_name: c.name,
+        rationale: `Appears to contradict "${c.name}" (sim=${(sim * 100).toFixed(0)}%)` });
     } else if (sim >= 0.88 && nameSimilar && !contradicts) {
       // High similarity + similar name → UPDATE in place (prevents cross-name duplicates)
       decisions.push({ action: "UPDATE", target_id: c.id, target_name: c.name,
@@ -429,7 +457,7 @@ function heuristicMem0(
 async function llmMem0(
   newName: string,
   newContent: string,
-  candidates: Array<{ id: string; name: string; content: string; similarity: number }>
+  candidates: Mem0Candidate[]
 ): Promise<Mem0Decision[]> {
   const prompt = `You are a memory deduplication system. Given a new fact and existing similar memories, classify the required operation.
 
@@ -445,12 +473,12 @@ ${candidates.slice(0, 5).map((c, i) =>
 Classify the operation required:
 - NOOP: New memory is fully captured by an existing one. No write needed.
 - UPDATE: New memory updates/corrects an existing one. Merge content into it.
-- DELETE: An existing memory is contradicted/stale. Remove it (new fact added separately).
+- CONFLICT: An existing memory makes a RIVAL CLAIM that this new fact contradicts. It is flagged for review, NOT removed — you are not deciding which one wins.
 - ADD: Genuinely new fact with no significant overlap.
 
-Rules: NOOP only if content is essentially identical. Multiple DELETE decisions allowed. Prefer UPDATE over ADD when clearly the same topic. Respond with a JSON array only, no explanation outside JSON.
+Rules: NOOP only if content is essentially identical. Prefer UPDATE over ADD when clearly the same topic. CONFLICT requires a DIRECT contradiction of the same claim — a different value for the same host/port/path/setting. Sharing a topic, a project name, or vocabulary is NOT a conflict; two dated entries in a log series are NOT a conflict, they describe different days. When unsure, do not emit CONFLICT. Respond with a JSON array only, no explanation outside JSON.
 
-Example: [{"action":"DELETE","target_id":"abc-123","target_name":"old fact","rationale":"contradicted by new IP"}]`;
+Example: [{"action":"CONFLICT","target_id":"abc-123","target_name":"old fact","rationale":"states the static IP is .51, new fact states .52"}]`;
 
   try {
     const res = await fetch(`${LLM_URL}/chat/completions`, {
@@ -470,7 +498,9 @@ Example: [{"action":"DELETE","target_id":"abc-123","target_name":"old fact","rat
     raw = raw.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
     let parsed: Mem0Decision[] = JSON.parse(raw);
     if (!Array.isArray(parsed)) parsed = [parsed];
-    const valid = parsed.filter((d) => ["ADD", "UPDATE", "DELETE", "NOOP"].includes(d.action));
+    // A model that still emits the retired DELETE verb is downgraded, not obeyed.
+    for (const d of parsed) if ((d.action as string) === "DELETE") d.action = "CONFLICT";
+    const valid = parsed.filter((d) => ["ADD", "UPDATE", "CONFLICT", "NOOP"].includes(d.action));
     return valid.length > 0 ? valid : [{ action: "ADD", rationale: "LLM returned no valid decisions" }];
   } catch (err: any) {
     console.warn("[mem0] LLM classify failed:", err.message, "— heuristic fallback");
@@ -485,25 +515,55 @@ async function mem0Resolve(
   type: string,
   embedding: number[],
   excludeId?: string
-): Promise<Mem0Decision[]> {
+): Promise<{ decisions: Mem0Decision[]; candidates: Mem0Candidate[] }> {
   const { data: raw } = await supabase.rpc("match_memories", {
     query_embedding: JSON.stringify(embedding),
-    match_threshold: 0.72,
+    match_threshold: MEM0_CANDIDATE_FLOOR,
     match_count: 10,
   });
 
-  if (!raw?.length) return [{ action: "ADD", rationale: "No similar memories found" }];
+  if (!raw?.length) return { decisions: [{ action: "ADD", rationale: "No similar memories found" }], candidates: [] };
 
-  const candidates = (raw as any[])
+  const shortlist = (raw as any[])
     .filter((m) => m.id !== excludeId && m.type === type)
-    .map((m) => ({ id: m.id, name: m.name, content: m.content, similarity: m.similarity as number }))
     .slice(0, 8);
 
-  if (!candidates.length) return [{ action: "ADD", rationale: "No same-type candidates" }];
+  if (!shortlist.length) return { decisions: [{ action: "ADD", rationale: "No same-type candidates" }], candidates: [] };
 
-  return LLM_URL
-    ? llmMem0(name, content, candidates)
+  // Hydrate the guard inputs in ONE query. match_memories does not project
+  // is_point_in_time, and memory_names_are_series() (migration 135) is the
+  // single definition of "this name belongs to a recurring dated series" — it
+  // unions the research_producers templates (126) with memory_is_log_series() (087).
+  const guardById = new Map<string, { pit: boolean; series: boolean }>();
+  const { data: guards, error: guardErr } = await supabase
+    .from("memories")
+    .select("id, is_point_in_time")
+    .in("id", shortlist.map((m) => m.id));
+  if (guardErr) console.warn(`[mem0] guard hydrate failed: ${guardErr.message} — treating all candidates as protected`);
+  for (const g of (guards as any[]) ?? []) guardById.set(g.id, { pit: !!g.is_point_in_time, series: false });
+
+  const { data: seriesRows } = await supabase.rpc("memory_names_are_series", {
+    p_ids: shortlist.map((m) => m.id),
+  });
+  for (const r of (seriesRows as any[]) ?? []) {
+    const cur = guardById.get(r.id);
+    if (cur) cur.series = !!r.is_series;
+  }
+
+  const candidates: Mem0Candidate[] = shortlist.map((m) => {
+    // Fail CLOSED: an un-hydrated candidate is treated as protected, so a
+    // transient Supabase error degrades into "flag nothing", never "flag anything".
+    const g = guardById.get(m.id) ?? { pit: true, series: true };
+    return {
+      id: m.id, name: m.name, content: m.content, similarity: m.similarity as number,
+      is_point_in_time: g.pit, is_series: g.series,
+    };
+  });
+
+  const decisions = LLM_URL
+    ? await llmMem0(name, content, candidates)
     : heuristicMem0(name, content, candidates);
+  return { decisions, candidates };
 }
 
 // ── Embeddings ───────────────────────────────────────────────────────────────
@@ -1403,7 +1463,7 @@ function startEmbeddingBackfillJob(supabase: any): void {
 // package.json. Two separate literals used to carry this — the MCP handshake and
 // GET /health — and on 2026-08-05 the /health one was missed on a version bump,
 // so the endpoint every dashboard and research run reads was a release behind.
-const SERVER_VERSION = "5.18.0";
+const SERVER_VERSION = "5.19.0";
 
 // ── Episode claim registry ───────────────────────────────────────────────────
 // Keyed by episode id, NOT a shared consult buffer — the consult ids themselves
@@ -1704,13 +1764,14 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       }
 
       // ── New-name path: full Mem0 conflict resolution ────────────────────────
-      // Migration 048 (2026-06-26): DELETE decisions are deferred to a
-      // non-destructive supersede_memory() call after the new row is
-      // inserted, so the old row + its content survive for audit/lineage.
+      // mem0 has no retire path (2026-08-24). CONFLICT decisions are gated
+      // below and deferred to a conflict_flagged write after the insert; see
+      // the block after the INSERT for the full history.
       let mem0Note = "";
-      const toSupersede: Array<{ id: string; name: string; rationale: string }> = [];
+      const toFlag: Array<{ id: string; name: string; rationale: string }> = [];
       if (embedding) {
-        const decisions = await mem0Resolve(name, content, type, embedding);
+        const { decisions, candidates: mem0Candidates } = await mem0Resolve(name, content, type, embedding);
+        const candidateById = new Map(mem0Candidates.map((c) => [c.id, c]));
 
         for (const d of decisions) {
           if (d.action === "NOOP") {
@@ -1743,9 +1804,34 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
             }
           }
 
-          if (d.action === "DELETE" && d.target_id) {
-            // Defer: supersede after new memory is inserted (preserves history).
-            toSupersede.push({ id: d.target_id, name: d.target_name || "?", rationale: d.rationale });
+          if (d.action === "CONFLICT" && d.target_id) {
+            // ── THE GATE ───────────────────────────────────────────────────────
+            // Lives HERE, in the mem0 loop, and deliberately NOT in
+            // supersede_memory(): monthly_research_consolidation.py legitimately
+            // supersedes point-in-time dailies into a digest via that RPC, so an
+            // RPC-level point-in-time guard would break monthly consolidation
+            // outright. Only this path is untrustworthy; only this path is gated.
+            //
+            // Fail closed — an unknown candidate was hydrated as {pit:true,
+            // series:true} in mem0Resolve and is dropped here.
+            const c = candidateById.get(d.target_id);
+            if (!c) {
+              console.log(`[mem0] CONFLICT DROPPED "${d.target_name}": target not in candidate set (LLM hallucinated an id)`);
+              continue;
+            }
+            if (c.similarity < MEM0_CONFLICT_FLOOR) {
+              console.log(`[mem0] CONFLICT DROPPED "${c.name}": sim=${c.similarity.toFixed(3)} < floor ${MEM0_CONFLICT_FLOOR}`);
+              continue;
+            }
+            if (c.is_point_in_time) {
+              console.log(`[mem0] CONFLICT DROPPED "${c.name}": is_point_in_time — an immutable dated record is not a rival claim`);
+              continue;
+            }
+            if (c.is_series) {
+              console.log(`[mem0] CONFLICT DROPPED "${c.name}": registered dated series — two entries differ by DAY, not by disagreement`);
+              continue;
+            }
+            toFlag.push({ id: d.target_id, name: d.target_name || c.name, rationale: d.rationale });
           }
         }
       }
@@ -1801,32 +1887,35 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
 
-      // Deferred mem0 DELETE decisions are now NON-DESTRUCTIVE (2026-08-24).
+      // mem0 NEVER retires a row. (2026-08-24, follow-up to commit 690f7df.)
       //
-      // INCIDENT: mem0Resolve issues DELETE on topical overlap alone — cosine
-      // 0.72-0.87 between facts that merely share vocabulary ("research",
-      // "gmail", "task queue"). Every one of the 23 auto-supersedes ever
-      // written to this database was a false positive; 17 live memories were
-      // silently retired, several of them is_point_in_time=true dated logs,
-      // which by definition CANNOT be superseded by a later fact. The blast
-      // radius was invisible: the audit insert inside supersede_memory() had
-      // been failing silently since migration 063 (see migrations 131/132).
+      // From migration 048 until 690f7df this loop applied mem0's DELETE
+      // decisions via supersede_memory(). All 23 auto-supersedes it ever wrote
+      // were false positives — 17 live memories silently retired on cosine
+      // 0.72-0.87 topical overlap, several of them is_point_in_time dated logs,
+      // and the audit insert inside supersede_memory() had been failing
+      // silently since migration 063 (migrations 131/132). 690f7df stopped the
+      // retirement but left mem0Resolve emitting DELETE at 0.72, which just
+      // moved the noise into the adjudication queue.
       //
-      // Retiring a row is not a decision this synchronous path has the evidence
-      // to make — same reasoning as the tentative belief-commit above. Flag the
-      // pair and let the 03:30 contradiction scan / resolve_conflict_auto
-      // adjudicate it. Explicit supersede_memory() callers (monthly research
-      // consolidation, the supersede_memory tool) are UNAFFECTED.
-      for (const sup of toSupersede) {
+      // So the DELETE branch is GONE, not suppressed: mem0Resolve now emits
+      // CONFLICT, gated above on similarity >= MEM0_CONFLICT_FLOOR, target not
+      // point-in-time, and target not a registered dated series. Adjudication
+      // belongs to the 03:30 contradiction scan / resolve_conflict_auto, which
+      // has the evidence a synchronous single-embedding write path does not.
+      // Explicit supersede_memory() callers (monthly research consolidation,
+      // the supersede_memory tool) are UNAFFECTED.
+      for (const flag of toFlag) {
         const { error: flagErr } = await supabase
           .from("memories")
           .update({ conflict_flagged: true })
-          .eq("id", sup.id);
+          .in("id", [flag.id, inserted.id]);
         if (flagErr) {
-          console.warn(`[mem0] conflict_flagged(${sup.id}) failed: ${flagErr.message}`);
+          console.warn(`[mem0] conflict_flagged(${flag.id}) failed: ${flagErr.message}`);
+          continue;
         }
-        console.log(`[mem0] SUPERSEDE SUPPRESSED "${sup.name}" → "${name}": ${sup.rationale}`);
-        mem0Note += ` Flagged possible-stale memory "${sup.name}" for review (NOT retired — mem0 auto-supersede is non-destructive as of 2026-08-24).`;
+        console.log(`[mem0] CONFLICT FLAGGED "${flag.name}" vs "${name}": ${flag.rationale}`);
+        mem0Note += ` ⚠️ Flagged a possible contradiction with "${flag.name}" for adjudication (NOT retired — mem0 has no retire path).`;
       }
 
       // Auto-link
