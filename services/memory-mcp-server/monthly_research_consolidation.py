@@ -69,16 +69,26 @@ SB = {
 }
 
 
+def _check(r: httpx.Response, what: str):
+    """raise_for_status() alone throws away the response body, which is the only
+    place PostgREST puts the constraint name — a CHECK violation surfaced as a
+    bare "Client error '400 Bad Request'" with no hint which column was wrong.
+    """
+    if r.is_success:
+        return
+    raise RuntimeError(f"{what} failed: HTTP {r.status_code} {r.text[:1000]}")
+
+
 def sb_get(table: str, params: dict) -> list:
     r = httpx.get(f"{SUPABASE_URL}/rest/v1/{table}", params=params, headers=SB, timeout=45)
-    r.raise_for_status()
+    _check(r, f"GET {table}")
     return r.json()
 
 
 def sb_post(table: str, rows: list) -> list:
     r = httpx.post(f"{SUPABASE_URL}/rest/v1/{table}", json=rows,
                    headers={**SB, "Prefer": "return=representation"}, timeout=45)
-    r.raise_for_status()
+    _check(r, f"POST {table}")
     return r.json()
 
 
@@ -159,9 +169,14 @@ def queue_task(m: dict, dry: bool) -> str:
     sb_post("task_queue", [{
         "title": f"Consolidate {m['month']} daily research into a monthly digest",
         "description": body,
-        "priority": 5,
+        # priority must be 0..3 (task_queue_priority_check) and source must be
+        # one of the seven allowed values (task_queue_source_check) — this row
+        # previously carried priority=5 / source="monthly-research-consolidation"
+        # and would have been rejected on the first month that had real work.
+        # Provenance lives in context.source_job instead of source.
+        "priority": 3,
         "status": "ready",
-        "source": "monthly-research-consolidation",
+        "source": "system",
         "target": "claude-code",
         "tags": ["memory", "consolidation", "research-digest"],
         "recurring_key": key,
@@ -169,6 +184,7 @@ def queue_task(m: dict, dry: bool) -> str:
             "month": m["month"], "rows": m["rows"], "live_rows": m["live"],
             "chars": m["chars"], "digest_exists": m["has_digest"],
             "rec": "2026-07-29 research REC 2",
+            "source_job": "monthly-research-consolidation",
         },
     }])
     return "queued"
@@ -196,17 +212,25 @@ def main():
         print("all complete months consolidated — nothing to do")
         return 0
 
-    lines = []
+    lines, failures = [], []
     for m in pending:
-        outcome = queue_task(m, args.dry_run)
+        try:
+            outcome = queue_task(m, args.dry_run)
+        except Exception as e:  # a queue failure must be loud, not a log-file traceback
+            outcome = f"QUEUE FAILED: {e}"
+            failures.append(m["month"])
         line = (f"{m['month']}: {m['live']}/{m['rows']} rows live, {m['chars']:,} chars, "
                 f"digest={'yes' if m['has_digest'] else 'no'} -> {outcome}")
-        print(line)
+        print(line, file=sys.stderr if failures and failures[-1] == m["month"] else sys.stdout)
         lines.append(line)
 
-    if not args.dry_run and any("queued" == l.split("-> ")[-1] for l in lines):
-        notify("**Monthly research consolidation** — unconsolidated month(s) detected:\n"
-               + "\n".join(f"- {l}" for l in lines))
+    if not args.dry_run and (failures or any(l.endswith("-> queued") for l in lines)):
+        head = ("**Monthly research consolidation** — FAILED to queue "
+                f"{len(failures)} month(s):" if failures
+                else "**Monthly research consolidation** — unconsolidated month(s) detected:")
+        notify(head + "\n" + "\n".join(f"- {l}" for l in lines))
+    if failures:
+        return 1
     return 0
 
 
