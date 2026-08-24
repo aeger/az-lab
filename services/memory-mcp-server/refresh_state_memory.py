@@ -45,6 +45,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -58,6 +59,23 @@ HEALTH_URL = os.environ.get("MEMORY_HEALTH_URL", "http://localhost:3100/health")
 SCRIPT_DIR = Path(__file__).resolve().parent
 MIGRATIONS_DIR = SCRIPT_DIR / "migrations"
 STATE_MEMORY_NAME = "memory-mcp-server"
+
+# Floor for the ledger/disk SET comparison. Migrations below this predate reliable
+# recording and are legitimately absent from supabase_migrations.schema_migrations:
+# 001–115 were applied by psql long before the ledger was written at all, and a
+# handful of sub-lettered ledger entries (039_*_phase1..3, 092a/b/c, 093a/b) were
+# later consolidated into single files on disk, so they appear ledger-only forever.
+#
+# MEASURED 2026-08-24: an unscoped diff yields 65 findings — 51 on-disk-not-in-ledger
+# and 14 ledger-not-on-disk — every one of them historical. A block that cries wolf
+# 65 times is a block everyone learns to scroll past, which is how the real hole
+# (126/126a/126b/127/128/130) went unnoticed for two days in the first place.
+# At floor 116 the diff is clean, and it would still have caught that hole.
+#
+# Raise this ONLY with a measurement showing the range below it is genuinely
+# reconciled. Never raise it to silence a warning — that is the failure this
+# constant exists to avoid.
+LEDGER_DIFF_FLOOR = 116
 
 # Plain-text markers, deliberately NOT HTML comments: the scan_memory_for_injection()
 # trigger carries a `hidden_html_directive` soft pattern that matches
@@ -81,6 +99,19 @@ def sb_headers(extra=None):
     if extra:
         h.update(extra)
     return h
+
+
+def disk_migration_names():
+    """Every NNN_*.sql stem on disk, as a set. The SET is the thing that matters:
+    comparing only the two heads is what let six applied-but-unrecorded migrations
+    (126, 126a, 126b, 127, 128, 130) sit invisible on 2026-08-24 while ledger head
+    and disk head both read 132 and the check reported agreement. A head is an
+    extremum; an extremum cannot detect a hole."""
+    return {
+        p.name[: -len(".sql")]
+        for p in MIGRATIONS_DIR.glob("*.sql")
+        if p.name[:3].isdigit()
+    }
 
 
 def disk_migration_head():
@@ -151,6 +182,48 @@ def render_block(health, gt, disk_head):
         head_line += ("  ⚠️ **DB AHEAD — migration(s) applied with no file committed. "
                       "That is the 093 data-loss shape: live SQL existing in no git object and no backup.**")
 
+    # Heads agreeing is NOT the ledger agreeing. Diff the full sets — this is the
+    # check that would have caught the 2026-08-24 hole, where both heads read 132
+    # and six migrations in the middle were unrecorded. migrations_recorded arrives
+    # from memory_state_ground_truth() as of migration 134; if an older function is
+    # deployed the key is absent, and we say that rather than silently skipping.
+    recorded = gt.get("migrations_recorded")
+    if recorded is None:
+        ledger_lines = [
+            "**Migration ledger:** ⚠️ `migrations_recorded` absent from ground truth — "
+            "memory_state_ground_truth() predates migration 134, so the set comparison "
+            "did NOT run. Only the heads above were checked, and heads cannot detect a hole."
+        ]
+    else:
+        def mig_num(s):
+            mm = re.match(r"^(\d{3})", s)
+            return int(mm.group(1)) if mm else -1
+
+        on_disk = {n for n in disk_migration_names() if mig_num(n) >= LEDGER_DIFF_FLOOR}
+        in_ledger = {n for n in recorded if mig_num(n) >= LEDGER_DIFF_FLOOR}
+        missing_in_ledger = sorted(on_disk - in_ledger, key=lambda s: (mig_num(s), s))
+        missing_on_disk = sorted(in_ledger - on_disk, key=lambda s: (mig_num(s), s))
+        ledger_lines = [
+            f"**Migration ledger** (compared at ≥{LEDGER_DIFF_FLOOR:03d}; "
+            f"{len(in_ledger)} recorded vs {len(on_disk)} .sql on disk in range): "
+            f"migrations below {LEDGER_DIFF_FLOOR:03d} are NOT checked — see LEDGER_DIFF_FLOOR."
+        ]
+        if missing_in_ledger:
+            ledger_lines.append(
+                "  ⚠️ **ON DISK, NOT IN LEDGER (" + str(len(missing_in_ledger)) + "):** "
+                + ", ".join(f"`{n}`" for n in missing_in_ledger)
+                + " — either unapplied, or applied by direct SQL without calling "
+                  "`record_migration_applied()`. Verify against pg_catalog before assuming either."
+            )
+        if missing_on_disk:
+            ledger_lines.append(
+                "  ⚠️ **IN LEDGER, NOT ON DISK (" + str(len(missing_on_disk)) + "):** "
+                + ", ".join(f"`{n}`" for n in missing_on_disk)
+                + " — the 093 shape: recorded SQL with no committed file."
+            )
+        if not missing_in_ledger and not missing_on_disk:
+            ledger_lines.append("  ✅ ledger and disk agree as SETS, not merely at the head.")
+
     tiers = ev.get("by_tier") or {}
     tier_str = " / ".join(f"{k} {v}" for k, v in sorted(tiers.items()))
 
@@ -183,6 +256,7 @@ def render_block(health, gt, disk_head):
         f"**Service:** v{health.get('version','?')} · {health.get('tools','?')} tools · status `{health.get('status','?')}`"
         + (f" · r2={health.get('r2')} ha={health.get('ha')} aip={health.get('aip')}" if health.get("status") == "ok" else ""),
         head_line + f" · {gt['migrations_applied_count']} applied total",
+        *ledger_lines,
         "",
         f"**Corpus:** {corpus['total']} memories · {corpus['active']} active / {corpus['inactive']} inactive · "
         f"{corpus['retired']} retired · {corpus['missing_embedding']} missing embeddings · "
