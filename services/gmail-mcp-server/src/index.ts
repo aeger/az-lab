@@ -120,7 +120,12 @@ function persistRefreshToken(token: string): void {
     const content = readFileSync(ENV_PATH, 'utf-8')
     const updated = content.replace(/^GMAIL_REFRESH_TOKEN=.*$/m, `GMAIL_REFRESH_TOKEN=${token}`)
     writeFileSync(ENV_PATH, updated, 'utf-8')
-  } catch { /* best-effort */ }
+    console.log(`[auth] refresh token persisted to ${ENV_PATH}`)
+  } catch (e) {
+    // Do NOT swallow: a failed persist means the new token lives only in memory
+    // and the container silently reverts to the dead one on the next restart.
+    console.error(`[auth] FAILED to persist refresh token to ${ENV_PATH} — token is in-memory only, it will be lost on restart:`, e)
+  }
 }
 
 // ── OAuth2 Auth ────────────────────────────────────────────────────────────────
@@ -1143,7 +1148,9 @@ async function main(): Promise<void> {
             metadata: { gmail_auth_expired: gmailAuthExpired, port },
           }),
         })
-      } catch { /* best-effort */ }
+      } catch (e) {
+        console.error('[heartbeat] upsert failed:', e instanceof Error ? e.message : e)
+      }
     }
     sendHeartbeat()
     setInterval(sendHeartbeat, 60_000)
