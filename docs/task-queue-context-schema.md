@@ -119,3 +119,38 @@
 1. New rows from 2026-05-12 onward use this schema (writer convention).
 2. Backfill freeform rows on demand via a one-shot script when their `task_type` becomes obvious.
 3. After 30 days of compliant writes, consider a CHECK constraint requiring `task_type` and `payload`.
+
+## Time/data gates — `status='waiting'` (migration 136, 2026-08-25)
+
+Column-level (not `context`) gate fields for tasks that must not run until a
+time or condition is met. Do NOT park such tasks in `blocked` (dead end — nothing
+un-blocks it) or `pending_jeff_action` (that queue is for genuine Jeff decisions).
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `not_before` | timestamptz | Earliest claim time. Enforced by `poll_queue.claim_next_task` for ready/pending/delegated rows, and by the release sweep for `waiting` rows. |
+| `unblock_condition` | jsonb | Machine-checkable release gate, evaluated every 5-min poll by `poll_queue.sweep_waiting_tasks`. |
+| `blocked_by_task_ids` | uuid[] | Prerequisite tasks. Since migration 136 this is ENFORCED (claim skip + implicit release gate), not just dashboard display. |
+
+`unblock_condition` types (all declared gates must pass; unknown/unevaluable
+conditions never release — the row surfaces as `waiting_overdue`/`waiting_no_gate`
+in `task_queue_health` instead):
+
+```json
+{"type": "time"}
+{"type": "tasks_complete", "task_ids": ["<uuid>", "..."]}
+{"type": "file_newer_than", "path": "~/path/on/svc-podman-01", "after": "2026-08-25T05:03:00Z"}
+```
+
+Filing pattern — "run this after tomorrow's 05:00 UTC nightly eval":
+
+```sql
+INSERT INTO task_queue (title, description, status, target, priority, not_before, unblock_condition)
+VALUES ('...', '...', 'waiting', 'claude-code', 1,
+        '2026-08-26T05:05:00Z',
+        '{"type":"file_newer_than","path":"~/azlab/services/memory-mcp-server/eval_nightly.log","after":"<current mtime>"}');
+```
+
+When the gate opens, the poller flips the row to `ready` (Discord: "⏰ Gate
+released"), and normal claiming takes over. The dashboard shows these under
+**Scheduled** with the gate summary and a "⏰ Release Now" override.

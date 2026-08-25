@@ -534,8 +534,16 @@ def preflight_task(task: dict) -> list:
     # An explicitly null/absent action_required is the signal that a task parked
     # in a human status was mis-filed and is really agent work — exactly the
     # 2026-08-01 case — so it must NOT trip this check.
+    #
+    # Scoped to NEVER-RUN tasks only (attempt_count 0, no claim). A task coming
+    # back from Jeff review (pending_jeff_action → ready) still carries its old
+    # action_required, and until 2026-08-25 this check re-blocked it on the very
+    # next poll — approve → ready → blocked → attention view, forever. The
+    # dashboard now clears action_required on hand-back too, but a Jeff who
+    # flips status via SQL must not restart the bounce.
     action_required = ctx.get("action_required")
-    if action_required not in (None, "", [], {}):
+    never_run = not task.get("attempt_count") and not task.get("claimed_at")
+    if never_run and action_required not in (None, "", [], {}):
         reasons.append(
             "context.action_required is set — this task's deliverable is Jeff's "
             "decision, not agent work. Re-file with target='jeff'."
@@ -639,22 +647,54 @@ def block_task(task: dict, current_status: str, reasons: list) -> None:
 _PREFLIGHT_SCAN_LIMIT = 5
 
 
+def _dependencies_incomplete(task: dict) -> list:
+    """IDs from blocked_by_task_ids that are not yet completed/archived.
+
+    Until migration 136 this column was display-only (dashboard dependency
+    graph) — the poller happily claimed a task whose prerequisites had not run.
+    A cancelled blocker deliberately does NOT satisfy the gate: whether the
+    dependent still makes sense after a cancelled prerequisite is a human call,
+    and the row surfaces via the stale sweep rather than running on a premise
+    that was just cancelled.
+    """
+    dep_ids = [str(d) for d in (task.get("blocked_by_task_ids") or []) if d]
+    if not dep_ids:
+        return []
+    try:
+        rows = api_request("GET", "task_queue", params={
+            "id": f"in.({','.join(dep_ids)})",
+            "select": "id,status",
+        }) or []
+    except Exception as e:
+        # Same fail-open stance as the preflight memory probe: a Supabase blip
+        # must not freeze the queue.
+        print(f"dependency lookup failed ({e}) — treating as satisfied", file=sys.stderr)
+        return []
+    done = {r["id"] for r in rows if r.get("status") in ("completed", "archived")}
+    return [d for d in dep_ids if d not in done]
+
+
 def claim_next_task():
     """Fetch the highest-priority runnable task, preflight it, and claim atomically.
 
     Tasks that fail preflight are moved to `blocked` and the scan continues to the
     next candidate, so one mis-filed task at the head of the queue does not stall
     everything behind it."""
-    # Pick up 'ready'/'pending' (new/legacy) and 'delegated' tasks targeting claude-code or wren
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Pick up 'ready'/'pending' (new/legacy) and 'delegated' tasks targeting claude-code or wren.
+    # not_before is the migration-136 time gate: a future not_before means "do not
+    # claim yet" no matter the priority — the reason task ff8c500d had to be parked
+    # in blocked/pending_jeff_action was exactly that this filter did not exist.
     tasks = api_request(
         "GET",
         "task_queue",
         params={
             "status": "in.(ready,pending,delegated)",
             "target": "in.(claude-code,wren)",
+            "or": f"(not_before.is.null,not_before.lte.{now_iso})",
             "order": "priority.asc,created_at.asc",
             "limit": str(_PREFLIGHT_SCAN_LIMIT),
-            "select": "id,title,description,context,priority,tags,status,target,goal_id,attempt_count,error",
+            "select": "id,title,description,context,priority,tags,status,target,goal_id,attempt_count,error,claimed_at,expires_at,blocked_by_task_ids",
         },
     )
     if not tasks:
@@ -663,6 +703,32 @@ def claim_next_task():
     for task in tasks:
         task_id = task["id"]
         current_status = task.get("status", "pending")
+
+        # Hard deadline: expires_at was only ever checked inside
+        # handle_task_failure (i.e. after a failure). Enforce it at claim time
+        # so a task past its deadline is not run at full cost first.
+        expires_at = task.get("expires_at")
+        if expires_at:
+            try:
+                if datetime.fromisoformat(expires_at.replace("Z", "+00:00")) < datetime.now(timezone.utc):
+                    api_request(
+                        "PATCH",
+                        f"task_queue?id=eq.{task_id}&status=eq.{current_status}",
+                        data={"status": "expired",
+                              "blocked_reason": f"expires_at {expires_at} passed before the task was claimed"},
+                    )
+                    print(f"Task {task_id} expired unclaimed (deadline {expires_at}).")
+                    log_activity("status", f"Expired unclaimed: {task.get('title')}", task_id=task_id)
+                    continue
+            except ValueError:
+                pass  # unparseable timestamp — ignore the deadline rather than guess
+
+        # Prerequisites not finished → skip this cycle (no state change; the
+        # release sweep / a later poll picks it up once the blockers complete).
+        missing_deps = _dependencies_incomplete(task)
+        if missing_deps:
+            print(f"Task {task_id} waiting on {len(missing_deps)} incomplete dependenc(ies) — skipped.")
+            continue
 
         reasons = preflight_task(task)
         if reasons:
@@ -750,6 +816,7 @@ _EPISODE_STATUS_MAP = {
     "paused": "partial",
     "blocked": "partial",
     "escalated": "partial",
+    "waiting": "partial",
 }
 
 
@@ -1608,7 +1675,7 @@ def _has_recent_pending_task(goal_id: str) -> bool:
             "task_queue",
             params={
                 "goal_id": f"eq.{goal_id}",
-                "status": "in.(ready,pending,claimed,failed,pending_eval,in_progress_agent,pending_jeff_action)",
+                "status": "in.(ready,pending,claimed,failed,pending_eval,in_progress_agent,pending_jeff_action,waiting)",
                 "select": "id",
                 "limit": "1",
             },
@@ -2146,6 +2213,126 @@ def sweep_stale_tasks():
     _save_stale_notified(state)
 
 
+# ── Waiting-gate release sweep (migration 136) ───────────────────────────────
+# `waiting` is the first-class "gated and healthy" status: not claimable, not
+# failed, not Jeff's problem. This sweep is the ONLY thing that releases it, by
+# evaluating the row's machine-checkable gate every poll:
+#   not_before                                  — time gate (also enforced at claim)
+#   unblock_condition {"type":"tasks_complete"} — listed tasks completed/archived
+#   unblock_condition {"type":"file_newer_than"}— local file mtime newer than `after`
+#   blocked_by_task_ids                         — implicit tasks_complete gate
+# All declared gates must pass. A condition the sweep cannot evaluate (unknown
+# type, missing file, bad timestamp) never releases — a wrongly-held task is a
+# visible `waiting_overdue`/`waiting_no_gate` finding in task_queue_health,
+# while a wrongly-released one burns attempts on data that does not exist yet
+# (the ff8c500d failure mode this replaces).
+
+def _parse_iso(ts: str) -> datetime:
+    return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+
+
+def _gate_state(task: dict) -> tuple[bool, str]:
+    """(passed, detail) for a waiting task's release gate."""
+    now = datetime.now(timezone.utc)
+    passed_checks = []
+
+    nb = task.get("not_before")
+    if nb:
+        try:
+            if _parse_iso(nb) > now:
+                return False, f"not_before {nb} not reached"
+        except ValueError:
+            return False, f"unparseable not_before {nb!r}"
+        passed_checks.append(f"not_before {nb} passed")
+
+    cond = task.get("unblock_condition")
+    if cond is not None and not isinstance(cond, dict):
+        return False, "unblock_condition is not an object"
+    ctype = (cond or {}).get("type")
+
+    if ctype == "time":
+        if not nb:
+            return False, "gate type=time but not_before is unset"
+    elif ctype == "tasks_complete":
+        ids = [str(x) for x in (cond.get("task_ids") or []) if x]
+        if not ids:
+            return False, "gate type=tasks_complete with no task_ids"
+        missing = _dependencies_incomplete({"blocked_by_task_ids": ids})
+        if missing:
+            return False, f"{len(missing)}/{len(ids)} gate task(s) incomplete"
+        passed_checks.append(f"all {len(ids)} gate task(s) complete")
+    elif ctype == "file_newer_than":
+        path = os.path.expanduser(str(cond.get("path") or ""))
+        after = cond.get("after")
+        if not path or not after:
+            return False, "gate type=file_newer_than needs both path and after"
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc)
+        except OSError as e:
+            return False, f"cannot stat {path}: {e}"
+        try:
+            if mtime <= _parse_iso(after):
+                return False, f"{path} not modified since {after}"
+        except ValueError:
+            return False, f"unparseable after {after!r}"
+        passed_checks.append(f"{path} modified {mtime.strftime('%Y-%m-%dT%H:%M:%SZ')} > {after}")
+    elif ctype is not None:
+        return False, f"unknown gate type {ctype!r}"
+
+    dep_missing = _dependencies_incomplete(task)
+    dep_ids = task.get("blocked_by_task_ids") or []
+    if dep_missing:
+        return False, f"{len(dep_missing)}/{len(dep_ids)} dependenc(ies) incomplete"
+    if dep_ids:
+        passed_checks.append(f"all {len(dep_ids)} dependenc(ies) complete")
+
+    if not passed_checks:
+        # No gate declared at all — nothing will ever legitimately release this.
+        # Surfaced as waiting_no_gate by task_queue_health; a human decides.
+        return False, "no gate declared (waiting_no_gate)"
+    return True, "; ".join(passed_checks)
+
+
+def sweep_waiting_tasks():
+    """Flip waiting→ready for every task whose gate has opened. Best-effort."""
+    try:
+        rows = api_request("GET", "task_queue", params={
+            "status": "eq.waiting",
+            "select": "id,title,target,not_before,unblock_condition,blocked_by_task_ids",
+            "order": "created_at.asc",
+            "limit": "50",
+        }) or []
+    except Exception as e:
+        print(f"sweep_waiting_tasks fetch failed (non-fatal): {e}", file=sys.stderr)
+        return
+
+    for t in rows:
+        try:
+            passed, detail = _gate_state(t)
+        except Exception as e:
+            print(f"gate evaluation failed for {t['id']} (held): {e}", file=sys.stderr)
+            continue
+        if not passed:
+            continue
+        try:
+            # Status-guarded like the claim path, so a row a human just moved is
+            # left alone. blocked_reason is cleared — it described the gate.
+            released = api_request(
+                "PATCH",
+                f"task_queue?id=eq.{t['id']}&status=eq.waiting",
+                data={"status": "ready", "blocked_reason": None},
+            )
+        except Exception as e:
+            print(f"sweep_waiting_tasks release failed for {t['id']} (non-fatal): {e}", file=sys.stderr)
+            continue
+        if not released:
+            continue
+        title = t.get("title") or t["id"][:8]
+        print(f"Gate released: {t['id']} ({detail})")
+        log_activity("status", f"Gate released → ready: {detail}", task_id=t["id"])
+        discord_notify(f"⏰ **Gate released:** {title}\n{detail} — task is now `ready`.")
+
+
 def main():
     print(f"[{datetime.now().isoformat()}] Polling task queue on {HOSTNAME}...")
 
@@ -2160,6 +2347,9 @@ def main():
 
     # Surface rows rotting in ready/failed/pending_jeff_action
     sweep_stale_tasks()
+
+    # Release waiting tasks whose time/data gate has opened
+    sweep_waiting_tasks()
 
     write_heartbeat("active")
 
