@@ -11,7 +11,10 @@
 # WHAT IT DOES
 #   1. run  — all active eval_queries through the real hybrid_recall path, recorded to
 #             eval_runs with git_sha so a regression is attributable to a commit.
-#   2. gate — compare nDCG@10 to the trailing 7-run median; Discord alert if >5% below.
+#   2. gate — compare nDCG@10 to the trailing 7-run median (Discord alert if >5%
+#             below) AND to a fixed per-scoreset absolute floor. Both, because a
+#             median-relative gate cannot see a decline slower than its window
+#             and a fixed one cannot see a step change from a healthy baseline.
 #
 # The eval is NON-MUTATING: retrieval_regression.py snapshots access_count /
 # recall_count / last_accessed_at before the run and restores them in a finally block
@@ -103,7 +106,38 @@ fi
 # a denominator that had shrunk underneath it. --max-fcfr reads a ratio and cannot
 # tell "nothing leaked" from "nothing was measurable"; a denominator at 0 used to
 # fall straight through to a pass.
-python3 retrieval_regression.py gate --tag "$TAG" --window 7 --drop-pct 5.0 --notify-ok
+#
+# ABSOLUTE nDCG@10 FLOOR — added 2026-08-25 (research impl 2/2).
+#
+# Everything else in `gate` is median-relative, and the comment on the hard-tier
+# floors above already predicted the consequence on 2026-08-02: "a slow uniform
+# decay stays green forever because the median decays with it". It did. Within
+# scoreset v4, nDCG@10 went 0.6891 (08-03) -> 0.6291 (08-25) — -8.7% over 22
+# nights — and this gate printed "OK, within tolerance" every single night,
+# because no single night's step exceeded -5.0%. The hard-tier floors above,
+# which are absolute, are what finally registered it. So nDCG@10 gets one too.
+#
+# THE FLOOR IS SET FROM A BASELINE, NOT FROM TODAY. Scoreset v4 baseline is
+# 0.689 (nightly-20260803, the first full run on the v4 probe set, 97 probes;
+# 08-04 read 0.6902). Floor = 0.689 x 0.90 = 0.62. The slack is ~10x the largest
+# same-night reproducibility spread on record (0.6347 vs 0.6291 on 08-25;
+# 0.6796 vs 0.6781 on 08-11), so it cannot flap on run-to-run noise, but it is
+# nowhere near loose enough to sit under a decline of the size we just measured.
+#
+# HEADROOM TONIGHT IS +0.0091. That is not a mistake and it is not a floor drawn
+# under the decline — it is what "0.689 x 0.90" happens to evaluate to, and the
+# thinness IS the finding. One more -1.5% night turns this unit red, which is the
+# correct outcome for a drift that is real, ongoing, and still unexplained.
+# RAISE this as retrieval recovers. Do not lower it to make a red run green.
+#
+# Keyed by scoreset version on purpose: nDCG@10 is a mean over the probe
+# population, so a floor authored for v4's 97 probes says nothing about v5's set.
+# A run on an UNDECLARED scoreset fails loudly rather than passing — on the night
+# a scoreset is bumped the relative gate is also blind (no history on the new
+# version), and a silent double-blackout is exactly the defect this closes.
+python3 retrieval_regression.py gate --tag "$TAG" --window 7 --drop-pct 5.0 \
+  --fail-under-ndcg10 4:0.62 \
+  --notify-ok
 GATE_RC=$?
 
 # 3. skill outcome assertion (2026-08-04 daily research, TIER 1).

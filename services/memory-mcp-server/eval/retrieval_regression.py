@@ -213,6 +213,40 @@ SCORESET_VERSION = 4
 # took it to 21. Raise the floor rather than lower this.
 MIN_HARD_TIER_FOR_GATE = 8
 
+# Below this many scored probes, an ABSOLUTE nDCG@10 floor is noise wearing a
+# gate's clothes, for the same reason MIN_HARD_TIER_FOR_GATE exists. Every
+# scoreset so far has been well clear of it (v1 56, v2/v3 79, v4 97); it is here
+# so that a truncated probe set can never make a floor read green.
+MIN_QUERIES_FOR_ABS_NDCG_GATE = 40
+
+
+def parse_ndcg10_floors(spec: str) -> dict:
+    """Parse --fail-under-ndcg10 'SSV:FLOOR[,SSV:FLOOR...]' into {int: float}.
+
+    WHY THE FLOOR IS KEYED BY SCORESET VERSION AND NOT A BARE FLOAT.
+      nDCG@10 is a MEAN OVER THE PROBE POPULATION, so the population is part of
+      the metric definition — the same argument that makes cmd_gate median only
+      within a scoreset_version (migration 091). The observed headline numbers
+      make the point: v1 (56 probes) sat at 0.8747, v3 (79) at 0.7076, v4 (97) at
+      0.6891. A single scalar floor authored against v1 would be unreachable at
+      v4, and one authored against v4 would be free at v1. A bare float here
+      would be a floor under a metric that keeps changing identity underneath it.
+    """
+    floors = {}
+    for part in (x.strip() for x in spec.split(",")):
+        if not part:
+            continue
+        if ":" not in part:
+            die(f"--fail-under-ndcg10 wants SSV:FLOOR (e.g. 4:0.62), got {part!r}")
+        ssv_s, val_s = part.split(":", 1)
+        try:
+            floors[int(ssv_s)] = float(val_s)
+        except ValueError:
+            die(f"--fail-under-ndcg10 wants SSV:FLOOR (e.g. 4:0.62), got {part!r}")
+    if not floors:
+        die("--fail-under-ndcg10 was given but declares no floors")
+    return floors
+
 
 def annotate_reachability(rows: list) -> list:
     """Mark which forbidden ids hybrid_recall could actually return.
@@ -1374,6 +1408,75 @@ def cmd_gate(args):
     vals = [h["ndcg_at_10"] for h in hist]
     print(f"gate: run '{cur['tag']}' nDCG@10={cur['ndcg_at_10']:.4f} (n={cur['n_queries']}, "
           f"scoreset v{ssv}) vs trailing {len(vals)} run(s) on the same probe set")
+    # ── ABSOLUTE nDCG@10 FLOOR (2026-08-25 research impl 2/2) ───────────────
+    #
+    # THE DEFECT THIS CLOSES. Everything below this block derives its floor from a
+    # TRAILING MEDIAN, so the reference moves with the metric it is judging. A gate
+    # whose reference is computed from recent history cannot detect drift slower
+    # than its window: an arbitrarily large monotone decline passes forever as long
+    # as each single night's step stays under --drop-pct.
+    #
+    # NOT THEORETICAL — measured 2026-08-25. Within scoreset v4 alone, nDCG@10 fell
+    # 0.6891 (08-03) -> 0.6291 (08-25), -8.7% over 22 nights, and this gate printed
+    # "OK - within tolerance" on EVERY one of them (tonight's step: -3.9% vs -5.0%).
+    # The only control that registered the accumulation was the ABSOLUTE hard-tier
+    # floor in cmd_run, which is fixed and does not move. It fired the night the sum
+    # crossed. (The wider 0.7076 -> 0.6291 figure in the original finding crosses the
+    # v3 -> v4 boundary and conflates the probe-set change with the decline; the
+    # within-version number above is the real one, and it is still the same defect.)
+    #
+    # WHY IT IS CHECKED HERE, BEFORE THE HISTORY QUERY. An absolute floor is a
+    # property of the current run alone, and it must still fire during the
+    # --min-history window where the relative gate returns "establishing trend, not
+    # gating yet". That window is exactly when a scoreset has just been bumped and
+    # the relative gate is blind — a silent double-blackout is the class of defect
+    # this block exists to close.
+    #
+    # This is the INVERSE of the usual finding in this log (v21.1 DIRTY_MAX_AGE_D,
+    # v24.2 age-only routing), where a FIXED threshold was what hid the problem.
+    # Neither kind is safe alone: pair every relative gate with an absolute floor,
+    # and never let an absolute one be the only reading.
+    if args.fail_under_ndcg10:
+        floors = parse_ndcg10_floors(args.fail_under_ndcg10)
+        run_ssv = cur.get("scoreset_version") or 1
+        nq = cur.get("n_queries") or 0
+        floor_abs = floors.get(run_ssv)
+        if floor_abs is None:
+            # FAIL, not skip. On the night a scoreset is bumped the relative gate
+            # ALSO stops gating (no history on the new version), so passing an
+            # undeclared version through would leave the metric completely
+            # ungated for --min-history nights. Declare a floor from the NEW
+            # baseline's first runs; do not copy the old version's number across,
+            # it measures a different probe population.
+            print(f"  FAIL: no absolute nDCG@10 floor declared for scoreset v{run_ssv} "
+                  f"(have: {', '.join(f'v{k}' for k in sorted(floors))}). The relative "
+                  f"gate is also blind on a fresh scoreset, so this would leave "
+                  f"nDCG@10 entirely ungated. Author a floor from the new probe set's "
+                  f"own baseline.", file=sys.stderr)
+            return 1
+        if nq < MIN_QUERIES_FOR_ABS_NDCG_GATE:
+            print(f"  FAIL: absolute nDCG@10 floor requested but the run scored only "
+                  f"{nq} probe(s); {MIN_QUERIES_FOR_ABS_NDCG_GATE} is the minimum for "
+                  f"the number to mean anything. Find out why the probe set shrank "
+                  f"rather than lowering this.", file=sys.stderr)
+            return 1
+        print(f"  absolute floor {floor_abs:.4f} (scoreset v{run_ssv}, {nq} probes) · "
+              f"headroom {cur['ndcg_at_10'] - floor_abs:+.4f}")
+        if cur["ndcg_at_10"] < floor_abs:
+            discord(f"\U0001f53b **Memory retrieval below its ABSOLUTE floor** — nightly "
+                    f"eval `{cur['tag']}`\n"
+                    f"nDCG@10 **{cur['ndcg_at_10']:.4f}** < fixed floor {floor_abs:.4f} "
+                    f"(scoreset v{run_ssv}, n={nq})\n"
+                    f"recall@1 {cur['recall_at_1']:.3f} \u00b7 nDCG@5 {cur['ndcg_at_5']:.3f} "
+                    f"\u00b7 git `{(cur.get('git_sha') or 'unknown')[:8]}`\n"
+                    f"This floor does NOT move with the trailing median, so this is "
+                    f"cumulative drift the relative gate cannot see — the nightly "
+                    f"step may well still be inside -{args.drop_pct}%. Read "
+                    f"`python3 eval/retrieval_regression.py trend` as a SERIES, not "
+                    f"as a diff. Do not lower the floor to clear this.")
+            print("  ABSOLUTE FLOOR BREACHED — alerting Discord", file=sys.stderr)
+            return 1
+
     if len(vals) < args.min_history:
         print(f"  only {len(vals)} prior run(s) with nDCG on scoreset v{ssv} "
               f"(<{args.min_history}) — establishing trend, not gating yet")
@@ -1992,6 +2095,16 @@ def main():
                         "is below this floor, below the previous run in the same tag "
                         "family, or 0 (a disarmed gate). Raise it as probes are "
                         "added; do not lower it to make a red run green.")
+    g.add_argument("--fail-under-ndcg10", default=None, metavar="SSV:FLOOR[,SSV:FLOOR]",
+                   help="ABSOLUTE floor on nDCG@10, keyed by scoreset_version "
+                        "(e.g. '4:0.62'). The rest of this gate is median-relative "
+                        "and therefore blind to any decline slower than --window; "
+                        "this floor does not move. Keyed by scoreset because nDCG "
+                        "is a mean over the probe population, so a floor authored "
+                        "for one probe set does not transfer to another. A run on "
+                        "an undeclared scoreset FAILS rather than passing silently. "
+                        "RAISE these as retrieval improves; do not lower them to "
+                        "make a red run green.")
     g.add_argument("--notify-ok", action="store_true", help="also post a Discord line when green")
     g.set_defaults(func=cmd_gate)
 
