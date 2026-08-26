@@ -192,14 +192,26 @@ def main():
             if adjudicated is not None:
                 backlog = max(0, (available or 0) - sweep.get("processed", 0))
                 log.info(
-                    "conflict sweep split: adjudicated=%s skipped=%s errors=%s "
-                    "of processed=%s | candidates_available=%s backlog=%s "
+                    "conflict sweep split: adjudicated=%s skipped=%s vetoed=%s "
+                    "errors=%s of processed=%s | candidates_available=%s backlog=%s "
                     "pit_deferred_not_selected=%s open_remaining=%s",
-                    adjudicated, sweep.get("skipped"), sweep.get("errors"),
+                    adjudicated, sweep.get("skipped"),
+                    sweep.get("vetoed_forget_guard"), sweep.get("errors"),
                     sweep.get("processed"), available, backlog,
                     sweep.get("pit_deferred_not_selected"),
                     sweep.get("open_conflicts_remaining"),
                 )
+                # A forget-guard veto is a standing governance decision, not a
+                # fault (migration 138). It will not clear by retrying, so say
+                # so once rather than letting it read as a nightly error rate.
+                vetoed = sweep.get("vetoed_forget_guard") or 0
+                if vetoed:
+                    log.warning(
+                        "conflict sweep: %s conflict(s) refused by "
+                        "memories_forget_guard — the loser is an active eval "
+                        "probe gold or lifecycle_pinned. Needs a human call; "
+                        "see conflict_block_report()", vetoed,
+                    )
                 limit = int(os.environ.get("CONFLICT_SWEEP_LIMIT", "200"))
                 if adjudicated == 0 and sweep.get("processed", 0) >= limit:
                     log.warning(
