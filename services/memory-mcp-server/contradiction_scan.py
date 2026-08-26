@@ -182,6 +182,42 @@ def main():
         try:
             sweep = run_conflict_sweep(client)
             log.info("conflict sweep: %s", json.dumps(sweep))
+            # Saturation, explicitly. `processed` is pinned at p_limit whenever
+            # the queue is full and therefore reads healthy while the sweep
+            # adjudicates nothing — that is exactly how the point-in-time
+            # head-of-line block hid from 2026-08-24 to 08-26 (migration 137).
+            # Read adjudicated/skipped/backlog, never processed alone.
+            adjudicated = sweep.get("adjudicated")
+            available = sweep.get("candidates_available")
+            if adjudicated is not None:
+                backlog = max(0, (available or 0) - sweep.get("processed", 0))
+                log.info(
+                    "conflict sweep split: adjudicated=%s skipped=%s errors=%s "
+                    "of processed=%s | candidates_available=%s backlog=%s "
+                    "pit_deferred_not_selected=%s open_remaining=%s",
+                    adjudicated, sweep.get("skipped"), sweep.get("errors"),
+                    sweep.get("processed"), available, backlog,
+                    sweep.get("pit_deferred_not_selected"),
+                    sweep.get("open_conflicts_remaining"),
+                )
+                limit = int(os.environ.get("CONFLICT_SWEEP_LIMIT", "200"))
+                if adjudicated == 0 and sweep.get("processed", 0) >= limit:
+                    log.warning(
+                        "conflict sweep SATURATED: processed=%s adjudicated=0 — "
+                        "the whole budget went to rows resolve_conflict_auto refuses",
+                        sweep.get("processed"),
+                    )
+                elif adjudicated == 0 and sweep.get("processed", 0) > 0:
+                    log.warning(
+                        "conflict sweep STALLED: all %s candidate(s) refused or "
+                        "errored (under budget) — permanent residue, not a backlog",
+                        sweep.get("processed"),
+                    )
+                elif backlog > 0:
+                    log.warning(
+                        "conflict sweep BACKLOG: %s adjudicable conflict(s) exceeded "
+                        "CONFLICT_SWEEP_LIMIT and were not reached this run", backlog,
+                    )
         except Exception as e:  # resolution must never fail the detection scan
             log.error("conflict sweep failed: %s", e)
 
