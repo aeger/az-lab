@@ -194,11 +194,12 @@ def main():
                 log.info(
                     "conflict sweep split: adjudicated=%s skipped=%s vetoed=%s "
                     "errors=%s of processed=%s | candidates_available=%s backlog=%s "
-                    "pit_deferred_not_selected=%s open_remaining=%s",
+                    "pit_deferred_not_selected=%s flags_cleared=%s open_remaining=%s",
                     adjudicated, sweep.get("skipped"),
                     sweep.get("vetoed_forget_guard"), sweep.get("errors"),
                     sweep.get("processed"), available, backlog,
                     sweep.get("pit_deferred_not_selected"),
+                    sweep.get("conflict_flags_cleared"),
                     sweep.get("open_conflicts_remaining"),
                 )
                 # A forget-guard veto is a standing governance decision, not a
@@ -211,6 +212,17 @@ def main():
                         "memories_forget_guard — the loser is an active eval "
                         "probe gold or lifecycle_pinned. Needs a human call; "
                         "see conflict_block_report()", vetoed,
+                    )
+                # Migration 139 gates PIT-deferrable conflicts at INSERT, so this
+                # count should now stay at 0. Non-zero means a producer is bypassing
+                # conflict_intake_gate and the 08-24..08-26 head-of-line block is
+                # re-forming. Independent of the verdict chain below on purpose.
+                if (sweep.get("pit_deferred_not_selected") or 0) > 0:
+                    log.warning(
+                        "conflict sweep: %s point-in-time-deferred conflict(s) open "
+                        "despite the migration-139 intake gate — a producer is "
+                        "bypassing conflict_intake_gate; these can never be adjudicated",
+                        sweep.get("pit_deferred_not_selected"),
                     )
                 limit = int(os.environ.get("CONFLICT_SWEEP_LIMIT", "200"))
                 if adjudicated == 0 and sweep.get("processed", 0) >= limit:

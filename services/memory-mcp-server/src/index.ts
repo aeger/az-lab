@@ -157,11 +157,48 @@ async function detectConflicts(
     }
   }
 
+  // Migration 139 — do not FILE a conflict the resolver refuses forever.
+  // resolve_conflict_auto() has refused any conflict touching an is_point_in_time
+  // row since migration 133, and sweep_conflicts() has excluded them from its
+  // candidate set since 137, so every one filed here was an unclosable row plus a
+  // permanent governance_weight() x0.75 on BOTH sides. Measured 2026-08-28: 290 of
+  // the 347 open contradictions were a dated log series arguing with itself
+  // ("AI Memory Research - 2026-08-28" vs "... 2026-08-27"), and 120 memories were
+  // carrying an uncleavable flag because of it.
+  //
+  // A BEFORE INSERT trigger in the DB (conflict_intake_gate) is the real enforcement
+  // point — there is more than one producer. This check is deliberately STRICTER than
+  // that trigger: the trigger still admits conflict_type='stale' on a PIT row because
+  // contradiction-scan's 'stale' means link-graph staleness and is genuinely
+  // adjudicable, whereas the 'stale' half of THIS detector's pair asserts "may be
+  // superseded by a newer memory", which is exactly the claim a point-in-time record
+  // cannot be subject to. So both halves of the pair are skipped here.
+  const pointInTime = new Set<string>();
+  if (candidates.length > 0) {
+    const { data: pitRows } = await supabase
+      .from("memories")
+      .select("id, is_point_in_time")
+      .in("id", [newMemoryId, ...candidates.map((c) => c.id)]);
+    for (const row of (pitRows as any[]) ?? []) {
+      if (row.is_point_in_time) pointInTime.add(row.id);
+    }
+  }
+  // A dated record is a report about a moment, not a claim about now — it contradicts
+  // nothing and nothing supersedes it. Nothing to file in either direction.
+  if (pointInTime.has(newMemoryId)) return null;
+
   const conflictNames: string[] = [];
   for (const candidate of candidates) {
+    if (pointInTime.has(candidate.id)) continue;
     const sim = candidate.similarity;
     if (mightContradict(newContent, candidate.content)) {
       // Contradiction: negation words detected in semantically related memories
+      // ignoreDuplicates is load-bearing (migration 139). Without it PostgREST emits
+      // ON CONFLICT DO UPDATE and the literal `resolved: false` above RESURRECTS a
+      // conflict that was already adjudicated, re-flagging both memories and handing
+      // the nightly sweep the same decision to make again. 8 rows were in that state
+      // on 2026-08-28, reopened hours after the 03:30 sweep closed them. A BEFORE
+      // UPDATE trigger now refuses the reopen server-side as well.
       await supabase.from("memory_conflicts").upsert({
         memory_a_id: newMemoryId,
         memory_b_id: candidate.id,
@@ -169,7 +206,7 @@ async function detectConflicts(
         description: `New memory may contradict "${candidate.name}"`,
         resolved: false,
         detected_by: "negation_heuristic",
-      }, { onConflict: "memory_a_id,memory_b_id" });
+      }, { onConflict: "memory_a_id,memory_b_id", ignoreDuplicates: true });
       await supabase.from("memory_conflicts").upsert({
         memory_a_id: candidate.id,
         memory_b_id: newMemoryId,
@@ -177,7 +214,7 @@ async function detectConflicts(
         description: `May be superseded by newer memory "${newContent.slice(0, 80)}..."`,
         resolved: false,
         detected_by: "negation_heuristic",
-      }, { onConflict: "memory_a_id,memory_b_id" });
+      }, { onConflict: "memory_a_id,memory_b_id", ignoreDuplicates: true });
       await supabase.from("memories").update({ conflict_flagged: true }).in("id", [newMemoryId, candidate.id]);
       conflictNames.push(candidate.name);
     } else if (sim >= 0.85 && textSimilarity(newContent, candidate.content) < 0.65) {
@@ -190,7 +227,7 @@ async function detectConflicts(
         description: `High semantic similarity (${(sim * 100).toFixed(0)}%) but divergent content — possible stale data in "${candidate.name}"`,
         resolved: false,
         detected_by: "sim_threshold_0.85",
-      }, { onConflict: "memory_a_id,memory_b_id" });
+      }, { onConflict: "memory_a_id,memory_b_id", ignoreDuplicates: true });
       await supabase.from("memories").update({ conflict_flagged: true }).in("id", [newMemoryId, candidate.id]);
       conflictNames.push(`${candidate.name} (near-dup)`);
     }
@@ -1463,7 +1500,7 @@ function startEmbeddingBackfillJob(supabase: any): void {
 // package.json. Two separate literals used to carry this — the MCP handshake and
 // GET /health — and on 2026-08-05 the /health one was missed on a version bump,
 // so the endpoint every dashboard and research run reads was a release behind.
-const SERVER_VERSION = "5.19.0";
+const SERVER_VERSION = "5.20.0";
 
 // ── Episode claim registry ───────────────────────────────────────────────────
 // Keyed by episode id, NOT a shared consult buffer — the consult ids themselves
