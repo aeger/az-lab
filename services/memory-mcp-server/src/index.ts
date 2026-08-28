@@ -199,14 +199,13 @@ async function detectConflicts(
       // the nightly sweep the same decision to make again. 8 rows were in that state
       // on 2026-08-28, reopened hours after the 03:30 sweep closed them. A BEFORE
       // UPDATE trigger now refuses the reopen server-side as well.
-      await supabase.from("memory_conflicts").upsert({
-        memory_a_id: newMemoryId,
-        memory_b_id: candidate.id,
-        conflict_type: "contradiction",
-        description: `New memory may contradict "${candidate.name}"`,
-        resolved: false,
-        detected_by: "negation_heuristic",
-      }, { onConflict: "memory_a_id,memory_b_id", ignoreDuplicates: true });
+      // Migration 141: the 'contradiction' row is NOT filed any more. It routed to
+      // resolve_conflict_auto's supersede path and scored 2 correct retirements out
+      // of 54 — it retired 52 live, still-true notes between 08-24 and 08-27,
+      // including migration 138's own finding one day after it was written. The
+      // 'stale' row below carries the same suspicion, never invents a supersession,
+      // and closes itself when the claim does not hold (411 have). A BEFORE INSERT
+      // trigger refuses the contradiction row server-side too.
       await supabase.from("memory_conflicts").upsert({
         memory_a_id: candidate.id,
         memory_b_id: newMemoryId,
@@ -1500,7 +1499,7 @@ function startEmbeddingBackfillJob(supabase: any): void {
 // package.json. Two separate literals used to carry this — the MCP handshake and
 // GET /health — and on 2026-08-05 the /health one was missed on a version bump,
 // so the endpoint every dashboard and research run reads was a release behind.
-const SERVER_VERSION = "5.20.0";
+const SERVER_VERSION = "5.21.0";
 
 // ── Episode claim registry ───────────────────────────────────────────────────
 // Keyed by episode id, NOT a shared consult buffer — the consult ids themselves
