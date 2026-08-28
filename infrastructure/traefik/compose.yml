@@ -44,6 +44,14 @@ services:
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
       - "--entrypoints.metrics.address=:8082"
 
+      # GHSA-rf44-j88r-hh8c (v3.7.12): backends (PHP/CGI/WSGI/nginx) collapse
+      # X_Auth_User / X.Auth.User into the same var as X-Auth-User, letting a
+      # client smuggle an alias past authelia forward-auth and spoof identity.
+      # Default "keep" stays vulnerable — must be delete or reject.
+      - "--entrypoints.web.http.aliasheadersstrategy=delete"
+      - "--entrypoints.websecure.http.aliasheadersstrategy=delete"
+      - "--entrypoints.metrics.http.aliasheadersstrategy=delete"
+
       - "--metrics.prometheus=true"
       - "--metrics.prometheus.addEntryPointsLabels=true"
       - "--metrics.prometheus.addRoutersLabels=true"
