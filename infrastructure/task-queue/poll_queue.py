@@ -247,13 +247,13 @@ NVIDIA_NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_API_KEY_FILE = os.path.expanduser("~/.nvidia_api_key")
 NEMOTRON_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
-ROUTING_TARGETS = ["claude-code", "wren", "cowork", "desktop"]
+ROUTING_TARGETS = ["claude-code", "wren", "cowork", "atlas"]
 
 ROUTING_PROMPT = """You are a task router for a homelab AI system. Classify the task below to exactly one target agent.
 
 Targets:
 - claude-code: Linux server ops, git, docker/podman, deployments, file edits, code, networking, infrastructure, APIs, scripting, anything on the homelab server
-- desktop: Windows-only tasks, OneDrive, local Office files, anything requiring a Windows app or GUI
+- atlas: Windows-only tasks, OneDrive, local Office files, anything requiring a Windows app or GUI
 - cowork: Planning, research, writing docs, memory management, multi-turn conversational tasks, anything that needs discussion not execution
 
 Respond with ONLY the target name, nothing else. No punctuation, no explanation.
@@ -351,10 +351,10 @@ def _route_via_nemotron(title, description):
 def _route_by_keywords(title, description):
     """Fallback keyword-based routing when Nemotron is unavailable."""
     text = (title + " " + description).lower()
-    desktop_signals = ["windows", "onedrive", "obsidian", "office", "excel", "word", "outlook", "c:\\", "appdata"]
+    atlas_signals = ["windows", "onedrive", "obsidian", "office", "excel", "word", "outlook", "c:\\", "appdata"]
     cowork_signals = ["plan", "research", "write up", "document", "memory", "draft", "review", "summarize", "brainstorm"]
-    if any(s in text for s in desktop_signals):
-        return "desktop"
+    if any(s in text for s in atlas_signals):
+        return "atlas"
     if any(s in text for s in cowork_signals):
         return "cowork"
     return "claude-code"  # default: if in doubt, we can handle it

@@ -1,0 +1,12 @@
+{
+  "supabase_url": "https://ogqjjlbupqnvlcyrfnxi.supabase.co",
+  "supabase_publishable_key": "PASTE_SUPABASE_PUBLISHABLE_KEY",
+  "supabase_secret_key": "PASTE_SUPABASE_SECRET_KEY",
+  "agent_name": "atlas",
+  "claude_bin": "claude",
+  "claude_args": ["-p", "--output-format", "json", "--permission-mode", "acceptEdits"],
+  "claude_cwd": "C:\\Users\\almty",
+  "claude_timeout_ms": 300000,
+  "auto_execute_tasks": false,
+  "toast": true
+}

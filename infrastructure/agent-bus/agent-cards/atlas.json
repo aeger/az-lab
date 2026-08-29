@@ -85,7 +85,7 @@
   "contact": {
     "discord_channel": "general",
     "queue": "task_queue",
-    "queue_target": "claude-desktop"
+    "queue_target": "atlas"
   },
   "securitySchemes": {
     "none": {

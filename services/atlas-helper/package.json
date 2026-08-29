@@ -1,0 +1,11 @@
+{
+  "name": "atlas-helper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Atlas realtime Relay listener for the Windows workstation",
+  "main": "helper.mjs",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
