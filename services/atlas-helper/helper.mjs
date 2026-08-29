@@ -33,6 +33,8 @@ const CLAUDE_CWD = cfg.claude_cwd || process.env.USERPROFILE || HERE;
 const CLAUDE_TIMEOUT_MS = cfg.claude_timeout_ms || 300_000;
 const AUTO_EXECUTE_TASKS = cfg.auto_execute_tasks === true;
 const TOAST = cfg.toast !== false;
+// Max auto-reply depth per thread — the loop breaker (2026-08-29 ping-pong).
+const MAX_HOPS = Number(cfg.max_hops || 3);
 
 if (!SUPABASE_URL || !ANON_KEY || !SECRET_KEY) {
   console.error("[atlas-helper] config.json needs supabase_url, supabase_publishable_key, supabase_secret_key");
@@ -128,6 +130,24 @@ function enqueueMessage(row) {
   if (row.to_agent !== AGENT && row.to_agent !== null) return;
   if (row.from_agent === AGENT) return;
   if (row.kind === "status" || row.kind === "system" || row.kind === "task") return;
+
+  // Loop breaker (2026-08-29). The self-name guard is not enough: A's auto-reply
+  // lands on B, B spawns a session and auto-replies to A, forever. A failing
+  // agent errors in ~2s, so the loop runs at machine speed and burns tokens.
+  const meta = row.meta || {};
+  if (meta.auto_error) {
+    console.warn(`[atlas-helper] not spawning for error report ${row.id} from ${row.from_agent}`);
+    rest("PATCH", `agent_messages?id=eq.${row.id}`, { delivered_at: new Date().toISOString() }).catch(() => {});
+    return;
+  }
+  const hop = Number(meta.hop || 0);
+  if (hop >= MAX_HOPS) {
+    console.warn(`[atlas-helper] hop cap ${MAX_HOPS} reached on ${row.id} — not replying`);
+    rest("PATCH", `agent_messages?id=eq.${row.id}`, { delivered_at: new Date().toISOString() }).catch(() => {});
+    return;
+  }
+  row.__hop = hop;
+
   seen.add(row.id);
   if (seen.size > 5000) seen.clear();
   workQueue.push(row);
@@ -166,13 +186,14 @@ async function handleMessage(row) {
   }
 
   const reply = await runClaude(framePrompt(row));
+  const isErr = /^\(atlas-helper|^\(relay|Failed to authenticate|API Error|OAuth session expired/i.test(String(reply).trim());
   await rest("POST", "agent_messages", {
     from_agent: AGENT,
     to_agent: row.from_agent,
     kind: "chat",
     body: reply.slice(0, 60_000),
     thread_id: row.thread_id ?? row.id,
-    meta: { via: "atlas-helper" },
+    meta: { via: "atlas-helper", hop: (row.__hop ?? 0) + 1, ...(isErr ? { auto_error: true } : {}) },
   });
   await rest("PATCH", `agent_messages?id=eq.${row.id}`, { acked_at: new Date().toISOString() });
 }

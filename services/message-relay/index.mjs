@@ -26,6 +26,9 @@ if (!SUPABASE_URL || !ANON_KEY || !SECRET_KEY) {
 }
 
 const AGENT = "wren";
+// Max auto-reply depth per thread. Beyond this the relay stops replying rather
+// than letting two agents converse forever (see the 2026-08-29 ping-pong).
+const MAX_HOPS = Number(process.env.RELAY_MAX_HOPS || 3);
 const MY_NAMES = new Set(["wren", "claude-code"]);
 const CLAUDE_BIN = process.env.RELAY_CLAUDE_BIN || "claude";
 const CLAUDE_TIMEOUT_MS = Number(process.env.RELAY_CLAUDE_TIMEOUT_MS || 300_000);
@@ -80,6 +83,27 @@ function enqueueMessage(row) {
   if (!MY_NAMES.has(row.to_agent ?? "") && row.to_agent !== null) return; // not for us
   if (MY_NAMES.has(row.from_agent)) return;                              // our own
   if (row.kind === "status" || row.kind === "system") return;            // informational
+
+  // Loop breaker (2026-08-29). The self-name guard alone is NOT enough: A's
+  // auto-reply lands on B, B spawns a session and auto-replies to A, forever.
+  // A failing agent makes it worse — it errors in ~2s, so the loop runs at
+  // machine speed and burns tokens. Two independent cuts:
+  const meta = row.meta || {};
+  //  1. An error report must never cause the other side to spawn anything.
+  if (meta.auto_error) {
+    console.warn(`[relay] not spawning for error report ${row.id} from ${row.from_agent}: ${String(row.body).slice(0, 120)}`);
+    rest("PATCH", `agent_messages?id=eq.${row.id}`, { delivered_at: new Date().toISOString() }).catch(() => {});
+    return;
+  }
+  //  2. Bounded conversation depth: a thread may auto-reply MAX_HOPS times.
+  const hop = Number(meta.hop || 0);
+  if (hop >= MAX_HOPS) {
+    console.warn(`[relay] hop cap ${MAX_HOPS} reached on ${row.id} (thread ${row.thread_id ?? row.id}) — not replying`);
+    rest("PATCH", `agent_messages?id=eq.${row.id}`, { delivered_at: new Date().toISOString() }).catch(() => {});
+    return;
+  }
+  row.__hop = hop;
+
   seen.add(row.id);
   if (seen.size > 5000) seen.clear();
   workQueue.push(row);
@@ -124,7 +148,7 @@ async function handleMessage(row) {
     }, { Prefer: "return=representation" });
     const taskId = inserted?.[0]?.id ?? null;
     await rest("PATCH", `agent_messages?id=eq.${row.id}`, { task_id: taskId, acked_at: new Date().toISOString() });
-    await sendMessage(row.from_agent, `Queued as task ${taskId ?? "?"}: ${title}`, "status", row.thread_id ?? row.id, taskId);
+    await sendMessage(row.from_agent, `Queued as task ${taskId ?? "?"}: ${title}`, "status", row.thread_id ?? row.id, taskId, row.__hop ?? 0);
     return;
   }
 
@@ -135,11 +159,17 @@ async function handleMessage(row) {
   }
 
   const reply = await runClaude(row);
-  await sendMessage(row.from_agent, reply, "chat", row.thread_id ?? row.id, null);
+  await sendMessage(row.from_agent, reply, "chat", row.thread_id ?? row.id, null, row.__hop ?? 0);
   await rest("PATCH", `agent_messages?id=eq.${row.id}`, { acked_at: new Date().toISOString() });
 }
 
-async function sendMessage(toAgent, body, kind, threadId, taskId) {
+// Anything the relay generates automatically carries its hop count, and error
+// reports are tagged so the receiving side never spawns a session for them.
+function looksLikeError(body) {
+  return /^\(relay|^\(atlas-helper|Failed to authenticate|API Error|OAuth session expired/i.test(String(body).trim());
+}
+
+async function sendMessage(toAgent, body, kind, threadId, taskId, hop = 0) {
   await rest("POST", "agent_messages", {
     from_agent: AGENT,
     to_agent: toAgent === "jeff" ? "jeff" : toAgent,
@@ -147,7 +177,11 @@ async function sendMessage(toAgent, body, kind, threadId, taskId) {
     body: body.slice(0, 60_000),
     thread_id: threadId,
     ...(taskId ? { task_id: taskId } : {}),
-    meta: { via: "message-relay" },
+    meta: {
+      via: "message-relay",
+      hop: hop + 1,
+      ...(looksLikeError(body) ? { auto_error: true } : {}),
+    },
   });
 }
 
