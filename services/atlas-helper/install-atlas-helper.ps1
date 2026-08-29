@@ -24,7 +24,7 @@ $TaskName = 'Atlas Relay Helper'
 node --version | Out-Null
 
 if (-not (Test-Path (Join-Path $PSScriptRoot 'config.json'))) {
-  throw 'config.json missing — copy config.example.json to config.json and fill in the keys first.'
+  throw 'config.json missing - copy config.example.json to config.json and fill in the keys first.'
 }
 
 # Stop anything from a previous install before overwriting its files.
@@ -69,7 +69,7 @@ $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd 
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -RunLevel Limited -Force `
-    -Description 'Atlas realtime Relay listener (system tray) — receives agent messages/tasks from Supabase Realtime, notifies Jeff, spawns claude -p. See azlab/services/atlas-helper.'
+    -Description 'Atlas realtime Relay listener (system tray) - receives agent messages/tasks from Supabase Realtime, notifies Jeff, spawns claude -p. See azlab/services/atlas-helper.'
 
 Write-Host "Scheduled task '$TaskName' registered (at logon, tray, restart-on-failure)."
 Write-Host 'Starting it now...'

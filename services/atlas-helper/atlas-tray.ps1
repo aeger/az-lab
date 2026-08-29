@@ -1,9 +1,9 @@
 <#
-  atlas-tray.ps1 — system-tray front end for the Atlas Relay helper.
+  atlas-tray.ps1 - system-tray front end for the Atlas Relay helper.
 
   Runs helper.mjs as a child process and puts an icon in the notification area
   so the helper is visible and controllable instead of being an invisible
-  background task. Uses only WinForms (built into Windows PowerShell 5.1) —
+  background task. Uses only WinForms (built into Windows PowerShell 5.1) -
   no npm packages, no BurntToast required.
 
   Tray icon states:
@@ -37,7 +37,7 @@ $ErrLogPath = Join-Path $HelperDir 'helper.err.log'
 
 if (-not (Test-Path $HelperJs)) { throw "helper.mjs not found in $HelperDir" }
 
-# ── Helper process control ───────────────────────────────────────────────────
+# -- Helper process control ---------------------------------------------------
 $script:HelperProc = $null
 
 function Start-Helper {
@@ -67,15 +67,15 @@ function Get-Status {
   try { return Get-Content $StatusPath -Raw | ConvertFrom-Json } catch { return $null }
 }
 
-# ── Tray icon ────────────────────────────────────────────────────────────────
-# SystemIcons are always present — no icon file to ship or lose.
+# -- Tray icon ----------------------------------------------------------------
+# SystemIcons are always present - no icon file to ship or lose.
 $IconOk   = [System.Drawing.SystemIcons]::Information
 $IconBusy = [System.Drawing.SystemIcons]::Application
 $IconBad  = [System.Drawing.SystemIcons]::Error
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Icon = $IconBad
-$notify.Text = 'Atlas Relay — starting...'
+$notify.Text = 'Atlas Relay - starting...'
 $notify.Visible = $true
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -109,7 +109,7 @@ $miAuto.add_Click({
       $cfg.auto_execute_tasks = $new
     }
     # Must be UTF-8 WITHOUT a BOM: Set-Content -Encoding UTF8 on PowerShell 5.1
-    # emits one, and Node's JSON.parse throws on a leading BOM — that would
+    # emits one, and Node's JSON.parse throws on a leading BOM - that would
     # break the helper on its next start.
     $json = $cfg | ConvertTo-Json -Depth 10
     [System.IO.File]::WriteAllText($ConfigPath, $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -152,16 +152,16 @@ $notify.add_MouseDoubleClick({
   [System.Windows.Forms.MessageBox]::Show($msg, 'Atlas Relay status') | Out-Null
 })
 
-# ── Poll status.json, drive icon/tooltip/balloons ────────────────────────────
+# -- Poll status.json, drive icon/tooltip/balloons ----------------------------
 $script:LastSeq = -1
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 2000
 $timer.add_Tick({
-  # Helper died? bring it back — this is the tray's watchdog role.
+  # Helper died? bring it back - this is the tray's watchdog role.
   if ($script:HelperProc -and $script:HelperProc.HasExited) {
     Start-Helper
-    $notify.ShowBalloonTip(4000, 'Atlas Relay', 'Helper exited — restarted automatically.', [System.Windows.Forms.ToolTipIcon]::Warning)
+    $notify.ShowBalloonTip(4000, 'Atlas Relay', 'Helper exited - restarted automatically.', [System.Windows.Forms.ToolTipIcon]::Warning)
   }
 
   $s = Get-Status
@@ -169,7 +169,7 @@ $timer.add_Tick({
 
   if ($null -eq $s -or -not $running) {
     $notify.Icon = $IconBad
-    $notify.Text = 'Atlas Relay — helper not running'
+    $notify.Text = 'Atlas Relay - helper not running'
     $miStatus.Text = 'Status: helper not running'
     return
   }
@@ -179,14 +179,14 @@ $timer.add_Tick({
     $state = 'disconnected (retrying)'
   } elseif ($s.busy) {
     $notify.Icon = $IconBusy
-    $state = 'busy — claude running'
+    $state = 'busy - claude running'
   } else {
     $notify.Icon = $IconOk
     $state = 'connected'
   }
 
-  # NotifyIcon.Text is capped at 63 characters — keep it short or it throws.
-  $short = "Atlas Relay — $state"
+  # NotifyIcon.Text is capped at 63 characters - keep it short or it throws.
+  $short = "Atlas Relay - $state"
   if ($short.Length -gt 62) { $short = $short.Substring(0, 62) }
   $notify.Text = $short
   $miStatus.Text = "Status: $state  |  msgs $($s.messages_handled)  tasks $($s.tasks_handled)"
