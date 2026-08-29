@@ -14,6 +14,12 @@
 --     over the top of a completed result, which is how a row silently lands on its Nth execution.
 --
 -- Read-only view. No retry semantics are touched here.
+--
+-- NOTE ON execution_count: this migration deliberately does NOT reference
+-- task_queue.execution_count. That column does not exist yet at 143 — migration 144 adds it and
+-- then CREATE OR REPLACE's this view to append the column and widen the `decision` receipt. The
+-- two files must stay in that order: 143 is the pre-144 form, 144 carries the final form. Editing
+-- execution_count into this file makes the migration sequence unreplayable on a fresh database.
 
 BEGIN;
 
@@ -29,7 +35,6 @@ WITH inflight AS (
     t.updated_at,
     t.attempt_count,
     t.run_count,
-    t.execution_count,
     length(COALESCE(btrim(t.result), '')) AS result_len,
     (SELECT max(a.created_at) FROM agent_activity a WHERE a.task_id = t.id) AS last_activity
   FROM task_queue t
@@ -47,7 +52,6 @@ SELECT
   i.result_len,
   i.attempt_count,
   i.run_count,
-  i.execution_count,  -- added by 144; see that migration for counter semantics
   CASE
     WHEN COALESCE(i.last_activity, i.claimed_at, i.updated_at) < (now() - interval '30 minutes')
       THEN 'silent_no_activity'::text
@@ -66,7 +70,7 @@ SELECT
       ELSE 'FINDING result_over_run'
     END,
     COALESCE(i.last_activity::text, '(never)'),
-    COALESCE(i.claimed_at::text, '(NULL — pre-142 bare-SQL write)'),
+    COALESCE(i.claimed_at::text, '(NULL - pre-142 bare-SQL write)'),
     round(EXTRACT(epoch FROM (now() - COALESCE(i.last_activity, i.claimed_at, i.updated_at))) / 60.0, 1),
     i.result_len
   ) AS decision

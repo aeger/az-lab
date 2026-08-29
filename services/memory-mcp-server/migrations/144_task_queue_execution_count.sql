@@ -53,4 +53,68 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Now that task_queue.execution_count exists, extend the 143 probe to surface it. This is the
+-- ONLY place the column enters the view: 143 is the pre-144 form by construction, so the
+-- sequence 143 -> 144 replays cleanly on a fresh database. CREATE OR REPLACE VIEW can only
+-- append columns, which is why execution_count lands last rather than beside run_count.
+CREATE OR REPLACE VIEW public.task_queue_zombies AS
+WITH inflight AS (
+  SELECT
+    t.id,
+    t.title,
+    t.status,
+    t.target,
+    t.claimed_by,
+    t.claimed_at,
+    t.updated_at,
+    t.attempt_count,
+    t.run_count,
+    t.execution_count,
+    length(COALESCE(btrim(t.result), '')) AS result_len,
+    (SELECT max(a.created_at) FROM agent_activity a WHERE a.task_id = t.id) AS last_activity
+  FROM task_queue t
+  WHERE t.status = ANY (ARRAY['claimed'::text, 'in_progress_agent'::text])
+    AND t.archived_at IS NULL
+)
+SELECT
+  i.id,
+  i.title,
+  i.status,
+  i.target,
+  i.claimed_by,
+  i.claimed_at,
+  i.last_activity,
+  i.result_len,
+  i.attempt_count,
+  i.run_count,
+  CASE
+    WHEN COALESCE(i.last_activity, i.claimed_at, i.updated_at) < (now() - interval '30 minutes')
+      THEN 'silent_no_activity'::text
+    ELSE 'result_over_run'::text
+  END AS zombie_class,
+  (i.last_activity IS NULL) AS never_executed,
+  round(EXTRACT(epoch FROM (now() - COALESCE(i.last_activity, i.claimed_at, i.updated_at))) / 60.0, 1)
+    AS silent_minutes,
+  -- Receipt now names all three counters, so a result_over_run finding is self-explaining about
+  -- WHY attempt_count/run_count both read 0 on a task that has executed more than once.
+  format(
+    '%s — last_activity=%s, claimed_at=%s, silent %smin vs 30min gate; result_len=%s, execution_count=%s (attempt_count=%s is retry budget, run_count=%s is recurring firings; neither counts executions)',
+    CASE
+      WHEN COALESCE(i.last_activity, i.claimed_at, i.updated_at) < (now() - interval '30 minutes')
+        THEN 'FINDING silent_no_activity'
+      ELSE 'FINDING result_over_run'
+    END,
+    COALESCE(i.last_activity::text, '(never)'),
+    COALESCE(i.claimed_at::text, '(NULL - pre-142 bare-SQL write)'),
+    round(EXTRACT(epoch FROM (now() - COALESCE(i.last_activity, i.claimed_at, i.updated_at))) / 60.0, 1),
+    i.result_len,
+    i.execution_count,
+    i.attempt_count,
+    i.run_count
+  ) AS decision,
+  i.execution_count
+FROM inflight i
+WHERE COALESCE(i.last_activity, i.claimed_at, i.updated_at) < (now() - interval '30 minutes')
+   OR i.result_len > 0;
+
 COMMIT;
