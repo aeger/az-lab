@@ -183,29 +183,45 @@ function runClaude(row) {
       env: childEnv(),
     });
     let out = "", err = "";
+
+    // Settle exactly once, and ALWAYS settle: a promise that never resolves
+    // leaves `working` true and stalls the FIFO permanently — the relay goes
+    // silent while still looking connected. (Hit on the Atlas side 2026-08-29.)
+    let settled = false;
+    const finish = (text) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(text);
+    };
+
+    const parseOut = (code) => {
+      if (code !== 0 && !out) {
+        return `(relay error: session exited ${code}${err ? `: ${err.slice(0, 300)}` : ""})`;
+      }
+      try {
+        const parsed = JSON.parse(out);
+        return parsed.result ?? parsed.text ?? out.slice(0, 4000);
+      } catch {
+        return out.trim().slice(0, 4000) || `(relay: empty response, exit ${code}${err ? `: ${err.slice(0, 300)}` : ""})`;
+      }
+    };
+
     const timer = setTimeout(() => {
       console.warn(`[relay] claude timed out after ${CLAUDE_TIMEOUT_MS}ms — killing`);
-      child.kill("SIGKILL");
+      try { child.kill("SIGKILL"); } catch { /* best effort */ }
+      setTimeout(() => finish(
+        `(relay: claude timed out after ${Math.round(CLAUDE_TIMEOUT_MS / 1000)}s and was killed. ` +
+        `Partial output: ${(out || "(none)").slice(0, 500)}${err ? ` | stderr: ${err.slice(0, 300)}` : ""})`
+      ), 2_000);
     }, CLAUDE_TIMEOUT_MS);
 
     child.stdout.on("data", d => { out += d; });
     child.stderr.on("data", d => { err += d; });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0 && !out) {
-        resolve(`(relay error: session exited ${code}${err ? `: ${err.slice(0, 200)}` : ""})`);
-        return;
-      }
-      try {
-        const parsed = JSON.parse(out);
-        resolve(parsed.result ?? parsed.text ?? out.slice(0, 4000));
-      } catch {
-        resolve(out.trim().slice(0, 4000) || `(relay: empty response, exit ${code})`);
-      }
-    });
+    child.on("exit", (code) => { setTimeout(() => finish(parseOut(code)), 1_000); });
+    child.on("close", (code) => finish(parseOut(code)));
     child.on("error", (e) => {
-      clearTimeout(timer);
-      resolve(`(relay error: failed to spawn claude: ${e.message})`);
+      finish(`(relay error: failed to spawn claude: ${e.message})`);
     });
     child.stdin.write(framePrompt(row));
     child.stdin.end();

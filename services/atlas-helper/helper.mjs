@@ -202,6 +202,19 @@ function childEnv() {
   return env;
 }
 
+// Kill the whole process TREE. On Windows with shell:true the direct child is
+// cmd.exe; child.kill() reaps only that wrapper and leaves claude running,
+// which is what let a hung session jam the helper forever (2026-08-29).
+function killTree(child) {
+  try {
+    if (process.platform === "win32" && child.pid) {
+      spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      child.kill("SIGKILL");
+    }
+  } catch { /* best effort */ }
+}
+
 function runClaude(prompt) {
   return new Promise((resolve) => {
     const child = spawn(CLAUDE_BIN, CLAUDE_ARGS, {
@@ -211,29 +224,53 @@ function runClaude(prompt) {
       shell: process.platform === "win32", // claude is a .cmd shim on Windows installs
     });
     let out = "", err = "";
+
+    // The promise MUST settle exactly once and MUST always settle: if it never
+    // resolves, `working` stays true and the FIFO stalls permanently — the
+    // helper goes silent while still looking connected.
+    let settled = false;
+    const finish = (text) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(text);
+    };
+
+    const parseOut = (code) => {
+      if (code !== 0 && !out) {
+        return `(atlas-helper error: session exited ${code}${err ? `: ${err.slice(0, 300)}` : ""})`;
+      }
+      try {
+        const parsed = JSON.parse(out);
+        return parsed.result ?? parsed.text ?? out.slice(0, 4000);
+      } catch {
+        return out.trim().slice(0, 4000) || `(atlas-helper: empty response, exit ${code}${err ? `: ${err.slice(0, 300)}` : ""})`;
+      }
+    };
+
     const timer = setTimeout(() => {
-      console.warn(`[atlas-helper] claude timed out after ${CLAUDE_TIMEOUT_MS}ms — killing`);
-      child.kill("SIGKILL");
+      console.warn(`[atlas-helper] claude timed out after ${CLAUDE_TIMEOUT_MS}ms — killing process tree`);
+      killTree(child);
+      // Do NOT wait for 'close' here: a surviving grandchild can hold the pipes
+      // open and 'close' would never fire.
+      setTimeout(() => finish(
+        `(atlas-helper: claude timed out after ${Math.round(CLAUDE_TIMEOUT_MS / 1000)}s and was killed. ` +
+        `Partial output: ${(out || "(none)").slice(0, 500)}${err ? ` | stderr: ${err.slice(0, 300)}` : ""})`
+      ), 2_000);
     }, CLAUDE_TIMEOUT_MS);
 
     child.stdout.on("data", d => { out += d; });
     child.stderr.on("data", d => { err += d; });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0 && !out) {
-        resolve(`(atlas-helper error: session exited ${code}${err ? `: ${err.slice(0, 200)}` : ""})`);
-        return;
-      }
-      try {
-        const parsed = JSON.parse(out);
-        resolve(parsed.result ?? parsed.text ?? out.slice(0, 4000));
-      } catch {
-        resolve(out.trim().slice(0, 4000) || `(atlas-helper: empty response, exit ${code})`);
-      }
+
+    // 'exit' fires when the process ends even if stdio pipes are still held
+    // open by a descendant; 'close' fires once the pipes drain. Take whichever
+    // comes first, giving 'exit' a short grace period to collect trailing output.
+    child.on("exit", (code) => {
+      setTimeout(() => finish(parseOut(code)), 1_000);
     });
+    child.on("close", (code) => finish(parseOut(code)));
     child.on("error", (e) => {
-      clearTimeout(timer);
-      resolve(`(atlas-helper error: failed to spawn claude: ${e.message})`);
+      finish(`(atlas-helper error: failed to spawn claude: ${e.message})`);
     });
     child.stdin.write(prompt);
     child.stdin.end();
