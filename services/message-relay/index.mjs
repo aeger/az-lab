@@ -108,14 +108,19 @@ async function handleMessage(row) {
   if (row.kind === "task") {
     // Escalate into the durable queue — existing pipeline takes it from here.
     const title = row.body.split("\n")[0].slice(0, 160);
+    // task_queue.source has a CHECK constraint whose vocabulary is NOT the
+    // agent-name vocabulary ('jeff'/'atlas'/'iris' are all rejected). Map to a
+    // legal source and keep the true origin in context.
+    const SOURCES = new Set(["cowork", "chat", "claude-code", "system", "desktop", "wren-scheduler", "dashboard"]);
+    const source = SOURCES.has(row.from_agent) ? row.from_agent : "chat";
     const inserted = await rest("POST", "task_queue", {
       title,
       description: row.body,
-      source: row.from_agent,
+      source,
       target: "claude-code",
       status: "pending",
       priority: 2,
-      context: { relay_message_id: row.id, via: "message-relay" },
+      context: { relay_message_id: row.id, relay_from: row.from_agent, via: "message-relay" },
     }, { Prefer: "return=representation" });
     const taskId = inserted?.[0]?.id ?? null;
     await rest("PATCH", `agent_messages?id=eq.${row.id}`, { task_id: taskId, acked_at: new Date().toISOString() });
