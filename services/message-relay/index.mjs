@@ -78,6 +78,12 @@ const seen = new Set();          // message ids already handled this process
 const workQueue = [];            // FIFO of pending message rows
 let working = false;
 
+// Per-thread count of replies THIS process has generated. The meta.hop cap
+// trusts the peer to echo the counter back; this one does not depend on the
+// peer at all, so an old or buggy listener on the other end cannot loop us.
+const repliesByThread = new Map();
+function threadKey(row) { return row.thread_id ?? row.id; }
+
 function enqueueMessage(row) {
   if (!row || seen.has(row.id)) return;
   if (!MY_NAMES.has(row.to_agent ?? "") && row.to_agent !== null) return; // not for us
@@ -97,12 +103,13 @@ function enqueueMessage(row) {
   }
   //  2. Bounded conversation depth: a thread may auto-reply MAX_HOPS times.
   const hop = Number(meta.hop || 0);
-  if (hop >= MAX_HOPS) {
-    console.warn(`[relay] hop cap ${MAX_HOPS} reached on ${row.id} (thread ${row.thread_id ?? row.id}) — not replying`);
+  const mine = repliesByThread.get(threadKey(row)) || 0;
+  if (hop >= MAX_HOPS || mine >= MAX_HOPS) {
+    console.warn(`[relay] hop cap reached on ${row.id} (thread ${threadKey(row)}, peer hop ${hop}, my replies ${mine}) — not replying`);
     rest("PATCH", `agent_messages?id=eq.${row.id}`, { delivered_at: new Date().toISOString() }).catch(() => {});
     return;
   }
-  row.__hop = hop;
+  row.__hop = Math.max(hop, mine);
 
   seen.add(row.id);
   if (seen.size > 5000) seen.clear();
@@ -170,6 +177,8 @@ function looksLikeError(body) {
 }
 
 async function sendMessage(toAgent, body, kind, threadId, taskId, hop = 0) {
+  if (threadId) repliesByThread.set(threadId, (repliesByThread.get(threadId) || 0) + 1);
+  if (repliesByThread.size > 2000) repliesByThread.clear();
   await rest("POST", "agent_messages", {
     from_agent: AGENT,
     to_agent: toAgent === "jeff" ? "jeff" : toAgent,

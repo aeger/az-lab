@@ -125,6 +125,11 @@ const seen = new Set();
 const workQueue = [];
 let working = false;
 
+// Per-thread count of replies THIS process has generated — a peer-independent
+// loop stop, since meta.hop relies on the other side echoing the counter back.
+const repliesByThread = new Map();
+function threadKey(row) { return row.thread_id ?? row.id; }
+
 function enqueueMessage(row) {
   if (!row || seen.has(row.id)) return;
   if (row.to_agent !== AGENT && row.to_agent !== null) return;
@@ -141,12 +146,13 @@ function enqueueMessage(row) {
     return;
   }
   const hop = Number(meta.hop || 0);
-  if (hop >= MAX_HOPS) {
-    console.warn(`[atlas-helper] hop cap ${MAX_HOPS} reached on ${row.id} — not replying`);
+  const mine = repliesByThread.get(threadKey(row)) || 0;
+  if (hop >= MAX_HOPS || mine >= MAX_HOPS) {
+    console.warn(`[atlas-helper] hop cap reached on ${row.id} (peer hop ${hop}, my replies ${mine}) — not replying`);
     rest("PATCH", `agent_messages?id=eq.${row.id}`, { delivered_at: new Date().toISOString() }).catch(() => {});
     return;
   }
-  row.__hop = hop;
+  row.__hop = Math.max(hop, mine);
 
   seen.add(row.id);
   if (seen.size > 5000) seen.clear();
@@ -186,6 +192,9 @@ async function handleMessage(row) {
   }
 
   const reply = await runClaude(framePrompt(row));
+  const tk = threadKey(row);
+  repliesByThread.set(tk, (repliesByThread.get(tk) || 0) + 1);
+  if (repliesByThread.size > 2000) repliesByThread.clear();
   const isErr = /^\(atlas-helper|^\(relay|Failed to authenticate|API Error|OAuth session expired/i.test(String(reply).trim());
   await rest("POST", "agent_messages", {
     from_agent: AGENT,
