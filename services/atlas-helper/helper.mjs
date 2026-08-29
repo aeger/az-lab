@@ -14,12 +14,14 @@
 
 import { WebSocket } from "ws";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const cfg = JSON.parse(readFileSync(join(HERE, "config.json"), "utf8"));
+// Strip a UTF-8 BOM before parsing: Notepad and PowerShell's Set-Content both
+// write one, and JSON.parse throws on it with a baffling error.
+const cfg = JSON.parse(readFileSync(join(HERE, "config.json"), "utf8").replace(/^﻿/, ""));
 
 const SUPABASE_URL = cfg.supabase_url;
 const ANON_KEY = cfg.supabase_publishable_key;
@@ -55,8 +57,50 @@ async function rest(method, path, body, extraHeaders = {}) {
   return text ? JSON.parse(text) : null;
 }
 
+// ── Status file (read by the tray app; harmless when running headless) ───────
+// atlas-tray.ps1 polls this to drive the tray icon, tooltip and balloon
+// notifications. notify_seq increments on every user-visible event so the tray
+// can show a balloon without needing BurntToast installed.
+const STATUS_PATH = join(HERE, "status.json");
+const status = {
+  pid: process.pid,
+  agent: AGENT,
+  connected: false,
+  started_at: new Date().toISOString(),
+  connected_at: null,
+  last_event_at: null,
+  messages_handled: 0,
+  tasks_handled: 0,
+  busy: false,
+  auto_execute_tasks: AUTO_EXECUTE_TASKS,
+  notify_seq: 0,
+  notify_title: "",
+  notify_body: "",
+  last_error: null,
+};
+
+function writeStatus() {
+  try {
+    const tmp = `${STATUS_PATH}.tmp`;
+    writeFileSync(tmp, JSON.stringify(status, null, 2));
+    renameSync(tmp, STATUS_PATH); // atomic-ish: tray never reads a half-written file
+  } catch { /* status is best-effort — never break the listener over it */ }
+}
+
+function notify(title, body) {
+  status.notify_seq += 1;
+  status.notify_title = String(title).slice(0, 120);
+  status.notify_body = String(body).slice(0, 400);
+  status.last_event_at = new Date().toISOString();
+  writeStatus();
+}
+
+setInterval(writeStatus, 30_000).unref?.();
+writeStatus();
+
 function toast(title, body) {
-  if (!TOAST) return;
+  notify(title, body);   // always publish to the tray
+  if (!TOAST) return;    // BurntToast is the optional extra path
   const psBody = String(body).slice(0, 180).replace(/'/g, "''");
   const psTitle = String(title).slice(0, 60).replace(/'/g, "''");
   const script = `try { Import-Module BurntToast -ErrorAction Stop; New-BurntToastNotification -Text '${psTitle}','${psBody}' } catch { msg * '${psTitle}: ${psBody}' }`;
@@ -95,12 +139,18 @@ async function pump() {
   const row = workQueue.shift();
   if (!row) return;
   working = true;
+  status.busy = true;
+  writeStatus();
   try {
     await handleMessage(row);
+    status.messages_handled += 1;
   } catch (e) {
     console.error(`[atlas-helper] message ${row.id} failed: ${e.message}`);
+    status.last_error = `${new Date().toISOString()} ${e.message}`.slice(0, 300);
   } finally {
     working = false;
+    status.busy = false;
+    writeStatus();
     if (workQueue.length > 0) setImmediate(pump);
   }
 }
@@ -219,8 +269,12 @@ async function onTaskInsert(rec) {
       ``,
       `Do the work. Your final message is stored as the task result — report what you actually did.`,
     ].join("\n");
+    status.busy = true;
+    writeStatus();
     const result = await runClaude(prompt);
     await rest("PATCH", `task_queue?id=eq.${rec.id}`, { status: "completed", result: result.slice(0, 60_000) });
+    status.tasks_handled += 1;
+    status.busy = false;
     toast("Atlas task completed", rec.title ?? rec.id);
   } catch (e) {
     console.error(`[atlas-helper] task ${rec.id} failed: ${e.message}`);
@@ -289,6 +343,10 @@ function connect() {
     if (msg.event === "phx_reply" && msg.payload?.status === "ok" && msg.topic === TOPIC) {
       console.log("[atlas-helper] Realtime subscription active (agent_messages + task_queue)");
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+      status.connected = true;
+      status.connected_at = new Date().toISOString();
+      status.last_error = null;
+      writeStatus();
       catchUp();
       return;
     }
@@ -304,11 +362,16 @@ function connect() {
 
   ws.on("error", (e) => {
     console.warn(`[atlas-helper] WS error: ${e.message} — reconnecting in 30s`);
+    status.connected = false;
+    status.last_error = `${new Date().toISOString()} WS: ${e.message}`.slice(0, 300);
+    writeStatus();
     cleanup();
     retryTimer = setTimeout(connect, 30_000);
   });
 
   ws.on("close", () => {
+    status.connected = false;
+    writeStatus();
     cleanup();
     retryTimer = setTimeout(connect, 30_000);
   });
