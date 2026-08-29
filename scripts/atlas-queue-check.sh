@@ -33,4 +33,4 @@ echo "$resp" | jq -r '.[] |
   (if .description then "\n  " + (.description | gsub("\n"; " ") | .[0:200]) else "" end)
 '
 echo
-echo "_To claim a task: UPDATE task_queue SET status=in_progress_agent WHERE id=..._"
+echo "_To claim a task: SELECT claim_task('{id}', 'atlas') — see claim_task() function._"
