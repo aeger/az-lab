@@ -2067,7 +2067,12 @@ def recover_stuck_tasks():
             age_ts = task.get("claimed_at") or task.get("updated_at") or task.get("created_at")
             if not age_ts:
                 continue
-            age = datetime.fromisoformat(age_ts.replace("+00", "").replace("Z", "")).replace(tzinfo=timezone.utc)
+            # _parse_iso, not a hand-rolled strip: replace("+00","") turns the
+            # "+00:00" PostgREST returns into a trailing ":00" and fromisoformat
+            # rejects it, which killed the whole sweep.
+            age = _parse_iso(age_ts)
+            if age.tzinfo is None:
+                age = age.replace(tzinfo=timezone.utc)
             if age < cutoff_time:
                 stuck.append(task)
 
