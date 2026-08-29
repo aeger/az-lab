@@ -2043,21 +2043,37 @@ def recover_stuck_tasks():
     """Reset tasks stuck in claimed/in_progress_agent for >30 min with no recent agent_activity."""
     from datetime import timedelta
     try:
-        cutoff_claimed = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
-        stuck = api_request(
+        cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+        cutoff_activity = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+        # Query all in-flight rows; filter in Python to handle NULL claimed_at.
+        # The authoritative age signal is COALESCE(claimed_at, updated_at, created_at).
+        all_inflight = api_request(
             "GET",
             "task_queue",
             params={
                 "status": "in.(claimed,in_progress_agent)",
-                "claimed_at": f"lt.{cutoff_claimed}",
-                "select": "id,title,claimed_at",
-                "limit": "20",
+                "archived_at": "is.null",
+                "select": "id,title,status,claimed_at,updated_at,created_at",
+                "limit": "100",
             },
         )
+        if not all_inflight:
+            return
+
+        stuck = []
+        for task in all_inflight:
+            # Use COALESCE logic: claimed_at → updated_at → created_at
+            age_ts = task.get("claimed_at") or task.get("updated_at") or task.get("created_at")
+            if not age_ts:
+                continue
+            age = datetime.fromisoformat(age_ts.replace("+00", "").replace("Z", "")).replace(tzinfo=timezone.utc)
+            if age < cutoff_time:
+                stuck.append(task)
+
         if not stuck:
             return
 
-        cutoff_activity = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
         recovered = []
         for task in stuck:
             task_id = task["id"]
@@ -2067,7 +2083,7 @@ def recover_stuck_tasks():
                 "agent_activity",
                 params={
                     "task_id": f"eq.{task_id}",
-                    "created_at": f"gt.{cutoff_activity}",
+                    "created_at": f"gt.{cutoff_activity.isoformat()}",
                     "select": "id",
                     "limit": "1",
                 },
@@ -2331,6 +2347,14 @@ def sweep_waiting_tasks():
         print(f"Gate released: {t['id']} ({detail})")
         log_activity("status", f"Gate released → ready: {detail}", task_id=t["id"])
         discord_notify(f"⏰ **Gate released:** {title}\n{detail} — task is now `ready`.")
+
+
+# The zombie-row probe that briefly lived here was moved to anomaly-heartbeat's
+# check_zombie_tasks() (migration 143's task_queue_zombies view). Three reasons:
+# it false-positived on every freshly claimed row (a task claimed 1min ago has no
+# activity in the 30min window), it issued one HTTP request per in-flight row, and
+# it reposted to Discord every 5min with no change-only gating. The heartbeat
+# already owns anomaly dedup and record_anomaly.
 
 
 def main():
