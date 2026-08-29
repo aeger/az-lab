@@ -691,10 +691,11 @@ def claim_next_task():
         params={
             "status": "in.(ready,pending,delegated)",
             "target": "in.(claude-code,wren)",
+            "archived_at": "is.null",
             "or": f"(not_before.is.null,not_before.lte.{now_iso})",
             "order": "priority.asc,created_at.asc",
             "limit": str(_PREFLIGHT_SCAN_LIMIT),
-            "select": "id,title,description,context,priority,tags,status,target,goal_id,attempt_count,error,claimed_at,expires_at,blocked_by_task_ids",
+            "select": "id,title,description,context,priority,tags,status,target,goal_id,attempt_count,error,claimed_at,expires_at,blocked_by_task_ids,result,recurring",
         },
     )
     if not tasks:
@@ -728,6 +729,36 @@ def claim_next_task():
         missing_deps = _dependencies_incomplete(task)
         if missing_deps:
             print(f"Task {task_id} waiting on {len(missing_deps)} incomplete dependenc(ies) — skipped.")
+            continue
+
+        # Idempotency boundary (2026-08-29): a non-recurring task that already
+        # carries a result is finished work — executing it again burns a session
+        # to rediscover that (the c958ef26 four-run loop, traced to dashboard
+        # /status flips). A deliberate re-run must either clear result (the
+        # dashboard reopen path stashes it in context.prior_result) or carry the
+        # premise-accepted tag (premise_decide's sanctioned build-after-verdict).
+        if (
+            not task.get("recurring")
+            and (task.get("result") or "").strip()
+            and "premise-accepted" not in (task.get("tags") or [])
+        ):
+            bounced = api_request(
+                "PATCH",
+                f"task_queue?id=eq.{task_id}&status=eq.{current_status}",
+                data={
+                    "status": "pending_jeff_action",
+                    "blocked_reason": "idempotency guard: non-recurring task already has a result; "
+                                      "re-run refused. Reopen it (which clears result) to run again.",
+                },
+            )
+            if bounced:
+                log_activity(
+                    "status",
+                    f"Idempotency guard: refused re-run of finished task, bounced {current_status} -> pending_jeff_action: "
+                    f"{(task.get('title') or '')[:120]}",
+                    task_id=task_id,
+                )
+                print(f"Task {task_id} has a result and is not recurring — re-run refused, bounced to pending_jeff_action.")
             continue
 
         reasons = preflight_task(task)
