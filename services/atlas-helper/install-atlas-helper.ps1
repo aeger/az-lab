@@ -11,6 +11,10 @@
 
   Before running (elevated PowerShell, from this folder):
     1. Copy config.example.json to config.json and fill in the Supabase keys.
+       IMPORTANT: claude_cwd decides which file-memory root the headless agent
+       uses (Claude Code keys projects/<slug>/memory off the working directory).
+       Point it at the SAME directory your interactive sessions run from, or the
+       agent gets a second, empty memory it writes to and you never read.
     2. Ensure Node is installed:  node --version   (v18+ required)
     3. Toasts work out of the box via the tray. BurntToast is optional:
          Install-Module BurntToast -Scope CurrentUser -Force

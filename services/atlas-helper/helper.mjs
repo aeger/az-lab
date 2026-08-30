@@ -30,7 +30,8 @@ const AGENT = cfg.agent_name || "atlas";
 const CLAUDE_BIN = cfg.claude_bin || "claude";
 const CLAUDE_ARGS = cfg.claude_args || ["-p", "--output-format", "json", "--permission-mode", "acceptEdits"];
 const CLAUDE_CWD = cfg.claude_cwd || process.env.USERPROFILE || HERE;
-const CLAUDE_TIMEOUT_MS = cfg.claude_timeout_ms || 300_000;
+const CLAUDE_TIMEOUT_MS = cfg.claude_timeout_ms || 300_000;          // chat replies: short
+const TASK_TIMEOUT_MS   = cfg.task_timeout_ms   || 1_500_000;        // queue tasks: 25 min — real work takes longer than a chat turn
 const AUTO_EXECUTE_TASKS = cfg.auto_execute_tasks === true;
 const TOAST = cfg.toast !== false;
 // Max auto-reply depth per thread — the loop breaker (2026-08-29 ping-pong).
@@ -246,7 +247,7 @@ function killTree(child) {
   } catch { /* best effort */ }
 }
 
-function runClaude(prompt) {
+function runClaude(prompt, timeoutMs = CLAUDE_TIMEOUT_MS) {
   return new Promise((resolve) => {
     const child = spawn(CLAUDE_BIN, CLAUDE_ARGS, {
       stdio: ["pipe", "pipe", "pipe"],
@@ -260,6 +261,10 @@ function runClaude(prompt) {
     // resolves, `working` stays true and the FIFO stalls permanently — the
     // helper goes silent while still looking connected.
     let settled = false;
+    let timedOut = false;
+    const timeoutText = () =>
+      `(atlas-helper: claude timed out after ${Math.round(timeoutMs / 1000)}s and was killed. ` +
+      `Partial output: ${(out || "(none)").slice(0, 500)}${err ? ` | stderr: ${err.slice(0, 300)}` : ""})`;
     const finish = (res) => {
       if (settled) return;
       settled = true;
@@ -272,6 +277,8 @@ function runClaude(prompt) {
     // 826315cb ended up 'completed' with body "Failed to authenticate"
     // (2026-08-29). Claude's JSON carries is_error/subtype; trust those.
     const parseOut = (code) => {
+      // A kill we initiated must never be reported as a plain non-zero exit.
+      if (timedOut) return { ok: false, text: timeoutText() };
       if (code !== 0 && !out) {
         return { ok: false, text: `(atlas-helper error: session exited ${code}${err ? `: ${err.slice(0, 300)}` : ""})` };
       }
@@ -290,15 +297,13 @@ function runClaude(prompt) {
     };
 
     const timer = setTimeout(() => {
-      console.warn(`[atlas-helper] claude timed out after ${CLAUDE_TIMEOUT_MS}ms — killing process tree`);
+      timedOut = true;
+      console.warn(`[atlas-helper] claude timed out after ${timeoutMs}ms — killing process tree`);
       killTree(child);
       // Do NOT wait for 'close' here: a surviving grandchild can hold the pipes
       // open and 'close' would never fire.
-      setTimeout(() => finish({ ok: false, text:
-        `(atlas-helper: claude timed out after ${Math.round(CLAUDE_TIMEOUT_MS / 1000)}s and was killed. ` +
-        `Partial output: ${(out || "(none)").slice(0, 500)}${err ? ` | stderr: ${err.slice(0, 300)}` : ""})`
-      }), 2_000);
-    }, CLAUDE_TIMEOUT_MS);
+      setTimeout(() => finish({ ok: false, text: timeoutText() }), 2_000);
+    }, timeoutMs);
 
     child.stdout.on("data", d => { out += d; });
     child.stderr.on("data", d => { err += d; });
@@ -358,7 +363,7 @@ async function onTaskInsert(rec) {
     ].join("\n");
     status.busy = true;
     writeStatus();
-    const { ok, text: result } = await runClaude(prompt);
+    const { ok, text: result } = await runClaude(prompt, TASK_TIMEOUT_MS);
     if (!ok) {
       // A failed session must NEVER be recorded as completed work. Send it back
       // to the queue as failed with the error preserved, so it stays visible.

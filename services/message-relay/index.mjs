@@ -232,6 +232,10 @@ function runClaude(row) {
     // leaves `working` true and stalls the FIFO permanently — the relay goes
     // silent while still looking connected. (Hit on the Atlas side 2026-08-29.)
     let settled = false;
+    let timedOut = false;
+    const timeoutText = () =>
+      `(relay: claude timed out after ${Math.round(CLAUDE_TIMEOUT_MS / 1000)}s and was killed. ` +
+      `Partial output: ${(out || "(none)").slice(0, 500)}${err ? ` | stderr: ${err.slice(0, 300)}` : ""})`;
     const finish = (res) => {
       if (settled) return;
       settled = true;
@@ -242,6 +246,8 @@ function runClaude(row) {
     // {ok, text} — ok must mean the session genuinely succeeded. Claude's JSON
     // carries is_error/subtype; an error string is not a result.
     const parseOut = (code) => {
+      // A kill we initiated must not be reported as a plain non-zero exit.
+      if (timedOut) return { ok: false, text: timeoutText() };
       if (code !== 0 && !out) {
         return { ok: false, text: `(relay error: session exited ${code}${err ? `: ${err.slice(0, 300)}` : ""})` };
       }
@@ -260,12 +266,10 @@ function runClaude(row) {
     };
 
     const timer = setTimeout(() => {
+      timedOut = true;
       console.warn(`[relay] claude timed out after ${CLAUDE_TIMEOUT_MS}ms — killing`);
       try { child.kill("SIGKILL"); } catch { /* best effort */ }
-      setTimeout(() => finish({ ok: false, text:
-        `(relay: claude timed out after ${Math.round(CLAUDE_TIMEOUT_MS / 1000)}s and was killed. ` +
-        `Partial output: ${(out || "(none)").slice(0, 500)}${err ? ` | stderr: ${err.slice(0, 300)}` : ""})`
-      }), 2_000);
+      setTimeout(() => finish({ ok: false, text: timeoutText() }), 2_000);
     }, CLAUDE_TIMEOUT_MS);
 
     child.stdout.on("data", d => { out += d; });

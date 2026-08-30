@@ -4,9 +4,17 @@
   "supabase_secret_key": "PASTE_SUPABASE_SECRET_KEY",
   "agent_name": "atlas",
   "claude_bin": "claude",
-  "claude_args": ["-p", "--output-format", "json", "--permission-mode", "acceptEdits"],
-  "claude_cwd": "C:\\Users\\almty",
+  "claude_args": [
+    "-p",
+    "--output-format",
+    "json",
+    "--permission-mode",
+    "acceptEdits"
+  ],
+  "claude_cwd": "C:\\Users\\almty\\OneDrive\\Documents\\Projects",
   "claude_timeout_ms": 300000,
+  "task_timeout_ms": 1500000,
   "auto_execute_tasks": false,
-  "toast": true
+  "toast": true,
+  "max_hops": 3
 }
