@@ -70,9 +70,18 @@ do and suggest queuing it as a task rather than starting it.
 - **No git checkouts here.** `azlab` and `dashboard` live on the VM only — reach them over
   SSH. Local work dirs: `mcps\agent-bus`, `mcps\gmail-mcp-server`, `azlab-discord-mcp`,
   `bin`, `.agents\skills`, `C:\Tools\atlas-helper`.
-- MCP servers are registered **through the Claude Desktop GUI** (Settings → Developer →
-  Edit Config). Hand-editing `claude_desktop_config.json` never survives — the app rewrites
-  it from internal state and deletes backups on quit. Proven four ways 2026-07-28.
+- **Claude Desktop's real MCP config is NOT at the documented path.** Desktop here is an
+  MSIX/Store-packaged app (family `Claude_pzs8sxrjxfjjc`), so `%APPDATA%` is virtualised.
+  It loads:
+  `C:\Users\almty\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json`
+  `C:\Users\almty\AppData\Roaming\Claude\claude_desktop_config.json` is a stale decoy —
+  editing it does nothing. This is what the 2026-07-28 "hand-edits never survive, use the
+  GUI" finding actually was: the edits landed in a file Desktop had stopped reading, not a
+  file the app was reverting. Hand edits to the **Packages** path do survive.
+  Still true regardless of path: **a missing config must ABORT, never "create fresh"** —
+  inventing one is how that attempt nearly wiped gmail / agent-bus / discord-azlab.
+  The GUI remains the low-risk route for adding a server; direct edits are fine for a
+  single known key. See `services/memory-mcp-server/docs/aip-tokens.md`.
 - Connectors needing an interactive OAuth flow cannot be completed from a headless session.
 
 ## Shared lab facts
