@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodic qBittorrent listen-port sync (gluetun forwarded port)
+
+[Timer]
+# 2 min after boot/login so the downloads stack has settled, then every 10 min.
+# The sync is a no-op read when nothing has drifted, so this is cheap.
+OnBootSec=2min
+OnUnitActiveSec=10min
+# Catch up after the machine was asleep/off rather than waiting a full interval.
+Persistent=true
+Unit=sync-qbit-port.service
+
+[Install]
+WantedBy=timers.target
