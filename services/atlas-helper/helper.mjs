@@ -471,6 +471,11 @@ function connect() {
   });
 }
 
+// Realtime only delivers INSERTs, so a row that becomes ours by UPDATE — a
+// task restored from a bad run, or retargeted to atlas — would sit unseen until
+// the next reconnect. Sweep every 5 minutes so the queue cannot go quiet on us.
+setInterval(() => { catchUp().catch(() => {}); }, 5 * 60_000).unref?.();
+
 console.log(`[atlas-helper] starting — agent=${AGENT}, claude=${CLAUDE_BIN}, auto_execute_tasks=${AUTO_EXECUTE_TASKS}`);
 connect();
 process.on("SIGTERM", () => { cleanup(); process.exit(0); });
