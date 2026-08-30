@@ -68,10 +68,39 @@ function Get-Status {
 }
 
 # -- Tray icon ----------------------------------------------------------------
-# SystemIcons are always present - no icon file to ship or lose.
-$IconOk   = [System.Drawing.SystemIcons]::Information
-$IconBusy = [System.Drawing.SystemIcons]::Application
-$IconBad  = [System.Drawing.SystemIcons]::Error
+# Drawn, not shipped: a flat coloured dot per state. The stock SystemIcons
+# (Information / Application / Error) were too similar to read at a glance -
+# the tray looked frozen on the blue "i" because "connected and idle" is the
+# state ~99% of the time and the busy window is only ~10s.
+#   green = connected, idle      amber = busy (claude running)      red = down
+function New-DotIcon {
+  param([int]$R, [int]$G, [int]$B)
+  $bmp = New-Object System.Drawing.Bitmap 16, 16
+  $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+  $gfx.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+  $gfx.Clear([System.Drawing.Color]::Transparent)
+  $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, $R, $G, $B))
+  $pen   = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(140, 0, 0, 0)), 1
+  $gfx.FillEllipse($brush, 1, 1, 13, 13)
+  $gfx.DrawEllipse($pen,   1, 1, 13, 13)
+  $gfx.Dispose(); $brush.Dispose(); $pen.Dispose()
+  # Three icons are created once for the life of the process, so the handles
+  # they hold are not worth a P/Invoke to DestroyIcon.
+  $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+  $bmp.Dispose()
+  return $icon
+}
+
+try {
+  $IconOk   = New-DotIcon  46 204 113   # green
+  $IconBusy = New-DotIcon 241 196  15   # amber
+  $IconBad  = New-DotIcon 231  76  60   # red
+} catch {
+  # Any GDI oddity: fall back to stock icons rather than run without a tray.
+  $IconOk   = [System.Drawing.SystemIcons]::Information
+  $IconBusy = [System.Drawing.SystemIcons]::Application
+  $IconBad  = [System.Drawing.SystemIcons]::Error
+}
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Icon = $IconBad
