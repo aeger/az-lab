@@ -306,7 +306,16 @@ function runClaude(prompt) {
     // 'exit' fires when the process ends even if stdio pipes are still held
     // open by a descendant; 'close' fires once the pipes drain. Take whichever
     // comes first, giving 'exit' a short grace period to collect trailing output.
-    child.on("exit", (code) => {
+    child.on("exit", (code, signal) => {
+      // Log the full spawn context on any non-zero exit: an "exited 1" with no
+      // stdout and no stderr is otherwise undiagnosable from the queue row.
+      if (code !== 0) {
+        console.error(`[atlas-helper] claude exited code=${code} signal=${signal} ` +
+          `bin=${CLAUDE_BIN} args=${JSON.stringify(CLAUDE_ARGS)} cwd=${CLAUDE_CWD} ` +
+          `stdout=${out.length}b stderr=${err.length}b prompt=${prompt.length}b` +
+          (err ? ` stderr_text=${err.slice(0, 500)}` : "") +
+          (out ? ` stdout_head=${out.slice(0, 300)}` : ""));
+      }
       setTimeout(() => finish(parseOut(code)), 1_000);
     });
     child.on("close", (code) => finish(parseOut(code)));
