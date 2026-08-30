@@ -63,7 +63,10 @@ do and suggest queuing it as a task rather than starting it.
 
 - `claude` 2.1.251, `node` v22.20.0, user `almty`, host `DESKTOP-OFFICEMAIN`.
 - **File-based memory root on this machine:**
-  `C:\Users\almty\.claude\projects\C--Users-almty\memory\` (MEMORY.md is loaded each session).
+  `C:\Users\almty\.claude\projects\C--Users-almty-OneDrive-Documents-Projects\memory\`
+  (MEMORY.md is loaded each session). Claude Code keys this off **cwd**, so headless Relay
+  sessions only share this root because `claude_cwd` in `C:\Tools\atlas-helper\config.json`
+  is pinned to the same path. Change one without the other and the two lanes split.
 - **No git checkouts here.** `azlab` and `dashboard` live on the VM only — reach them over
   SSH. Local work dirs: `mcps\agent-bus`, `mcps\gmail-mcp-server`, `azlab-discord-mcp`,
   `bin`, `.agents\skills`, `C:\Tools\atlas-helper`.
