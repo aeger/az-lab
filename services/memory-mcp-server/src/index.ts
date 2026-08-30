@@ -437,6 +437,24 @@ function textSimilarity(a: string, b: string): number {
   return union === 0 ? 1 : intersection / union;
 }
 
+// An APPEND is not a duplicate. Jaccard is set-based, so a superset scores as
+// "unchanged" — adding a 100-word section to a 1000-word memory lands around
+// 0.91, over the 0.85 NOOP threshold, and the write was silently dropped while
+// returning a success-shaped message. Found 2026-08-30 by Atlas, and it is why
+// every prior "RE-VERIFIED" appendix had to go in by direct SQL.
+function isMaterialExtension(oldText: string, newText: string): boolean {
+  const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+  const o = norm(oldText);
+  const n = norm(newText);
+  if (n.length <= o.length) return false;      // not longer → not an append
+  const grew = n.length - o.length;
+  // Old text carried through verbatim = an append or an in-place edit + append.
+  if (n.includes(o)) return true;
+  // Otherwise require the growth itself to be material, so a reworded near-copy
+  // still NOOPs but a real addition never does.
+  return grew >= 200 || grew / Math.max(o.length, 1) >= 0.05;
+}
+
 function levenshtein(a: string, b: string): number {
   const m = a.length, n = b.length;
   const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>
@@ -1643,7 +1661,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       const embedText = embedInput(name, description, content);
       const embedHash = contentHashOf(embedText);
       if (existing && existing.content_hash && existing.content_hash === embedHash) {
-        return { content: [{ type: "text" as const, text: `NOOP: Memory "${name}" is byte-identical (SHA-256 match) to the stored version — embedding reused, no write.` }] };
+        return { content: [{ type: "text" as const, text: `NOT WRITTEN — NOOP: "${name}" is byte-identical (SHA-256) to the stored version, so nothing was saved and the embedding was reused.` }] };
       }
 
       const embedding = await embed(embedText);
@@ -1651,9 +1669,15 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
 
       // ── Same-name path ──────────────────────────────────────────────────────
       if (existing) {
-        // Mem0 NOOP: content is essentially unchanged — skip write
-        if (existing.content && textSimilarity(existing.content, content) >= 0.85) {
-          return { content: [{ type: "text" as const, text: `NOOP: Memory "${name}" content is unchanged (Jaccard ≥ 85%). No write needed.` }] };
+        // Mem0 NOOP: content is essentially unchanged — skip write.
+        // An append must never land here (see isMaterialExtension).
+        if (existing.content
+            && textSimilarity(existing.content, content) >= 0.85
+            && !isMaterialExtension(existing.content, content)) {
+          return { content: [{ type: "text" as const, text:
+            `NOT WRITTEN — NOOP: "${name}" is ≥85% similar to the stored version and adds no material content, ` +
+            `so nothing was saved. If you meant to APPEND, the new text must contain the old text or add ` +
+            `>200 chars; if you meant to REPLACE a claim, use supersede_memory.` }] };
         }
 
         // ── Rec 3: Concurrent write detection (last-write-wins with conflict logging) ──
