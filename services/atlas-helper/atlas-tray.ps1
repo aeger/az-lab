@@ -120,6 +120,25 @@ $miAuto.add_Click({
   }
 })
 
+# "Restart Helper" re-spawns node and therefore picks up a new helper.mjs, but
+# it does NOT reload THIS script - PowerShell holds atlas-tray.ps1 as loaded at
+# launch. Updating the tray itself needs a full relaunch, which is what this does.
+$miReload = $menu.Items.Add('Reload Tray Script (full restart)')
+$miReload.add_Click({
+  try {
+    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+      '-NoProfile','-Command',
+      "Start-Sleep -Seconds 3; Start-ScheduledTask -TaskName 'Atlas Relay Helper'"
+    )
+    Stop-Helper
+    $notify.Visible = $false
+    $notify.Dispose()
+    [System.Windows.Forms.Application]::Exit()
+  } catch {
+    [System.Windows.Forms.MessageBox]::Show("Could not reload: $_") | Out-Null
+  }
+})
+
 $menu.Items.Add('-') | Out-Null
 $miExit = $menu.Items.Add('Exit (stops the helper)')
 $miExit.add_Click({

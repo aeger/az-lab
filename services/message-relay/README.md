@@ -57,3 +57,18 @@ Reply loops are prevented structurally: the relay ignores messages from
 - `claude-queue-realtime.service` — disable after this is live.
 - `memory-realtime.service` — same Python-lib zombie; memory-sync is already
   covered by the working TS listener inside memory-mcp-server.
+
+## Updating the Atlas helper (Windows)
+
+The tray and the listener reload differently, which is easy to get wrong:
+
+| You changed | What picks it up |
+|---|---|
+| `helper.mjs` | tray right-click -> **Restart Helper** (re-spawns node from disk) |
+| `config.json` | **Restart Helper**, or the **Auto-execute tasks** toggle (which restarts for you) |
+| `atlas-tray.ps1` | tray right-click -> **Reload Tray Script (full restart)** — PowerShell holds the script as loaded at launch, so "Restart Helper" alone will NOT pick up tray changes |
+
+Runtime dir is `C:\Tools\atlas-helper\` (what the "Atlas Relay Helper" Scheduled Task
+executes). `Downloads\atlas-helper` is only the staging copy you run the installer from —
+copy updated files into `C:\Tools\atlas-helper\` (or re-run the installer, which is
+idempotent and reuses the existing `config.json`).
