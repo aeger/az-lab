@@ -3,7 +3,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { createHash, createHmac } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 import WebSocket from "ws";
 import express, { Request, Response } from "express";
 import { z } from "zod";
@@ -29,25 +29,111 @@ const HA_TOKEN = process.env.HA_TOKEN || "";
 // Agents sign requests with HS256 JWTs. If AIP_SECRET is set, write ops will
 // stamp the verified caller identity as `source`/`updated_by` instead of
 // trusting the client-supplied value.
+//
+// AIP is ATTRIBUTION, not admission. Reaching this server at all is gated by
+// Traefik's lan-allow@file middleware: an unauthenticated LAN caller already
+// has every tool. What a token buys is a *trusted* identity stamp — which is
+// what feeds the trust lane in hybrid recall — and, when the token carries a
+// `scope` claim, a reduced blast radius if the token leaks. Read that second
+// clause carefully before treating a scope as a security boundary: dropping
+// the Authorization header entirely still gets you in, just unattributed.
 const AIP_SECRET = process.env.AIP_SECRET || "";
+const AIP_ISSUER = process.env.AIP_ISSUER || "az-lab";
+// Hard ceiling on token lifetime, checked against the token's own exp-iat span.
+// An over-long token stops verifying the moment this build ships — no rotation
+// of the shared secret required. That is the revocation path for the 365-day
+// tokens minted before this check existed. Raise only deliberately.
+const AIP_MAX_TTL_SECONDS = parseInt(process.env.AIP_MAX_TTL_DAYS || "30", 10) * 86400;
+const AIP_CLOCK_SKEW_SECONDS = 120;
 
-function verifyAipJwt(token: string): { sub: string } | null {
+// Scope names. A token with no `scope` claim is unrestricted (legacy tokens
+// keep working); a token that has one is held to it. Only the destructive lane
+// and HA control are enforced — gating read/write would be theatre, since an
+// anonymous caller can already do both.
+const AIP_SCOPE_ADMIN = "memory:admin";
+const AIP_SCOPE_HA = "ha:control";
+
+type AipCaller = { sub: string; scopes: string[] | null };
+
+function normalizeScopes(raw: unknown): string[] | null {
+  if (typeof raw === "string") {
+    const parts = raw.split(/[\s,]+/).filter(Boolean);
+    return parts.length ? parts : null;
+  }
+  if (Array.isArray(raw)) {
+    const parts = raw.filter((x): x is string => typeof x === "string" && !!x);
+    return parts.length ? parts : null;
+  }
+  return null;
+}
+
+function verifyAipJwt(token: string): AipCaller | null {
   if (!AIP_SECRET) return null;
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return null;
     const [headerB64, payloadB64, sigB64] = parts;
+
+    // Pin the algorithm. The signature below is always recomputed as HS256, so
+    // an "alg": "none" token could never have passed anyway, but rejecting it
+    // by name keeps the failure legible in the log.
+    const header = JSON.parse(Buffer.from(headerB64, "base64url").toString("utf-8"));
+    if (header?.alg !== "HS256") {
+      console.warn(`[aip] rejected token: alg "${header?.alg}" is not HS256`);
+      return null;
+    }
+    if (header?.typ && header.typ !== "JWT") return null;
+
     const expected = createHmac("sha256", AIP_SECRET)
       .update(`${headerB64}.${payloadB64}`)
-      .digest("base64url");
-    if (expected !== sigB64) return null;
+      .digest();
+    const actual = Buffer.from(sigB64, "base64url");
+    if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) return null;
+
     const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf-8"));
-    if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) return null;
+    const now = Math.floor(Date.now() / 1000);
+
     if (!payload.sub || typeof payload.sub !== "string") return null;
-    return { sub: payload.sub };
+    if (payload.iss !== AIP_ISSUER) {
+      console.warn(`[aip] rejected token for "${payload.sub}": iss "${payload.iss}" != "${AIP_ISSUER}"`);
+      return null;
+    }
+    // exp and iat are both mandatory: without exp the token is a permanent
+    // credential, and without iat its lifetime cannot be measured.
+    if (typeof payload.exp !== "number" || typeof payload.iat !== "number") {
+      console.warn(`[aip] rejected token for "${payload.sub}": missing exp and/or iat`);
+      return null;
+    }
+    if (now > payload.exp + AIP_CLOCK_SKEW_SECONDS) return null;
+    if (payload.iat > now + AIP_CLOCK_SKEW_SECONDS) return null;
+    if (typeof payload.nbf === "number" && now + AIP_CLOCK_SKEW_SECONDS < payload.nbf) return null;
+    if (payload.exp - payload.iat > AIP_MAX_TTL_SECONDS) {
+      console.warn(
+        `[aip] rejected token for "${payload.sub}": lifetime ${Math.round((payload.exp - payload.iat) / 86400)}d ` +
+        `exceeds the ${AIP_MAX_TTL_SECONDS / 86400}d ceiling — re-mint with mint-aip-token.mjs`
+      );
+      return null;
+    }
+
+    return { sub: payload.sub, scopes: normalizeScopes(payload.scope) };
   } catch {
     return null;
   }
+}
+
+// Returns a tool-shaped refusal when the caller presented a scoped token that
+// does not cover `required`, or null when the call may proceed. Unverified
+// callers and unscoped tokens proceed — see the attribution note above.
+function scopeDenied(caller: AipCaller | null, required: string, tool: string) {
+  if (!caller?.scopes) return null;
+  if (caller.scopes.includes(required) || caller.scopes.includes("memory:*")) return null;
+  console.warn(`[aip] denied ${tool} for "${caller.sub}" — token lacks scope "${required}"`);
+  return {
+    content: [{
+      type: "text" as const,
+      text: `Denied: the "${caller.sub}" token is not scoped for ${tool} (requires "${required}"). Re-mint with that scope if this is intended.`,
+    }],
+  };
 }
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -1517,7 +1603,7 @@ function startEmbeddingBackfillJob(supabase: any): void {
 // package.json. Two separate literals used to carry this — the MCP handshake and
 // GET /health — and on 2026-08-05 the /health one was missed on a version bump,
 // so the endpoint every dashboard and research run reads was a release behind.
-const SERVER_VERSION = "5.21.0";
+const SERVER_VERSION = "5.22.0";
 
 // ── Episode claim registry ───────────────────────────────────────────────────
 // Keyed by episode id, NOT a shared consult buffer — the consult ids themselves
@@ -1541,7 +1627,8 @@ function claimEpisodesHeldByOthers(sessionKey: string): string[] {
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
-function createMcpServer(callerIdentity: string | null = null): McpServer {
+function createMcpServer(caller: AipCaller | null = null): McpServer {
+  const callerIdentity: string | null = caller?.sub ?? null;
   // ── Recall → episode consult correlation ───────────────────────────────────
   // `agent_episodes.memories_consulted` has been in record_episode's schema since
   // migration 059 and was populated exactly 0 times across 274 episodes: it is an
@@ -2386,6 +2473,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       name: z.string().describe("Exact name of the memory to delete"),
     },
     async ({ name }) => {
+      const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "forget");
+      if (denied) return denied;
       const { data: existing } = await supabase
         .from("memories")
         .select("id")
@@ -2416,6 +2505,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       reason: z.string().optional().describe("Why the supersession (e.g. 'IP address changed', 'service migrated to new host')"),
     },
     async ({ old_name, new_name, reason }) => {
+      const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "supersede_memory");
+      if (denied) return denied;
       const { data: oldMem } = await supabase.from("memories").select("id").eq("name", old_name).maybeSingle();
       if (!oldMem) return { content: [{ type: "text" as const, text: `No memory found with name "${old_name}"` }] };
       const { data: newMem } = await supabase.from("memories").select("id").eq("name", new_name).maybeSingle();
@@ -2752,6 +2843,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         filename: z.string().describe("Exact filename to delete"),
       },
       async ({ filename }) => {
+        const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "forget_file");
+        if (denied) return denied;
         const { data: file } = await supabase
           .from("memory_files")
           .select("id, r2_key")
@@ -3163,6 +3256,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       name: z.string().describe("Exact skill name to delete"),
     },
     async ({ name }) => {
+      const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "delete_skill");
+      if (denied) return denied;
       const { error } = await supabase.from("skills").delete().eq("name", name);
       if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
       console.log(`[aip] delete_skill "${name}" by ${callerIdentity || "unverified"}`);
@@ -3235,6 +3330,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       merged_content: z.string().optional().describe("Replacement content for the primary memory after merge. If omitted, primary content is unchanged."),
     },
     async ({ primary_name, secondary_name, merged_content }) => {
+      const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "merge_memories");
+      if (denied) return denied;
       // Fetch both
       const { data: primary } = await supabase.from("memories").select("id, type, description, content, tags, source, version").eq("name", primary_name).maybeSingle();
       const { data: secondary } = await supabase.from("memories").select("id, tags, content").eq("name", secondary_name).maybeSingle();
@@ -3319,6 +3416,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       dry_run: z.boolean().optional().describe("Preview what would be discarded without deleting (default false)"),
     },
     async ({ threshold = 0.92, max_discards = 10, dry_run = false }) => {
+      const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "discard_redundant");
+      if (denied) return denied;
       const { data, error } = await supabase.rpc("discard_redundant_memories", {
         p_similarity_threshold: threshold,
         p_max_discards: max_discards,
@@ -3493,6 +3592,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         data: z.record(z.unknown()).optional().describe("Additional service data (e.g. temperature, brightness, hvac_mode)"),
       },
       async ({ domain, service, entity_id, data }) => {
+        const denied = scopeDenied(caller, AIP_SCOPE_HA, "ha_call_service");
+        if (denied) return denied;
         const payload: Record<string, unknown> = { ...data };
         if (entity_id) payload.entity_id = entity_id;
         await haFetch(`/services/${domain}/${service}`, "POST", payload);
@@ -3717,15 +3818,15 @@ app.get("/health", (_req: Request, res: Response) => {
 const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
 
 app.post("/mcp", async (req: Request, res: Response) => {
-  // AIP: extract and verify caller-identity JWT from Authorization header
-  let callerIdentity: string | null = null;
+  // AIP: extract and verify caller-identity JWT from Authorization header.
+  // Scopes are pinned at session establishment, not re-checked per request —
+  // a token that expires mid-session keeps the session it opened.
+  let caller: AipCaller | null = null;
   const authHeader = req.headers.authorization || "";
   if (authHeader.startsWith("Bearer ") && AIP_SECRET) {
-    const token = authHeader.slice(7);
-    const payload = verifyAipJwt(token);
-    if (payload) {
-      callerIdentity = payload.sub;
-      console.log(`[aip] verified caller: ${callerIdentity}`);
+    caller = verifyAipJwt(authHeader.slice(7));
+    if (caller) {
+      console.log(`[aip] verified caller: ${caller.sub} scopes=${caller.scopes ? `[${caller.scopes.join(" ")}]` : "(unscoped)"}`);
     } else {
       console.warn("[aip] invalid/expired JWT presented — caller unverified");
     }
@@ -3741,7 +3842,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
   // New session — new server instance with verified caller identity bound
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
-  const server = createMcpServer(callerIdentity);
+  const server = createMcpServer(caller);
   if (!cachedToolCount) cachedToolCount = getToolCount(server);
 
   transport.onclose = () => {

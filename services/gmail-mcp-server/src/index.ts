@@ -1075,7 +1075,7 @@ async function main(): Promise<void> {
 
   // Health check
   app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', service: 'gmail-mcp-server', version: '1.3.0' })
+    res.json({ status: 'ok', service: 'gmail-mcp-server', version: '1.4.0' })
   })
 
   // ── Gmail OAuth reauth flow ───────────────────────────────────────────────────
@@ -1165,6 +1165,26 @@ async function main(): Promise<void> {
     await server.connect(transport)
     await transport.handleRequest(req, res, req.body)
   })
+
+  // GET/DELETE /mcp — this server is deliberately stateless: no sessions, and
+  // no server-initiated messages anywhere in it (no resources, no progress, no
+  // logging notifications), so there is nothing for an SSE stream to carry.
+  //
+  // Answer 405, not 404. Streamable HTTP clients treat 405 as "this server does
+  // not offer the GET stream" and move on silently, but surface any other
+  // status as a transport error — which is why leaving these unrouted made
+  // Express's default 404 spam `StreamableHTTPError: Failed to open SSE stream`
+  // into the Claude Desktop log on every startup. If this server ever grows
+  // notifications, replace this with a real session map (see memory-mcp-server).
+  const noStream = (_req: express.Request, res: express.Response): void => {
+    res.status(405).set('Allow', 'POST').json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method Not Allowed: this server does not offer an SSE stream.' },
+      id: null,
+    })
+  }
+  app.get('/mcp', noStream)
+  app.delete('/mcp', noStream)
 
   const port = parseInt(process.env.PORT ?? '3000', 10)
   app.listen(port, '0.0.0.0', () => {

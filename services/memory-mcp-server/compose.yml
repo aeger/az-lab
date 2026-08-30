@@ -59,9 +59,14 @@ services:
       - HA_URL=${HA_URL}
       - HA_TOKEN=${HA_TOKEN}
       # AIP: Agent Identity Protocol — shared HS256 secret for caller-identity JWTs
-      # Agents sign: {"sub":"wren","iss":"az-lab","iat":<unix>,"exp":<unix+3600>}
+      # Agents sign: {"sub":"wren","iss":"az-lab","iat":<unix>,"exp":<unix+3600>,"scope":"memory:read memory:write"}
+      # Mint with ./mint-aip-token.mjs; see docs/aip-tokens.md.
       # If unset, AIP verification is disabled (backward-compatible)
       - AIP_SECRET=${AIP_SECRET:-}
+      - AIP_ISSUER=${AIP_ISSUER:-az-lab}
+      # Ceiling on token lifetime, enforced against the token's own exp-iat span.
+      # Raising this re-admits every over-long token already in circulation.
+      - AIP_MAX_TTL_DAYS=${AIP_MAX_TTL_DAYS:-30}
     depends_on:
       rerank-onnx:
         condition: service_healthy
