@@ -35,6 +35,7 @@ const AUTO_EXECUTE_TASKS = cfg.auto_execute_tasks === true;
 const TOAST = cfg.toast !== false;
 // Max auto-reply depth per thread — the loop breaker (2026-08-29 ping-pong).
 const MAX_HOPS = Number(cfg.max_hops || 3);
+const AUTH_FAIL_RE = /Failed to authenticate|OAuth session expired|API Error|Invalid API key|401/i;
 
 if (!SUPABASE_URL || !ANON_KEY || !SECRET_KEY) {
   console.error("[atlas-helper] config.json needs supabase_url, supabase_publishable_key, supabase_secret_key");
@@ -191,11 +192,11 @@ async function handleMessage(row) {
     return;
   }
 
-  const reply = await runClaude(framePrompt(row));
+  const { ok, text: reply } = await runClaude(framePrompt(row));
   const tk = threadKey(row);
   repliesByThread.set(tk, (repliesByThread.get(tk) || 0) + 1);
   if (repliesByThread.size > 2000) repliesByThread.clear();
-  const isErr = /^\(atlas-helper|^\(relay|Failed to authenticate|API Error|OAuth session expired/i.test(String(reply).trim());
+  const isErr = !ok;
   await rest("POST", "agent_messages", {
     from_agent: AGENT,
     to_agent: row.from_agent,
@@ -259,22 +260,32 @@ function runClaude(prompt) {
     // resolves, `working` stays true and the FIFO stalls permanently — the
     // helper goes silent while still looking connected.
     let settled = false;
-    const finish = (text) => {
+    const finish = (res) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(text);
+      resolve(typeof res === "string" ? { ok: false, text: res } : res);
     };
 
+    // Returns {ok, text}. `ok` must mean the session genuinely succeeded — a
+    // failed run whose error text got recorded as a task RESULT is how task
+    // 826315cb ended up 'completed' with body "Failed to authenticate"
+    // (2026-08-29). Claude's JSON carries is_error/subtype; trust those.
     const parseOut = (code) => {
       if (code !== 0 && !out) {
-        return `(atlas-helper error: session exited ${code}${err ? `: ${err.slice(0, 300)}` : ""})`;
+        return { ok: false, text: `(atlas-helper error: session exited ${code}${err ? `: ${err.slice(0, 300)}` : ""})` };
       }
       try {
         const parsed = JSON.parse(out);
-        return parsed.result ?? parsed.text ?? out.slice(0, 4000);
+        const text = parsed.result ?? parsed.text ?? out.slice(0, 4000);
+        const ok = code === 0 &&
+                   parsed.is_error !== true &&
+                   (parsed.subtype === undefined || parsed.subtype === "success") &&
+                   !AUTH_FAIL_RE.test(String(text));
+        return { ok, text };
       } catch {
-        return out.trim().slice(0, 4000) || `(atlas-helper: empty response, exit ${code}${err ? `: ${err.slice(0, 300)}` : ""})`;
+        const text = out.trim().slice(0, 4000) || `(atlas-helper: empty response, exit ${code}${err ? `: ${err.slice(0, 300)}` : ""})`;
+        return { ok: false, text };
       }
     };
 
@@ -283,10 +294,10 @@ function runClaude(prompt) {
       killTree(child);
       // Do NOT wait for 'close' here: a surviving grandchild can hold the pipes
       // open and 'close' would never fire.
-      setTimeout(() => finish(
+      setTimeout(() => finish({ ok: false, text:
         `(atlas-helper: claude timed out after ${Math.round(CLAUDE_TIMEOUT_MS / 1000)}s and was killed. ` +
         `Partial output: ${(out || "(none)").slice(0, 500)}${err ? ` | stderr: ${err.slice(0, 300)}` : ""})`
-      ), 2_000);
+      }), 2_000);
     }, CLAUDE_TIMEOUT_MS);
 
     child.stdout.on("data", d => { out += d; });
@@ -300,7 +311,7 @@ function runClaude(prompt) {
     });
     child.on("close", (code) => finish(parseOut(code)));
     child.on("error", (e) => {
-      finish(`(atlas-helper error: failed to spawn claude: ${e.message})`);
+      finish({ ok: false, text: `(atlas-helper error: failed to spawn claude: ${e.message})` });
     });
     child.stdin.write(prompt);
     child.stdin.end();
@@ -338,7 +349,23 @@ async function onTaskInsert(rec) {
     ].join("\n");
     status.busy = true;
     writeStatus();
-    const result = await runClaude(prompt);
+    const { ok, text: result } = await runClaude(prompt);
+    if (!ok) {
+      // A failed session must NEVER be recorded as completed work. Send it back
+      // to the queue as failed with the error preserved, so it stays visible.
+      await rest("PATCH", `task_queue?id=eq.${rec.id}`, {
+        status: "failed",
+        error: `atlas-helper: session did not succeed — ${String(result).slice(0, 500)}`,
+        claimed_by: null,
+        claimed_at: null,
+      });
+      status.busy = false;
+      status.last_error = `${new Date().toISOString()} task ${rec.id} failed: ${String(result).slice(0, 200)}`;
+      writeStatus();
+      toast("Atlas task FAILED", rec.title ?? rec.id);
+      console.error(`[atlas-helper] task ${rec.id} failed: ${String(result).slice(0, 200)}`);
+      return;
+    }
     await rest("PATCH", `task_queue?id=eq.${rec.id}`, { status: "completed", result: result.slice(0, 60_000) });
     status.tasks_handled += 1;
     status.busy = false;

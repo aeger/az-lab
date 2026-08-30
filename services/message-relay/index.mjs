@@ -29,6 +29,7 @@ const AGENT = "wren";
 // Max auto-reply depth per thread. Beyond this the relay stops replying rather
 // than letting two agents converse forever (see the 2026-08-29 ping-pong).
 const MAX_HOPS = Number(process.env.RELAY_MAX_HOPS || 3);
+const AUTH_FAIL_RE = /Failed to authenticate|OAuth session expired|API Error|Invalid API key|401/i;
 const MY_NAMES = new Set(["wren", "claude-code"]);
 const CLAUDE_BIN = process.env.RELAY_CLAUDE_BIN || "claude";
 const CLAUDE_TIMEOUT_MS = Number(process.env.RELAY_CLAUDE_TIMEOUT_MS || 300_000);
@@ -165,8 +166,8 @@ async function handleMessage(row) {
     return;
   }
 
-  const reply = await runClaude(row);
-  await sendMessage(row.from_agent, reply, "chat", row.thread_id ?? row.id, null, row.__hop ?? 0);
+  const { ok, text: reply } = await runClaude(row);
+  await sendMessage(row.from_agent, reply, "chat", row.thread_id ?? row.id, null, row.__hop ?? 0, !ok);
   await rest("PATCH", `agent_messages?id=eq.${row.id}`, { acked_at: new Date().toISOString() });
 }
 
@@ -176,7 +177,7 @@ function looksLikeError(body) {
   return /^\(relay|^\(atlas-helper|Failed to authenticate|API Error|OAuth session expired/i.test(String(body).trim());
 }
 
-async function sendMessage(toAgent, body, kind, threadId, taskId, hop = 0) {
+async function sendMessage(toAgent, body, kind, threadId, taskId, hop = 0, isError = false) {
   if (threadId) repliesByThread.set(threadId, (repliesByThread.get(threadId) || 0) + 1);
   if (repliesByThread.size > 2000) repliesByThread.clear();
   await rest("POST", "agent_messages", {
@@ -189,7 +190,7 @@ async function sendMessage(toAgent, body, kind, threadId, taskId, hop = 0) {
     meta: {
       via: "message-relay",
       hop: hop + 1,
-      ...(looksLikeError(body) ? { auto_error: true } : {}),
+      ...(isError || looksLikeError(body) ? { auto_error: true } : {}),
     },
   });
 }
@@ -231,32 +232,40 @@ function runClaude(row) {
     // leaves `working` true and stalls the FIFO permanently — the relay goes
     // silent while still looking connected. (Hit on the Atlas side 2026-08-29.)
     let settled = false;
-    const finish = (text) => {
+    const finish = (res) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(text);
+      resolve(typeof res === "string" ? { ok: false, text: res } : res);
     };
 
+    // {ok, text} — ok must mean the session genuinely succeeded. Claude's JSON
+    // carries is_error/subtype; an error string is not a result.
     const parseOut = (code) => {
       if (code !== 0 && !out) {
-        return `(relay error: session exited ${code}${err ? `: ${err.slice(0, 300)}` : ""})`;
+        return { ok: false, text: `(relay error: session exited ${code}${err ? `: ${err.slice(0, 300)}` : ""})` };
       }
       try {
         const parsed = JSON.parse(out);
-        return parsed.result ?? parsed.text ?? out.slice(0, 4000);
+        const text = parsed.result ?? parsed.text ?? out.slice(0, 4000);
+        const ok = code === 0 &&
+                   parsed.is_error !== true &&
+                   (parsed.subtype === undefined || parsed.subtype === "success") &&
+                   !AUTH_FAIL_RE.test(String(text));
+        return { ok, text };
       } catch {
-        return out.trim().slice(0, 4000) || `(relay: empty response, exit ${code}${err ? `: ${err.slice(0, 300)}` : ""})`;
+        const text = out.trim().slice(0, 4000) || `(relay: empty response, exit ${code}${err ? `: ${err.slice(0, 300)}` : ""})`;
+        return { ok: false, text };
       }
     };
 
     const timer = setTimeout(() => {
       console.warn(`[relay] claude timed out after ${CLAUDE_TIMEOUT_MS}ms — killing`);
       try { child.kill("SIGKILL"); } catch { /* best effort */ }
-      setTimeout(() => finish(
+      setTimeout(() => finish({ ok: false, text:
         `(relay: claude timed out after ${Math.round(CLAUDE_TIMEOUT_MS / 1000)}s and was killed. ` +
         `Partial output: ${(out || "(none)").slice(0, 500)}${err ? ` | stderr: ${err.slice(0, 300)}` : ""})`
-      ), 2_000);
+      }), 2_000);
     }, CLAUDE_TIMEOUT_MS);
 
     child.stdout.on("data", d => { out += d; });
@@ -264,7 +273,7 @@ function runClaude(row) {
     child.on("exit", (code) => { setTimeout(() => finish(parseOut(code)), 1_000); });
     child.on("close", (code) => finish(parseOut(code)));
     child.on("error", (e) => {
-      finish(`(relay error: failed to spawn claude: ${e.message})`);
+      finish({ ok: false, text: `(relay error: failed to spawn claude: ${e.message})` });
     });
     child.stdin.write(framePrompt(row));
     child.stdin.end();
