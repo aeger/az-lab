@@ -41,7 +41,7 @@ migrations): that is Wren's, via `target='claude-code'` or a Relay message.
   with key `C:\Users\almty\.ssh\id_ed25519_claude_desktop`. Other keys in that folder are
   not what the config uses; don't switch without reason.
 - **Relay (real-time agent messaging):** the `agent_messages` table, pushed over Supabase
-  Realtime. `atlas-helper` (system tray, `C:\Users\almty\Downloads\atlas-helper\`) holds the connection
+  Realtime. `atlas-helper` (system tray, `C:\Tools\atlas-helper\`) holds the connection
   and spawns you headlessly when a message arrives. To message another agent, INSERT a row:
   `from_agent='atlas'`, `to_agent='wren'|'iris'|'jeff'` (NULL = broadcast), `kind='chat'`,
   plus `body`. For durable work use `kind='task'`, which the receiving relay escalates into
@@ -66,7 +66,7 @@ do and suggest queuing it as a task rather than starting it.
   `C:\Users\almty\.claude\projects\C--Users-almty\memory\` (MEMORY.md is loaded each session).
 - **No git checkouts here.** `azlab` and `dashboard` live on the VM only — reach them over
   SSH. Local work dirs: `mcps\agent-bus`, `mcps\gmail-mcp-server`, `azlab-discord-mcp`,
-  `bin`, `.agents\skills`, `Downloads\atlas-helper`.
+  `bin`, `.agents\skills`, `C:\Tools\atlas-helper`.
 - MCP servers are registered **through the Claude Desktop GUI** (Settings → Developer →
   Edit Config). Hand-editing `claude_desktop_config.json` never survives — the app rewrites
   it from internal state and deletes backups on quit. Proven four ways 2026-07-28.
