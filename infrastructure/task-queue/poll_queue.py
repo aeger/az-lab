@@ -1152,6 +1152,26 @@ def mark_failed(task_id, error, goal_id=None, original_task=None):
 
 
 _CONTEXT_STRIP_KEYS = {"previous_output", "last_result", "full_transcript", "raw_output", "stdout"}
+
+# Keys that ARE the task's payload rather than incidental context. They are never
+# evicted by the size cap below and never routed through lossy Haiku compression.
+#
+# 2026-08-30: every Discord-delivery recurring task (breakthrough-watch,
+# daily-ai-memory-research, weekly-rls-audit, weekly-constitution-audit) carries its
+# pre-composed alert body in context.message and its destination in
+# context.discord_channel. On a RETRY the injected _retry_hint/_prior_failure pushed
+# the serialized context past _CONTEXT_MAX_CHARS, and the eviction loop popped whatever
+# happened to sit last in insertion order — so attempt 2 of a breakthrough-watch run
+# reached the agent with the channel (and, on a slightly longer body, the message
+# itself) silently missing, and the agent had to re-read task_queue.context by hand.
+# A retry must see the full context jsonb, not a size-shaped subset of it.
+# Regression coverage: tests/test_context_preservation.py.
+_CONTEXT_PRESERVE_KEYS = {
+    "message", "discord_channel", "discord_webhook", "webhook_url",
+    "channel_id", "channel",
+    "recurring_key", "recurring_schedule", "recurring_parent_id",
+    "skill_name", "timeout_secs",
+}
 _CONTEXT_MAX_CHARS = 3000
 _CONTEXT_COMPRESS_THRESHOLD = 6000   # compress when serialized context exceeds this
 _RESULT_MAX_CHARS = 2000
@@ -1218,7 +1238,7 @@ def _sanitize_context(ctx: dict, attempt_count: int, prior_error: str | None) ->
 
     # If oversized, try intelligent compression first
     if len(serialized) > _CONTEXT_COMPRESS_THRESHOLD:
-        priority_keys = {"_retry_hint", "_prior_failure"}
+        priority_keys = {"_retry_hint", "_prior_failure"} | _CONTEXT_PRESERVE_KEYS
         compressible = {k: v for k, v in cleaned.items() if k not in priority_keys}
         if compressible:
             compressed_str = _compress_via_haiku(
@@ -1226,13 +1246,13 @@ def _sanitize_context(ctx: dict, attempt_count: int, prior_error: str | None) ->
                 target_chars=_CONTEXT_MAX_CHARS - 200,  # leave room for retry hints
                 label="task context JSON",
             )
-            cleaned = {**{k: cleaned[k] for k in priority_keys if k in cleaned}}
+            cleaned = {k: v for k, v in cleaned.items() if k in priority_keys}
             cleaned["_context_compressed"] = compressed_str
             serialized = json.dumps(cleaned, indent=2)
 
     # Hard cap as last resort
     if len(serialized) > _CONTEXT_MAX_CHARS:
-        priority_keys = {"_retry_hint", "_prior_failure"}
+        priority_keys = {"_retry_hint", "_prior_failure"} | _CONTEXT_PRESERVE_KEYS
         overflow_keys = [k for k in cleaned if k not in priority_keys]
         while len(serialized) > _CONTEXT_MAX_CHARS and overflow_keys:
             cleaned.pop(overflow_keys.pop())
