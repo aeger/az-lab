@@ -1599,11 +1599,42 @@ function startEmbeddingBackfillJob(supabase: any): void {
   setInterval(run, 30 * 60 * 1000);
 }
 
+// ── Backflow invariant (migration 115's missing half) ────────────────────────
+// Migration 115 downweights inbound edges AT THE MOMENT a row is retired. That is
+// a sweep, and a sweep cannot see the future: a link created AFTER the retirement
+// keeps its full similarity strength, and spreading_activation_rerank then serves
+// the superseded row WITH a relevance boost. Observed 2026-08-31 (backflow_edges
+// 0 -> 1, first true positive of that gauge) and again 2026-09-02, when a single
+// remember() minted two more edges into rows retired earlier the same morning.
+//
+// The cause is that public.match_memories — BOTH overloads — selects
+// `FROM memories WHERE embedding IS NOT NULL` with no lifecycle predicate. It is
+// deliberately NOT fixed there: its other three callers (detectConflicts, the AMAC
+// novelty gate, mem0Resolve) legitimately want retired rows in their candidate
+// set, and silently filtering those would trade this defect for a new one. The
+// predicate belongs at the two sites that WRITE edges.
+//
+// Fails closed: if the hydrate errors we drop every candidate rather than link
+// blind, matching mem0Resolve's "treat all candidates as protected" stance.
+async function activeLinkTargets(ids: string[]): Promise<Set<string>> {
+  if (!ids.length) return new Set();
+  const { data, error } = await supabase
+    .from("memories")
+    .select("id")
+    .in("id", ids)
+    .not("is_active", "is", false);
+  if (error) {
+    console.warn(`[autolink] is_active hydrate failed: ${error.message} — creating no links`);
+    return new Set();
+  }
+  return new Set((data as any[]).map((r) => r.id));
+}
+
 // Single source of truth for the reported version. Keep in sync with
 // package.json. Two separate literals used to carry this — the MCP handshake and
 // GET /health — and on 2026-08-05 the /health one was missed on a version bump,
 // so the endpoint every dashboard and research run reads was a release behind.
-const SERVER_VERSION = "5.22.0";
+const SERVER_VERSION = "5.23.0";
 
 // ── Episode claim registry ───────────────────────────────────────────────────
 // Keyed by episode id, NOT a shared consult buffer — the consult ids themselves
@@ -1835,8 +1866,9 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
             match_count: 5,
           });
           if (similar?.length) {
+            const liveTargets = await activeLinkTargets((similar as any[]).map((m: any) => m.id));
             const links = similar
-              .filter((m: any) => m.id !== existing.id)
+              .filter((m: any) => m.id !== existing.id && liveTargets.has(m.id))
               .map((m: any) => ({ source_id: existing.id, target_id: m.id, relationship: "related_to", link_type: "semantic", strength: Math.min(m.similarity, 1.0) }));
             if (links.length) {
               await supabase.from("memory_links").upsert(links, { onConflict: "source_id,target_id,relationship" });
@@ -2074,8 +2106,9 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
           match_count: 5,
         });
         if (similar?.length) {
+          const liveTargets = await activeLinkTargets((similar as any[]).map((m: any) => m.id));
           const links = similar
-            .filter((m: any) => m.id !== inserted.id)
+            .filter((m: any) => m.id !== inserted.id && liveTargets.has(m.id))
             .map((m: any) => ({ source_id: inserted.id, target_id: m.id, relationship: "related_to", link_type: "semantic", strength: Math.min(m.similarity, 1.0) }));
           if (links.length) {
             await supabase.from("memory_links").upsert(links, { onConflict: "source_id,target_id,relationship" });
