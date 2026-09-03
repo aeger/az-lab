@@ -148,7 +148,18 @@ _SPLIT_WORD_COUNT   = 400  # above this, suggest splitting
 
 # ── Supabase helpers ─────────────────────────────────────────────────────────
 
+# Consecutive failed heartbeat POSTs. A heartbeat that cannot leave the network
+# is exactly what trips a `silent_agent` kill switch, and this used to be
+# swallowed by a bare `except: pass` — so the gap left no trace in the journal
+# and every incident had to be reconstructed from cloudflared/gluetun timings
+# (2026-08-22 aardvark-dns flap, 2026-09-02 Cox WAN outage). Log the first
+# failure and the recovery so the journal brackets the silence; stay quiet in
+# between so a multi-hour outage does not flood it.
+_hb_fail_streak = 0
+
+
 def _write_heartbeat(status: str = "active", metadata: dict | None = None) -> None:
+    global _hb_fail_streak
     try:
         payload = json.dumps({
             "agent": "sage",
@@ -168,8 +179,17 @@ def _write_heartbeat(status: str = "active", metadata: dict | None = None) -> No
             },
         )
         urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        _hb_fail_streak += 1
+        if _hb_fail_streak == 1:
+            print(f"[Sage] HEARTBEAT FAILED (1st consecutive) — {type(e).__name__}: {e}. "
+                  f"Silence from here will look like a silent_agent anomaly; "
+                  f"suspect network/WAN before suspecting Sage.", file=sys.stderr)
+    else:
+        if _hb_fail_streak:
+            print(f"[Sage] HEARTBEAT RECOVERED after {_hb_fail_streak} "
+                  f"consecutive failure(s).", file=sys.stderr)
+            _hb_fail_streak = 0
 
 
 def _patch_task(task_id: str, data: dict) -> None:

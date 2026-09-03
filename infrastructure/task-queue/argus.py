@@ -63,7 +63,14 @@ def _is_complex(task: dict) -> bool:
     )
 
 
+# Consecutive failed heartbeat POSTs. See the matching note in sage.py — a
+# swallowed heartbeat failure is what makes a network outage indistinguishable
+# from a dead agent when a `silent_agent` kill switch fires.
+_hb_fail_streak = 0
+
+
 def _write_heartbeat(status: str = "active", metadata: dict | None = None) -> None:
+    global _hb_fail_streak
     try:
         payload = json.dumps({
             "agent": "argus",
@@ -88,8 +95,17 @@ def _write_heartbeat(status: str = "active", metadata: dict | None = None) -> No
             },
         )
         urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        _hb_fail_streak += 1
+        if _hb_fail_streak == 1:
+            print(f"[Argus] HEARTBEAT FAILED (1st consecutive) — {type(e).__name__}: {e}. "
+                  f"Silence from here will look like a silent_agent anomaly; "
+                  f"suspect network/WAN before suspecting Argus.", file=sys.stderr)
+    else:
+        if _hb_fail_streak:
+            print(f"[Argus] HEARTBEAT RECOVERED after {_hb_fail_streak} "
+                  f"consecutive failure(s).", file=sys.stderr)
+            _hb_fail_streak = 0
 
 
 def _reset_task_to_pending(task_id: str, reason: str) -> None:
