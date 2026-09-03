@@ -25,6 +25,18 @@
 #      afterwards, crediting the restart for AdGuard intermittently serving. The
 #      post-restart verification now uses the uncached probe too.
 #
+# 2026-09-02: a ~2h19m Cox WAN outage (10:06 -> 12:25 UTC). Stage 2 correctly
+# called it 94 times. But on the run at 12:25:23 the WAN came back mid-script:
+# the DoH probe passed, so we fell through to stage 3, poked AdGuard, and logged
+# "stage 3 RECOVERED — AdGuard upstream wedge cleared". AdGuard was never at
+# fault — the WAN recovered on its own and the poke took the credit. That is the
+# very defect #2 above, one stage further down the ladder.
+#
+#   3. RECOVERY ATTRIBUTION. A stage-1/stage-3 remediation may only claim credit
+#      if the fault was already localized to that component on a PREVIOUS run.
+#      If the last run reported a WAN outage, recovery on this run is far more
+#      likely the WAN returning, so we say so instead of blaming AdGuard.
+#
 # Ladder: probe -> restart systemd-resolved -> localize fault -> poke AdGuard ->
 # alert. Each remediation has a cooldown so a long outage does not turn into a
 # restart loop (v1 restarted every ~2 min for an hour).
@@ -156,8 +168,13 @@ alert() {
 if healthy; then
   if [ -f "$STATE_DIR/degraded" ]; then
     rm -f "$STATE_DIR/degraded"
-    log "DNS healthy again (cached + uncached both answering)"
+    if [ -f "$STATE_DIR/wan_outage" ]; then
+      log "DNS healthy again — previous run saw a WAN/upstream outage, so this is the WAN returning, not local remediation"
+    else
+      log "DNS healthy again (cached + uncached both answering)"
+    fi
   fi
+  rm -f "$STATE_DIR/wan_outage"
   exit 0
 fi
 
@@ -173,7 +190,11 @@ if cooldown_ok resolved_restart "$RESOLVED_RESTART_COOLDOWN"; then
   systemctl restart systemd-resolved
   sleep 3
   if healthy; then
-    log "stage 1 RECOVERED — systemd-resolved was wedged"
+    if [ -f "$STATE_DIR/wan_outage" ]; then
+      log "stage 1 recovered DNS, but the previous run was a WAN/upstream outage — cause NOT confirmed as a systemd-resolved wedge"
+    else
+      log "stage 1 RECOVERED — systemd-resolved was wedged"
+    fi
     rm -f "$STATE_DIR/degraded"
     exit 0
   fi
@@ -184,11 +205,18 @@ fi
 
 # Stage 2 — localize. Is the internet fine and only our resolver broken?
 if ! probe_doh; then
+  # Marker consumed by stage 1/stage 3 on the NEXT run, and by anyone triaging a
+  # `silent_agent` kill switch: agent heartbeats cannot leave the box right now.
+  touch "$STATE_DIR/wan_outage" 2>/dev/null || true
   alert "DNS down and DoH to 1.1.1.1/8.8.8.8 also fails — WAN/upstream outage, no local remediation available"
   exit 1
 fi
 
-log "stage 2: fault localized to AdGuard $ADGUARD_IP (DoH upstreams answer, local resolver does not)"
+if [ -f "$STATE_DIR/wan_outage" ]; then
+  log "stage 2: DoH answers again, but the previous run was a WAN/upstream outage — treating this as WAN recovery in progress, not an AdGuard fault"
+else
+  log "stage 2: fault localized to AdGuard $ADGUARD_IP (DoH upstreams answer, local resolver does not)"
+fi
 
 # Stage 3 — poke AdGuard into re-establishing its upstream connections.
 if cooldown_ok adguard_poke "$ADGUARD_POKE_COOLDOWN"; then
@@ -197,8 +225,12 @@ if cooldown_ok adguard_poke "$ADGUARD_POKE_COOLDOWN"; then
   if poke_adguard; then
     sleep 5
     if healthy; then
-      log "stage 3 RECOVERED — AdGuard upstream wedge cleared"
-      rm -f "$STATE_DIR/degraded"
+      if [ -f "$STATE_DIR/wan_outage" ]; then
+        log "stage 3 recovered DNS, but the previous run was a WAN/upstream outage — cause NOT confirmed; do not record this as an AdGuard wedge"
+      else
+        log "stage 3 RECOVERED — AdGuard upstream wedge cleared"
+      fi
+      rm -f "$STATE_DIR/degraded" "$STATE_DIR/wan_outage"
       exit 0
     fi
     log "stage 3 did NOT recover DNS"
