@@ -362,7 +362,31 @@ def write_semantic_memory(name: str, description: str, content: str, tags: list)
         log.error(f"Supabase write failed: {e}")
     return None
 
+def link_target_is_live(target_id: str) -> bool:
+    """True if target_id is an ACTIVE memory row.
+
+    The backflow invariant ('no strong edge may point at a retired row') is
+    enforced at RETIREMENT by supersede_memory (migration 115) and
+    retire_cold_memories (migration 148). Both are one-shot: they downweight the
+    edges that exist AT THAT MOMENT. Neither can defend against an edge minted
+    LATER, and this script's cluster fetches did not filter is_active, so it
+    routinely linked to rows that had already been superseded days earlier
+    (62 such edges as of 2026-09-04). Retirement-time downweighting is
+    structurally blind to retire-then-link; only a creation-time check closes it.
+    """
+    try:
+        row = supa_get("memories", {"id": f"eq.{target_id}", "select": "is_active", "limit": "1"})
+        return bool(row) and row[0].get("is_active") is not False
+    except Exception as e:
+        # Fail CLOSED: an unverifiable target does not get a strong edge.
+        log.warning(f"Liveness check failed for {target_id}, skipping link: {e}")
+        return False
+
+
 def create_link(source_id: str, target_id: str, relationship: str, link_type: str = "semantic"):
+    if not link_target_is_live(target_id):
+        log.info(f"Skipping link {source_id}->{target_id}: target is retired/inactive")
+        return
     try:
         supa_post("memory_links", {
             "source_id": source_id,
@@ -402,6 +426,7 @@ def fetch_stale_project_memories() -> list:
     try:
         mems = supa_get("memories", {
             "type": "eq.project",
+            "is_active": "eq.true",
             "access_count": f"gte.{PROJECT_MIN_ACCESS_COUNT}",
             "tags": f"not.cs.{{{CONSOLIDATED_TAG}}}",
             "updated_at": f"gte.{date_min}",
@@ -520,7 +545,7 @@ def run_project_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int,
             continue
 
         if ref_id == "ok":
-            result = supa_get("memories", {"name": f"eq.{ref_name}", "select": "id"})
+            result = supa_get("memories", {"name": f"eq.{ref_name}", "is_active": "eq.true", "select": "id"})
             ref_id = result[0]["id"] if result else None
 
         if ref_id:
@@ -563,6 +588,7 @@ def main():
     try:
         episodic_memories = supa_get("memories", {
             "type": "eq.episodic",
+            "is_active": "eq.true",
             # Overlap-exclude BOTH tag dialects: this script's 'consolidated' and the
             # legacy consolidate_episodic_memories.py 'consolidated=true' — the two
             # jobs were blind to each other's done-markers (double-processing risk).
@@ -582,6 +608,7 @@ def main():
     try:
         memories = supa_get("memories", {
             "type": "in.(project,feedback,reference)",
+            "is_active": "eq.true",
             "access_count": f"gte.{MIN_ACCESS_COUNT}",
             "tags": f"not.cs.{{{CONSOLIDATED_TAG}}}",
             "select": "id,name,description,content,tags,access_count,embedding",
@@ -637,7 +664,7 @@ def main():
                     content, ["distilled", "episodic-origin"])
                 if sem_id:
                     if sem_id == "ok":
-                        result = supa_get("memories", {"name": f"eq.{sem_name}", "select": "id"})
+                        result = supa_get("memories", {"name": f"eq.{sem_name}", "is_active": "eq.true", "select": "id"})
                         sem_id = result[0]["id"] if result else None
                     if sem_id:
                         for ep in batch:
@@ -663,7 +690,7 @@ def main():
                     content, ["distilled", "episodic-origin"])
                 if sem_id:
                     if sem_id == "ok":
-                        result = supa_get("memories", {"name": f"eq.{sem_name}", "select": "id"})
+                        result = supa_get("memories", {"name": f"eq.{sem_name}", "is_active": "eq.true", "select": "id"})
                         sem_id = result[0]["id"] if result else None
                     if sem_id:
                         for ep in cluster_mems:
@@ -726,7 +753,7 @@ def main():
 
         # 5. Get the newly created memory's ID if we got "ok" back
         if semantic_id == "ok":
-            result = supa_get("memories", {"name": f"eq.{semantic_name}", "select": "id"})
+            result = supa_get("memories", {"name": f"eq.{semantic_name}", "is_active": "eq.true", "select": "id"})
             semantic_id = result[0]["id"] if result else None
 
         if semantic_id:
@@ -816,6 +843,7 @@ def fetch_project_30day_memories() -> list:
     try:
         mems = supa_get("memories", {
             "type": "eq.project",
+            "is_active": "eq.true",
             "tags": f"not.cs.{{auto-consolidated}}",
             "updated_at": f"gte.{date_cutoff}",
             "select": "id,name,description,content,tags,access_count,embedding,updated_at",
@@ -893,7 +921,7 @@ def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, 
             continue
 
         if ref_id == "ok":
-            result = supa_get("memories", {"name": f"eq.{ref_name}", "select": "id"})
+            result = supa_get("memories", {"name": f"eq.{ref_name}", "is_active": "eq.true", "select": "id"})
             ref_id = result[0]["id"] if result else None
 
         if ref_id:
