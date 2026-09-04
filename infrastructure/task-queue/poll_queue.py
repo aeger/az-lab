@@ -2447,6 +2447,15 @@ def sweep_waiting_tasks():
 def main():
     print(f"[{datetime.now().isoformat()}] Polling task queue on {HOSTNAME}...")
 
+    # Liveness FIRST. This used to sit after the five sweeps below, which meant a
+    # transient Supabase timeout in any of them killed the process before the
+    # heartbeat was written — the poller was alive and on schedule, but looked
+    # silent. Three such runs in a row tripped the silent_agent kill switch on
+    # 2026-09-04. The heartbeat reports "this process ran", so it must not be
+    # gated behind the work whose failure it is supposed to survive.
+    # write_heartbeat() swallows its own exceptions, so this cannot break main().
+    write_heartbeat("active")
+
     # Auto-recover tasks stuck in claimed/in_progress_agent
     recover_stuck_tasks()
 
