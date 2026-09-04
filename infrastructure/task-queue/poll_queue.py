@@ -994,6 +994,31 @@ def requeue_recurring(task: dict) -> bool:
         return False
 
 
+def refresh_container_updates(task):
+    """Re-run the dashboard update checker after a container-update task.
+
+    Applying an update swaps the running image, but only the dashboard's own
+    apply paths (stack-update route, apply-updates.py) wrote the result back
+    into data/updates.json. A container update applied through the task queue
+    left the snapshot — and the `wren_flagged` state that goes with it — stale
+    until the next 6h timer run, so the widget kept advertising an update that
+    was already applied. traefik was reopened for exactly this five times.
+
+    check-updates.py re-derives has_update from a real pull + image-ID compare,
+    so kicking it is ground truth, not a hand-written "assume it worked" patch.
+    """
+    if "container-update" not in (task.get("tags") or []):
+        return
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "--no-block", "start", "dashboard-update-check.service"],
+            check=False, capture_output=True, timeout=15,
+        )
+        print("Kicked dashboard-update-check.service to refresh the update snapshot.")
+    except Exception as e:
+        print(f"Could not refresh update snapshot: {e}", file=sys.stderr)
+
+
 def mark_completed(task_id, result, goal_id=None, recurring=False):
     # Truncate result — long results cause context bloat on next reads
     stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
@@ -2516,6 +2541,9 @@ def main():
         task_ctx = task.get("context") or {}
         task_timeout = task_ctx.get("timeout_secs") if isinstance(task_ctx, dict) else None
         result = run_claude(prompt, task_id=task_id, model=model, timeout=task_timeout)
+        # Before any terminal-state branching: completed, pending_eval and
+        # pending_jeff_action all mean the image work already ran.
+        refresh_container_updates(task)
         summary = _notify_summary(result)
         goal_id = task.get("goal_id")
 
