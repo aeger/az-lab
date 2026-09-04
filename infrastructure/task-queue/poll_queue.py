@@ -2024,8 +2024,17 @@ def write_heartbeat(status="active", metadata=None):
             }
         )
         urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        # Never raise — callers depend on the heartbeat being unable to break a
+        # run. But do not swallow silently either: a heartbeat that cannot leave
+        # the network is exactly what trips a `silent_agent` kill switch, and a
+        # bare `except: pass` leaves no trace, so every incident has to be
+        # reconstructed from cloudflared/gluetun timings (2026-08-22, 2026-09-02,
+        # 2026-09-04). sage.py/argus.py already log this; match them. No streak
+        # counter here — the poller is a oneshot, so state dies with the process.
+        print(f"[poller] HEARTBEAT FAILED — {type(e).__name__}: {e}. "
+              f"Silence from here will look like a silent_agent anomaly; "
+              f"suspect network/WAN before suspecting the poller.", file=sys.stderr)
 
 
 # ── JeffLoop: auto-detect tasks needing Jeff input ────────────────────────────
