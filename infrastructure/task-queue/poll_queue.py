@@ -1019,13 +1019,18 @@ def mark_completed(task_id, result, goal_id=None, recurring=False):
             api_request(
                 "PATCH",
                 f"task_queue?id=eq.{task_id}",
-                data={"status": "completed", "result": stored_result},
+                data={"status": "completed", "result": stored_result,
+                      "blocked_reason": None},
             )
     else:
         api_request(
             "PATCH",
             f"task_queue?id=eq.{task_id}",
-            data={"status": "completed", "result": stored_result},
+            # blocked_reason described a gate that completion has now passed.
+            # Left populated it makes finished work read as still-blocked in
+            # every UI that shows the field beside the row.
+            data={"status": "completed", "result": stored_result,
+                  "blocked_reason": None},
         )
     summary = result.splitlines()[0][:200] if result else "done"
     log_activity("result", f"Completed: {summary}", task_id=task_id)
