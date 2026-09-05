@@ -1020,10 +1020,10 @@ def refresh_container_updates(task):
 
 
 def mark_completed(task_id, result, goal_id=None, recurring=False):
-    # Truncate result — long results cause context bloat on next reads
-    stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
-    if result and len(result) > _RESULT_MAX_CHARS:
-        stored_result += f"\n... [truncated from {len(result)} chars]"
+    # The row is the durable copy. Keep it whole; only a runaway is clipped, and
+    # even then both ends survive. See _clip_result.
+    stored_result = _clip_result(result)
+    note_to_jeff_from_result(task_id, result)
     if recurring:
         # Recurring task — atomically write result into runs[<last>] via RPC
         # so concurrent fires from cowork can't clobber history.
@@ -1092,9 +1092,8 @@ def mark_pending_eval(task_id, result, goal_id=None, original_task=None):
     When original_task carries a recurring_schedule, requeue the next occurrence
     immediately so the chain never breaks — even if Jeff/Iris hasn't approved yet.
     """
-    stored_result = result[:_RESULT_MAX_CHARS] if result and len(result) > _RESULT_MAX_CHARS else result
-    if result and len(result) > _RESULT_MAX_CHARS:
-        stored_result += f"\n... [truncated from {len(result)} chars]"
+    stored_result = _clip_result(result)
+    note_to_jeff_from_result(task_id, result)
     guidance = IRIS_EVAL_GUIDANCE.format(task_id=task_id)
     stored_result = (stored_result or "") + guidance
     api_request(
@@ -1204,11 +1203,174 @@ _CONTEXT_PRESERVE_KEYS = {
 }
 _CONTEXT_MAX_CHARS = 3000
 _CONTEXT_COMPRESS_THRESHOLD = 6000   # compress when serialized context exceeds this
-_RESULT_MAX_CHARS = 2000
-# pending_jeff_action rows are the durable copy Jeff reads and acts on, so they
-# are NOT clipped to _RESULT_MAX_CHARS. This cap only exists to stop a runaway
+# Every terminal row is the durable copy someone reads and acts on, so none of
+# them are clipped to a summary length. This cap only exists to stop a runaway
 # result from bloating the row.
+#
+# History (2026-09-05): _RESULT_MAX_CHARS used to be 2000 and was applied in
+# mark_completed() and mark_pending_eval(). It destroyed the tail of 79 of 288
+# completed rows in 30 days, and with it 32 notes and open questions addressed
+# to Jeff -- because "what I did NOT do" is written at the END of a result, and
+# a head-only clip eats exactly that. The stated reason for the cap was context
+# bloat "on next reads", but no read path injects a stored result into a prompt:
+# the only consumer is the idempotency guard's .strip() truthiness test, and
+# Guardian excerpts run_claude()'s in-memory return value, not the stored row.
+# So the cap cost real information and bought nothing. Unified at 20000.
+_RESULT_MAX_CHARS = 20000
 _JEFF_RESULT_MAX_CHARS = 20000
+# On the rare genuine runaway, keep BOTH ends. A head-only clip is what made the
+# old bug silent -- the tail is where the caveats, the open questions and the
+# "I deliberately did not fix X" live.
+_RESULT_RUNAWAY_HEAD = 14000
+_RESULT_RUNAWAY_TAIL = 6000
+
+
+def _clip_result(result: str | None, cap: int = _RESULT_MAX_CHARS) -> str | None:
+    """Cap a stored result without ever silently dropping its tail.
+
+    Under the cap the text is returned untouched. Over it, the head and the tail
+    are both kept with an explicit elision marker between them, so a reader can
+    always see how the agent CLOSED -- caveats, unresolved items, questions.
+    """
+    if not result or len(result) <= cap:
+        return result
+    dropped = len(result) - _RESULT_RUNAWAY_HEAD - _RESULT_RUNAWAY_TAIL
+    return (
+        result[:_RESULT_RUNAWAY_HEAD]
+        + f"\n\n... [{dropped} chars elided from the middle of a {len(result)}-char result; "
+          f"head and tail retained] ...\n\n"
+        + result[-_RESULT_RUNAWAY_TAIL:]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Notes to Jeff -- the third lane.
+#
+# The queue used to collapse three different things into task_queue.result:
+#   1. the work log      -- what the agent did; Jeff never needs to read it
+#   2. the decision gate -- agent is BLOCKED; must interrupt Jeff, must be cleared
+#   3. the note / FYI    -- agent finished, but Jeff needs to KNOW something
+#
+# Only (2) had a mechanism (mark_pending_jeff_action). (3) had none, so agents
+# wrote notes into the result of a completed row, where nothing ever surfaced
+# them: 32 such notes in 30 days, found by accident. Notes now go to
+# sentinel_notifications, which already drives the dashboard bell and ribbon,
+# is dismissible in one click, has no status to transition, and -- critically --
+# never enters task_queue_attention. So a note can never spam the work queue.
+# ---------------------------------------------------------------------------
+
+# Explicit marker an agent can write to address Jeff directly. Preferred path.
+_JEFF_MARKER = ">>JEFF:"
+
+# Safety net for when an agent forgets the marker -- which is exactly what
+# happened for a month. Deliberately specific: these phrases are second-person
+# and address a reader, so they do not fire on ordinary narration.
+_JEFF_CUES = (
+    "worth your attention", "worth your call", "your call on", "still yours",
+    "needs your", "need your", "awaiting your", "waiting on you",
+    "i deliberately did not", "i did not close", "i did not fix",
+    "two things for you", "one thing worth", "two things worth",
+    "flagged for jeff", "awaiting jeff", "jeff decision",
+)
+
+_NOTE_MAX_BLOCKS = 4       # never mint a wall of notes from one task
+_NOTE_MAX_CHARS = 4000
+
+# sentinel_notifications.urgency is CHECK-constrained to exactly these four.
+# Anything else (notably "normal") 400s the insert.
+_URGENCY_FOR_SEVERITY = {"critical": "critical", "warning": "high", "info": "medium"}
+
+
+def _extract_jeff_blocks(result: str) -> list[str]:
+    """Pull the parts of a result that are addressed to Jeff.
+
+    Explicit `>>JEFF:` blocks win outright. Failing that, fall back to whole
+    paragraphs containing a second-person cue -- a paragraph, not a sentence,
+    because the actionable detail is usually the list that follows the cue.
+    """
+    if not result:
+        return []
+    paras = [p.strip() for p in result.split("\n\n") if p.strip()]
+
+    explicit = [p for p in paras if _JEFF_MARKER in p]
+    if explicit:
+        return [p.split(_JEFF_MARKER, 1)[1].strip() or p for p in explicit][:_NOTE_MAX_BLOCKS]
+
+    hits = []
+    for i, p in enumerate(paras):
+        low = p.lower()
+        if any(cue in low for cue in _JEFF_CUES):
+            block = p
+            # A cue line is often a heading for the list underneath it.
+            if len(p) < 200 and i + 1 < len(paras):
+                block = p + "\n\n" + paras[i + 1]
+            hits.append(block)
+    return hits[:_NOTE_MAX_BLOCKS]
+
+
+def note_to_jeff(task_id: str | None, title: str, body: str,
+                 severity: str = "info", category: str = "agent_note") -> bool:
+    """File a note for Jeff outside the work queue. Never raises.
+
+    Returns True if a row was written. Deliberately best-effort: a note is an
+    accessory to finishing a task and must never be able to fail one.
+    """
+    try:
+        api_request("POST", "sentinel_notifications", data={
+            "source":    "task_queue",
+            "severity":  severity,
+            "status":    "unread",
+            "title":     title[:200],
+            "body":      body[:_NOTE_MAX_CHARS],
+            "category":  category,
+            "source_id": str(task_id) if task_id else None,
+            # urgency is CHECK-constrained to critical/high/medium/low. "normal"
+            # is not a member and silently 400s the whole insert.
+            "urgency":   _URGENCY_FOR_SEVERITY.get(severity, "medium"),
+            "metadata":  {"task_id": str(task_id) if task_id else None,
+                          "minted_by": "poll_queue.note_to_jeff"},
+        })
+        return True
+    except Exception as e:
+        print(f"note_to_jeff failed for {task_id}: {e}", file=sys.stderr)
+        return False
+
+
+def note_to_jeff_from_result(task_id: str, result: str | None) -> int:
+    """Lane C -- the safety net. Surface Jeff-directed passages from a result.
+
+    Called on every terminal transition. Idempotent per task: a task that fires
+    twice (recurring rows, re-runs) will not mint a second copy of the same note.
+    """
+    try:
+        blocks = _extract_jeff_blocks(result or "")
+        if not blocks:
+            return 0
+        existing = api_request(
+            "GET", "sentinel_notifications",
+            params={"source_id": f"eq.{task_id}", "category": "eq.agent_note",
+                    "select": "id", "limit": "1"},
+        )
+        if existing:
+            return 0
+        title = api_request(
+            "GET", "task_queue",
+            params={"id": f"eq.{task_id}", "select": "title", "limit": "1"},
+        )
+        task_title = (title[0].get("title") if title else "") or str(task_id)[:8]
+        body = "\n\n---\n\n".join(blocks)
+        ok = note_to_jeff(
+            task_id,
+            f"Note from: {task_title}"[:200],
+            f"{body}\n\n_Task `{str(task_id)[:8]}` — full result in the task row._",
+            severity="warning",
+        )
+        if ok:
+            print(f"Filed {len(blocks)} Jeff-directed note block(s) from {task_id}")
+        return len(blocks) if ok else 0
+    except Exception as e:
+        print(f"note_to_jeff_from_result failed for {task_id}: {e}", file=sys.stderr)
+        return 0
 _DESC_MAX_CHARS = 4000
 _DESC_COMPRESS_THRESHOLD = 8000      # compress descriptions above this before hard-capping
 
@@ -2134,11 +2296,7 @@ def mark_pending_jeff_action(task_id: str, result: str, reason: str, title: str 
     # The row is the full text — do not clip it to _RESULT_MAX_CHARS and then
     # point at "the task row" for the rest, because this IS the task row and the
     # tail is gone the moment this process exits. Only the runaway cap applies.
-    stored_result = result
-    if result and len(result) > _JEFF_RESULT_MAX_CHARS:
-        stored_result = result[:_JEFF_RESULT_MAX_CHARS] + (
-            f"\n... [truncated from {len(result)} chars — remainder not retained]"
-        )
+    stored_result = _clip_result(result, _JEFF_RESULT_MAX_CHARS)
     api_request(
         "PATCH",
         f"task_queue?id=eq.{task_id}",
