@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# azlab pre-commit hook.
+# Install with: ln -sf ../../scripts/git-hooks/pre-commit .git/hooks/pre-commit
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Guard: no two memory-mcp-server migrations may share a numeric prefix.
+GUARD="${REPO_ROOT}/services/memory-mcp-server/check-migration-numbering.sh"
+if [ -x "${GUARD}" ]; then
+  "${GUARD}" "${REPO_ROOT}/services/memory-mcp-server/migrations" || {
+    echo "pre-commit: migration numbering check failed — commit aborted." >&2
+    exit 1
+  }
+fi

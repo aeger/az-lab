@@ -1,0 +1,17 @@
+[Unit]
+Description=Periodic git durability audit
+Requires=git-durability-audit.service
+
+[Timer]
+# Every 6h. The exposure being bounded is "how long can work sit on one disk
+# before anything says so" — the 08-17 finding was six days, so hours is the
+# right unit and minutes would only add GitHub fetches. The 15m boot delay
+# keeps the fetch clear of the start-up window, where networking and the
+# ssh-agent holding the deploy key are still settling and a fetch failure
+# would be spurious.
+OnBootSec=15min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Run the podman healthcheck for %i
+Documentation=file:///home/almty1/azlab/infrastructure/container-health/container_health_audit.py
+# %i is a container NAME, not the container ID podman's own transient units use.
+# That is the point: a name survives recreation, so this timer keeps probing
+# across restarts instead of being orphaned onto a dead ID the way podman's
+# transient <id>.timer units are.
+ConditionPathExists=/run/user/1000/podman/podman.sock
+
+[Service]
+Type=oneshot
+# `podman healthcheck run` writes the result into the container's Health.Log
+# and flips Health.Status exactly as podman's own timer would, so downstream
+# consumers (podman ps, podman_container_health, the audit) see no difference.
+ExecStart=/usr/bin/podman healthcheck run %i
+# An unhealthy container is a FINDING, not a broken unit — exit 1 is the probe
+# reporting, so do not let it mark this unit failed and trip other alerting.
+SuccessExitStatus=0 1

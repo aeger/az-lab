@@ -1,0 +1,10 @@
+[Unit]
+Description=agent_episodes lifecycle sweep (reap stranded episodes, surface open count)
+Documentation=file:///home/almty1/azlab/infrastructure/episode-lifecycle/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/almty1/azlab/infrastructure/episode-lifecycle/episode_lifecycle_sweep.py
+StandardOutput=journal
+StandardError=journal

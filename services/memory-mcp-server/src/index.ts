@@ -3,10 +3,11 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import { createHmac } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 import WebSocket from "ws";
 import express, { Request, Response } from "express";
 import { z } from "zod";
+import threatPatternDefs from "./threat-patterns.json" with { type: "json" };
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || "3100", 10);
@@ -28,25 +29,111 @@ const HA_TOKEN = process.env.HA_TOKEN || "";
 // Agents sign requests with HS256 JWTs. If AIP_SECRET is set, write ops will
 // stamp the verified caller identity as `source`/`updated_by` instead of
 // trusting the client-supplied value.
+//
+// AIP is ATTRIBUTION, not admission. Reaching this server at all is gated by
+// Traefik's lan-allow@file middleware: an unauthenticated LAN caller already
+// has every tool. What a token buys is a *trusted* identity stamp — which is
+// what feeds the trust lane in hybrid recall — and, when the token carries a
+// `scope` claim, a reduced blast radius if the token leaks. Read that second
+// clause carefully before treating a scope as a security boundary: dropping
+// the Authorization header entirely still gets you in, just unattributed.
 const AIP_SECRET = process.env.AIP_SECRET || "";
+const AIP_ISSUER = process.env.AIP_ISSUER || "az-lab";
+// Hard ceiling on token lifetime, checked against the token's own exp-iat span.
+// An over-long token stops verifying the moment this build ships — no rotation
+// of the shared secret required. That is the revocation path for the 365-day
+// tokens minted before this check existed. Raise only deliberately.
+const AIP_MAX_TTL_SECONDS = parseInt(process.env.AIP_MAX_TTL_DAYS || "30", 10) * 86400;
+const AIP_CLOCK_SKEW_SECONDS = 120;
 
-function verifyAipJwt(token: string): { sub: string } | null {
+// Scope names. A token with no `scope` claim is unrestricted (legacy tokens
+// keep working); a token that has one is held to it. Only the destructive lane
+// and HA control are enforced — gating read/write would be theatre, since an
+// anonymous caller can already do both.
+const AIP_SCOPE_ADMIN = "memory:admin";
+const AIP_SCOPE_HA = "ha:control";
+
+type AipCaller = { sub: string; scopes: string[] | null };
+
+function normalizeScopes(raw: unknown): string[] | null {
+  if (typeof raw === "string") {
+    const parts = raw.split(/[\s,]+/).filter(Boolean);
+    return parts.length ? parts : null;
+  }
+  if (Array.isArray(raw)) {
+    const parts = raw.filter((x): x is string => typeof x === "string" && !!x);
+    return parts.length ? parts : null;
+  }
+  return null;
+}
+
+function verifyAipJwt(token: string): AipCaller | null {
   if (!AIP_SECRET) return null;
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return null;
     const [headerB64, payloadB64, sigB64] = parts;
+
+    // Pin the algorithm. The signature below is always recomputed as HS256, so
+    // an "alg": "none" token could never have passed anyway, but rejecting it
+    // by name keeps the failure legible in the log.
+    const header = JSON.parse(Buffer.from(headerB64, "base64url").toString("utf-8"));
+    if (header?.alg !== "HS256") {
+      console.warn(`[aip] rejected token: alg "${header?.alg}" is not HS256`);
+      return null;
+    }
+    if (header?.typ && header.typ !== "JWT") return null;
+
     const expected = createHmac("sha256", AIP_SECRET)
       .update(`${headerB64}.${payloadB64}`)
-      .digest("base64url");
-    if (expected !== sigB64) return null;
+      .digest();
+    const actual = Buffer.from(sigB64, "base64url");
+    if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) return null;
+
     const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf-8"));
-    if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) return null;
+    const now = Math.floor(Date.now() / 1000);
+
     if (!payload.sub || typeof payload.sub !== "string") return null;
-    return { sub: payload.sub };
+    if (payload.iss !== AIP_ISSUER) {
+      console.warn(`[aip] rejected token for "${payload.sub}": iss "${payload.iss}" != "${AIP_ISSUER}"`);
+      return null;
+    }
+    // exp and iat are both mandatory: without exp the token is a permanent
+    // credential, and without iat its lifetime cannot be measured.
+    if (typeof payload.exp !== "number" || typeof payload.iat !== "number") {
+      console.warn(`[aip] rejected token for "${payload.sub}": missing exp and/or iat`);
+      return null;
+    }
+    if (now > payload.exp + AIP_CLOCK_SKEW_SECONDS) return null;
+    if (payload.iat > now + AIP_CLOCK_SKEW_SECONDS) return null;
+    if (typeof payload.nbf === "number" && now + AIP_CLOCK_SKEW_SECONDS < payload.nbf) return null;
+    if (payload.exp - payload.iat > AIP_MAX_TTL_SECONDS) {
+      console.warn(
+        `[aip] rejected token for "${payload.sub}": lifetime ${Math.round((payload.exp - payload.iat) / 86400)}d ` +
+        `exceeds the ${AIP_MAX_TTL_SECONDS / 86400}d ceiling — re-mint with mint-aip-token.mjs`
+      );
+      return null;
+    }
+
+    return { sub: payload.sub, scopes: normalizeScopes(payload.scope) };
   } catch {
     return null;
   }
+}
+
+// Returns a tool-shaped refusal when the caller presented a scoped token that
+// does not cover `required`, or null when the call may proceed. Unverified
+// callers and unscoped tokens proceed — see the attribution note above.
+function scopeDenied(caller: AipCaller | null, required: string, tool: string) {
+  if (!caller?.scopes) return null;
+  if (caller.scopes.includes(required) || caller.scopes.includes("memory:*")) return null;
+  console.warn(`[aip] denied ${tool} for "${caller.sub}" — token lacks scope "${required}"`);
+  return {
+    content: [{
+      type: "text" as const,
+      text: `Denied: the "${caller.sub}" token is not scoped for ${tool} (requires "${required}"). Re-mint with that scope if this is intended.`,
+    }],
+  };
 }
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -57,28 +144,58 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ── Security Scanner ─────────────────────────────────────────────────────────
-const THREAT_PATTERNS: Array<[RegExp, string]> = [
-  [/ignore\s+(previous|all|above|prior)\s+instructions/i, "prompt_injection"],
-  [/you\s+are\s+now\s+/i, "role_hijack"],
-  [/do\s+not\s+tell\s+the\s+user/i, "deception_hide"],
-  [/system\s+prompt\s+override/i, "sys_prompt_override"],
-  [/disregard\s+(your|all|any)\s+(instructions|rules|guidelines)/i, "disregard_rules"],
-  [/act\s+as\s+(if|though)\s+you\s+(have\s+no|don'?t\s+have)\s+(restrictions|limits|rules)/i, "bypass_restrictions"],
-  [/curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)/i, "exfil_curl"],
-  [/wget\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)/i, "exfil_wget"],
-  [/cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)/i, "read_secrets"],
-  [/authorized_keys/i, "ssh_backdoor"],
-  [/\$HOME\/\.ssh|~\/\.ssh/i, "ssh_access"],
-  [/pretend\s+(you\s+are|to\s+be)\s+(a\s+)?(different|new|another)/i, "persona_hijack"],
-  [/your\s+(new\s+)?(instructions?|rules?|directives?)\s+are/i, "instruction_override"],
-  [/\u200b|\u200c|\u200d|\u2060|\ufeff|[\u202a-\u202e]/, "invisible_unicode"],
-];
+// Patterns live in src/threat-patterns.json, NOT here. That file is the single
+// source of truth shared with injection_scan.py — the retro/rescan worker that
+// closes OWASP ASI06 interception point 4 (post-hoc forensic detection). Before
+// 2026-08-02 the list was inline in this file and therefore reachable only from
+// the memories write path, which is how 785 of 955 rows came to exist having
+// never been scanned even once.
+//
+// Guarded write lanes (interception point 1, write-time admission): remember,
+// save_skill, set_memory_block, record_episode, remember_file, store_file.
+// Still unguarded and deliberately so for now: merge_memories and add_memory_link
+// mutate rows/edges that were themselves scanned on the way in.
+//
+// Adding a pattern? Edit the JSON and bump its `version`. The weekly
+// memory-injection-rescan.timer re-scans every row whose scan_pattern_version is
+// behind that number, so a pattern addition applies retroactively to the whole
+// corpus instead of only to writes that happen after it.
+// mode === "block" ONLY. The JSON also carries the five "signal" patterns from
+// the scan_memory_for_injection() DB trigger, which quarantine rather than reject.
+// Pulling those into scanContent() would turn a soft signal into a hard block and
+// make every already-quarantined row unwritable — so the filter is load-bearing.
+const THREAT_PATTERNS: Array<[RegExp, string]> = threatPatternDefs.patterns
+  .filter((p) => p.mode === "block")
+  .map((p) => [new RegExp(p.re, p.flags), p.id] as [RegExp, string]);
+const SCAN_PATTERN_VERSION: number = threatPatternDefs.version;
 
 function scanContent(text: string): string | null {
   for (const [pattern, threatId] of THREAT_PATTERNS) {
     if (pattern.test(text)) return threatId;
   }
   return null;
+}
+
+// Scan several named fields at once. Returns "field:threat_id" on the first hit,
+// null when everything is clean. Undefined/empty fields are skipped so optional
+// tool arguments don't need a guard at every call site.
+function scanFields(fields: Array<[string, string | undefined | null]>): string | null {
+  for (const [field, value] of fields) {
+    if (!value) continue;
+    const threat = scanContent(value);
+    if (threat) return `${field}:${threat}`;
+  }
+  return null;
+}
+
+// MIME types whose bytes are read back as prose by an agent. Only these get their
+// body scanned — running the pattern set over a PNG or a tarball tests noise, and
+// invisible_unicode in particular would fire on arbitrary binary.
+function isAgentReadableText(mime: string): boolean {
+  return mime.startsWith("text/") ||
+    mime === "application/json" ||
+    mime === "application/xml" ||
+    mime === "application/x-yaml";
 }
 
 // ── Conflict Detection ────────────────────────────────────────────────────────
@@ -126,19 +243,55 @@ async function detectConflicts(
     }
   }
 
+  // Migration 139 — do not FILE a conflict the resolver refuses forever.
+  // resolve_conflict_auto() has refused any conflict touching an is_point_in_time
+  // row since migration 133, and sweep_conflicts() has excluded them from its
+  // candidate set since 137, so every one filed here was an unclosable row plus a
+  // permanent governance_weight() x0.75 on BOTH sides. Measured 2026-08-28: 290 of
+  // the 347 open contradictions were a dated log series arguing with itself
+  // ("AI Memory Research - 2026-08-28" vs "... 2026-08-27"), and 120 memories were
+  // carrying an uncleavable flag because of it.
+  //
+  // A BEFORE INSERT trigger in the DB (conflict_intake_gate) is the real enforcement
+  // point — there is more than one producer. This check is deliberately STRICTER than
+  // that trigger: the trigger still admits conflict_type='stale' on a PIT row because
+  // contradiction-scan's 'stale' means link-graph staleness and is genuinely
+  // adjudicable, whereas the 'stale' half of THIS detector's pair asserts "may be
+  // superseded by a newer memory", which is exactly the claim a point-in-time record
+  // cannot be subject to. So both halves of the pair are skipped here.
+  const pointInTime = new Set<string>();
+  if (candidates.length > 0) {
+    const { data: pitRows } = await supabase
+      .from("memories")
+      .select("id, is_point_in_time")
+      .in("id", [newMemoryId, ...candidates.map((c) => c.id)]);
+    for (const row of (pitRows as any[]) ?? []) {
+      if (row.is_point_in_time) pointInTime.add(row.id);
+    }
+  }
+  // A dated record is a report about a moment, not a claim about now — it contradicts
+  // nothing and nothing supersedes it. Nothing to file in either direction.
+  if (pointInTime.has(newMemoryId)) return null;
+
   const conflictNames: string[] = [];
   for (const candidate of candidates) {
+    if (pointInTime.has(candidate.id)) continue;
     const sim = candidate.similarity;
     if (mightContradict(newContent, candidate.content)) {
       // Contradiction: negation words detected in semantically related memories
-      await supabase.from("memory_conflicts").upsert({
-        memory_a_id: newMemoryId,
-        memory_b_id: candidate.id,
-        conflict_type: "contradiction",
-        description: `New memory may contradict "${candidate.name}"`,
-        resolved: false,
-        detected_by: "negation_heuristic",
-      }, { onConflict: "memory_a_id,memory_b_id" });
+      // ignoreDuplicates is load-bearing (migration 139). Without it PostgREST emits
+      // ON CONFLICT DO UPDATE and the literal `resolved: false` above RESURRECTS a
+      // conflict that was already adjudicated, re-flagging both memories and handing
+      // the nightly sweep the same decision to make again. 8 rows were in that state
+      // on 2026-08-28, reopened hours after the 03:30 sweep closed them. A BEFORE
+      // UPDATE trigger now refuses the reopen server-side as well.
+      // Migration 141: the 'contradiction' row is NOT filed any more. It routed to
+      // resolve_conflict_auto's supersede path and scored 2 correct retirements out
+      // of 54 — it retired 52 live, still-true notes between 08-24 and 08-27,
+      // including migration 138's own finding one day after it was written. The
+      // 'stale' row below carries the same suspicion, never invents a supersession,
+      // and closes itself when the claim does not hold (411 have). A BEFORE INSERT
+      // trigger refuses the contradiction row server-side too.
       await supabase.from("memory_conflicts").upsert({
         memory_a_id: candidate.id,
         memory_b_id: newMemoryId,
@@ -146,7 +299,7 @@ async function detectConflicts(
         description: `May be superseded by newer memory "${newContent.slice(0, 80)}..."`,
         resolved: false,
         detected_by: "negation_heuristic",
-      }, { onConflict: "memory_a_id,memory_b_id" });
+      }, { onConflict: "memory_a_id,memory_b_id", ignoreDuplicates: true });
       await supabase.from("memories").update({ conflict_flagged: true }).in("id", [newMemoryId, candidate.id]);
       conflictNames.push(candidate.name);
     } else if (sim >= 0.85 && textSimilarity(newContent, candidate.content) < 0.65) {
@@ -159,7 +312,7 @@ async function detectConflicts(
         description: `High semantic similarity (${(sim * 100).toFixed(0)}%) but divergent content — possible stale data in "${candidate.name}"`,
         resolved: false,
         detected_by: "sim_threshold_0.85",
-      }, { onConflict: "memory_a_id,memory_b_id" });
+      }, { onConflict: "memory_a_id,memory_b_id", ignoreDuplicates: true });
       await supabase.from("memories").update({ conflict_flagged: true }).in("id", [newMemoryId, candidate.id]);
       conflictNames.push(`${candidate.name} (near-dup)`);
     }
@@ -184,8 +337,174 @@ const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY || "";
 const RERANK_URL = process.env.RERANK_URL || "http://192.168.1.183:8000";
 const RERANK_MODEL = process.env.RERANK_MODEL || "nvidia/nemotron-3-super-120b-a12b";
 const RERANK_TOP_K = parseInt(process.env.RERANK_TOP_K || "5", 10);
+// Multiplier applied to a staleness_candidate row's confidence at recall time.
+const STALE_CONFIDENCE_FACTOR = parseFloat(process.env.STALE_CONFIDENCE_FACTOR || "0.75");
 
-type Mem0Action = "ADD" | "UPDATE" | "DELETE" | "NOOP";
+// ── Spreading activation (recall link expansion) ────────────────────────────
+// Minimum link strength for a 1-hop edge to activate its target. Migration 115
+// downweights inbound edges to a retired row BELOW this value, so the constant
+// is a contract shared with SQL — change it in both places or retired edges
+// climb back over the bar. eval/retrieval_regression.py asserts they agree.
+const SPREAD_ACTIVATION_THRESHOLD = parseFloat(process.env.SPREAD_ACTIVATION_THRESHOLD || "0.72");
+// Extra memories injected into the result set by link expansion.
+const SPREAD_EXTRA_LIMIT = parseInt(process.env.SPREAD_EXTRA_LIMIT || "5", 10);
+// Candidate pool gathered BEFORE the retirement/validity filter. Larger than
+// SPREAD_EXTRA_LIMIT on purpose: filtering has to happen against a wide pool so
+// retired candidates cannot starve live ones out of the extras budget.
+const SPREAD_CANDIDATE_CAP = parseInt(process.env.SPREAD_CANDIDATE_CAP || "50", 10);
+
+// ── Adaptive recall router (2026-07-26 research, tier 1) ────────────────────
+// Off by default. Set RECALL_ROUTER=1 to enable.
+const RECALL_ROUTER = process.env.RECALL_ROUTER === "1";
+
+/**
+ * Pick recall_mode / rerank / pool width from the SHAPE of the query.
+ *
+ * WHY: recall_mode has existed since the 5-lane work and is caller-selected, but no
+ * caller has ever selected it — every recall in az-lab pays the full 6-lane RRF plus
+ * a TEI cross-encoder rerank, including "192.168.1.181" and "hybrid_recall", where
+ * the embedding lane contributes nothing a BM25/trigram match would not already have
+ * found and the reranker is being asked to semantically re-order exact-token hits.
+ *
+ * FAIL-OPEN IS THE WHOLE DESIGN. A misroute is not a slow query, it is a silent
+ * recall MISS — the caller gets fewer/worse memories and has no way to tell that a
+ * heuristic chose that for them. So every branch that is not positively identified
+ * falls through to hybrid + rerank, which is exactly today's behaviour. The router
+ * can only ever make a query CHEAPER when it is confident, never narrower when it
+ * is guessing.
+ */
+type RecallRoute = {
+  mode: "hybrid" | "semantic" | "lexical";
+  rerank: boolean;
+  poolMultiplier: number;
+  reason: string;
+};
+
+const STOPWORDS = new Set([
+  "a", "an", "the", "is", "are", "was", "were", "be", "been", "do", "does", "did",
+  "of", "for", "to", "in", "on", "at", "and", "or", "but", "with", "from", "by",
+  "it", "its", "this", "that", "these", "those", "i", "we", "you", "my", "our",
+]);
+const QUESTION_WORDS = new Set([
+  "what", "why", "how", "when", "where", "which", "who", "whom", "whose", "should", "can",
+]);
+
+/** IP/CIDR, hostname/FQDN, snake_case/kebab ident, version string, error code, path. */
+const EXACT_TOKEN_RE = [
+  /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/,        // 192.168.1.181, 10.0.0.0/8
+  /^[a-z0-9-]+(\.[a-z0-9-]+){1,}$/i,            // svc-podman-01.az-lab.dev, memories.name
+  /^[a-z0-9]+(_[a-z0-9]+)+$/i,                  // hybrid_recall, eval_run_trend
+  /^v?\d+\.\d+(\.\d+)?$/,                       // 5.13.0, v3.6
+  /^[A-Z][A-Z0-9_]{2,}$/,                       // ENOENT, RECALL_ROUTER
+  /^\d{3}$/,                                    // 504, 422
+  /^\//,                                        // /home/almty1/azlab
+];
+
+function routeRecall(query: string, topicHint?: string): RecallRoute {
+  const HYBRID: RecallRoute = {
+    mode: "hybrid", rerank: true, poolMultiplier: 2, reason: "default (fail-open)",
+  };
+  const q = (query || "").trim();
+  if (!q) return { ...HYBRID, reason: "empty query — fail-open" };
+
+  const tokens = q.split(/\s+/).filter(Boolean);
+  const lower = tokens.map((t) => t.toLowerCase());
+  const hasStopword = lower.some((t) => STOPWORDS.has(t));
+  const hasQuestionWord = lower.some((t) => QUESTION_WORDS.has(t));
+  // Multi-clause: punctuation that joins independent thoughts, not decoration.
+  const multiClause = /[,;?]|\band\b|\bor\b|\bbut\b/i.test(q);
+
+  // 1. Exact-token shape → lexical, no rerank. The embedding lane cannot beat an
+  //    exact BM25/trigram match on an identifier, and a cross-encoder asked to
+  //    re-rank exact hits mostly adds latency and occasionally demotes the right one.
+  if (tokens.length <= 4 && !hasStopword && !hasQuestionWord) {
+    const exact = tokens.filter((t) =>
+      EXACT_TOKEN_RE.some((re) => re.test(t.replace(/[.,;:?!]+$/, ""))));
+    if (exact.length > 0 && exact.length === tokens.length) {
+      return {
+        mode: "lexical", rerank: false, poolMultiplier: 2,
+        reason: `exact-token (${tokens.length} tok, all identifier-shaped)`,
+      };
+    }
+  }
+
+  // 2. Short factual NL → hybrid, no rerank. Both lanes still run (cheap, and the
+  //    hint lane carries the ranking); skipping only the cross-encoder, which has
+  //    little to reorder when the query is this specific.
+  if (tokens.length <= 8 && hasStopword && !multiClause && !hasQuestionWord) {
+    return {
+      mode: "hybrid", rerank: false, poolMultiplier: 2,
+      reason: `short factual NL (${tokens.length} tok)`,
+    };
+  }
+
+  // 3. Verbose / multi-clause / question-word NL → hybrid + rerank + wider pool.
+  //    This is where the cross-encoder earns its latency: the 2026-07-28 depth
+  //    sweep measured nDCG@10 0.456 -> 0.617 going from no-rerank to depth 20.
+  //
+  //    MEASURED 2026-07-28, poolMultiplier 4 BUYS NOTHING: the router A/B
+  //    (`retrieval_regression.py router`) moved nDCG@10 0.6929 -> 0.6932 (+0.0003)
+  //    for +0.6% p50. That is structural, not noise — rerankPool is hard-capped at
+  //    20 by TEI's max_client_batch_size, and finalLimit collapses to
+  //    min(RERANK_TOP_K, limit) once rerank fires, so candidates 21-40 can neither
+  //    be reranked nor returned. A wider pool is only worth paying for AFTER the
+  //    rerank request is chunked. Left at 4 as specified, but do not read it as
+  //    a tuned value.
+  if (tokens.length > 8 || multiClause || hasQuestionWord) {
+    return {
+      mode: "hybrid", rerank: true, poolMultiplier: 4,
+      reason: `verbose/interrogative NL (${tokens.length} tok${multiClause ? ", multi-clause" : ""}${hasQuestionWord ? ", question-word" : ""})`,
+    };
+  }
+
+  return HYBRID;
+}
+
+// Per-class re-verification TTL, in days (migration 057). Only 'working' gets a
+// default: it is short-term scratch context that is wrong within the week.
+// The durable classes carry no blanket TTL — they fall through to the sweep's
+// 14-day project/reference rule, or take an explicit ttl_days from the writer.
+const CLASS_DEFAULT_TTL_DAYS: Record<string, number | undefined> = {
+  working: 7,
+  episodic: undefined,
+  semantic: undefined,
+  procedural: undefined,
+};
+
+function ttlToExpiresAt(days?: number): string | undefined {
+  if (days === undefined || !Number.isFinite(days) || days <= 0) return undefined;
+  return new Date(Date.now() + days * 86400000).toISOString();
+}
+
+// 2026-08-24: there is no DELETE. mem0 ran DELETE→supersede_memory from
+// migration 048 until commit 690f7df, and EVERY auto-supersede it ever wrote —
+// 23 of 23 — was a false positive. The synchronous write path sees one
+// embedding and no adjudication evidence; retiring a row is not a decision it
+// can make. CONFLICT is what that branch was always actually entitled to do:
+// flag the pair and hand it to the 03:30 contradiction scan. Renamed rather
+// than suppressed so nothing here reads as dormant-but-revivable.
+type Mem0Action = "ADD" | "UPDATE" | "CONFLICT" | "NOOP";
+
+// Floor for emitting CONFLICT. The old DELETE branch fired at 0.72, which is
+// topical overlap ("research", "gmail", "task queue"), not disagreement — that
+// is how a Gmail-OAuth write retired a DNS memory. 0.90 is the same floor the
+// 03:30 deterministic scan uses for a high-confidence contradiction
+// (CONTRA_HIGH_CONF_SIM), so the two paths agree on what "rival claim" means.
+const MEM0_CONFLICT_FLOOR = Number(process.env.MEM0_CONFLICT_FLOOR ?? 0.90);
+// Candidate retrieval floor. Was 0.72; UPDATE needs >= 0.88 and NOOP >= 0.95,
+// so everything under 0.80 was noise fed to the LLM classifier and nothing else.
+const MEM0_CANDIDATE_FLOOR = Number(process.env.MEM0_CANDIDATE_FLOOR ?? 0.80);
+
+// Candidates carry the guard inputs (is_point_in_time, registered-series) so the
+// deferred loop can gate on them WITHOUT a second round-trip per decision.
+interface Mem0Candidate {
+  id: string;
+  name: string;
+  content: string;
+  similarity: number;
+  is_point_in_time: boolean;
+  is_series: boolean;   // registered research producer OR canonical dated log series
+}
 
 interface Mem0Decision {
   action: Mem0Action;
@@ -202,6 +521,24 @@ function textSimilarity(a: string, b: string): number {
   const intersection = [...A].filter((w) => B.has(w)).length;
   const union = new Set([...A, ...B]).size;
   return union === 0 ? 1 : intersection / union;
+}
+
+// An APPEND is not a duplicate. Jaccard is set-based, so a superset scores as
+// "unchanged" — adding a 100-word section to a 1000-word memory lands around
+// 0.91, over the 0.85 NOOP threshold, and the write was silently dropped while
+// returning a success-shaped message. Found 2026-08-30 by Atlas, and it is why
+// every prior "RE-VERIFIED" appendix had to go in by direct SQL.
+function isMaterialExtension(oldText: string, newText: string): boolean {
+  const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+  const o = norm(oldText);
+  const n = norm(newText);
+  if (n.length <= o.length) return false;      // not longer → not an append
+  const grew = n.length - o.length;
+  // Old text carried through verbatim = an append or an in-place edit + append.
+  if (n.includes(o)) return true;
+  // Otherwise require the growth itself to be material, so a reworded near-copy
+  // still NOOPs but a real addition never does.
+  return grew >= 200 || grew / Math.max(o.length, 1) >= 0.05;
 }
 
 function levenshtein(a: string, b: string): number {
@@ -223,7 +560,7 @@ function levenshtein(a: string, b: string): number {
 function heuristicMem0(
   newName: string,
   newContent: string,
-  candidates: Array<{ id: string; name: string; content: string; similarity: number }>
+  candidates: Mem0Candidate[]
 ): Mem0Decision[] {
   const decisions: Mem0Decision[] = [];
 
@@ -239,10 +576,10 @@ function heuristicMem0(
     const nameSimilar = levenshtein(c.name.toLowerCase(), newName.toLowerCase()) <= 3;
     const contradicts = mightContradict(newContent, c.content);
 
-    if (contradicts && sim >= 0.72) {
-      // Contradicted/stale → DELETE the old one; new content will be ADDed after
-      decisions.push({ action: "DELETE", target_id: c.id, target_name: c.name,
-        rationale: `Contradicts stale memory "${c.name}" (sim=${(sim * 100).toFixed(0)}%)` });
+    if (contradicts && sim >= MEM0_CONFLICT_FLOOR) {
+      // Apparent contradiction → FLAG the pair. The old row is NOT retired.
+      decisions.push({ action: "CONFLICT", target_id: c.id, target_name: c.name,
+        rationale: `Appears to contradict "${c.name}" (sim=${(sim * 100).toFixed(0)}%)` });
     } else if (sim >= 0.88 && nameSimilar && !contradicts) {
       // High similarity + similar name → UPDATE in place (prevents cross-name duplicates)
       decisions.push({ action: "UPDATE", target_id: c.id, target_name: c.name,
@@ -260,7 +597,7 @@ function heuristicMem0(
 async function llmMem0(
   newName: string,
   newContent: string,
-  candidates: Array<{ id: string; name: string; content: string; similarity: number }>
+  candidates: Mem0Candidate[]
 ): Promise<Mem0Decision[]> {
   const prompt = `You are a memory deduplication system. Given a new fact and existing similar memories, classify the required operation.
 
@@ -276,12 +613,12 @@ ${candidates.slice(0, 5).map((c, i) =>
 Classify the operation required:
 - NOOP: New memory is fully captured by an existing one. No write needed.
 - UPDATE: New memory updates/corrects an existing one. Merge content into it.
-- DELETE: An existing memory is contradicted/stale. Remove it (new fact added separately).
+- CONFLICT: An existing memory makes a RIVAL CLAIM that this new fact contradicts. It is flagged for review, NOT removed — you are not deciding which one wins.
 - ADD: Genuinely new fact with no significant overlap.
 
-Rules: NOOP only if content is essentially identical. Multiple DELETE decisions allowed. Prefer UPDATE over ADD when clearly the same topic. Respond with a JSON array only, no explanation outside JSON.
+Rules: NOOP only if content is essentially identical. Prefer UPDATE over ADD when clearly the same topic. CONFLICT requires a DIRECT contradiction of the same claim — a different value for the same host/port/path/setting. Sharing a topic, a project name, or vocabulary is NOT a conflict; two dated entries in a log series are NOT a conflict, they describe different days. When unsure, do not emit CONFLICT. Respond with a JSON array only, no explanation outside JSON.
 
-Example: [{"action":"DELETE","target_id":"abc-123","target_name":"old fact","rationale":"contradicted by new IP"}]`;
+Example: [{"action":"CONFLICT","target_id":"abc-123","target_name":"old fact","rationale":"states the static IP is .51, new fact states .52"}]`;
 
   try {
     const res = await fetch(`${LLM_URL}/chat/completions`, {
@@ -301,7 +638,9 @@ Example: [{"action":"DELETE","target_id":"abc-123","target_name":"old fact","rat
     raw = raw.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
     let parsed: Mem0Decision[] = JSON.parse(raw);
     if (!Array.isArray(parsed)) parsed = [parsed];
-    const valid = parsed.filter((d) => ["ADD", "UPDATE", "DELETE", "NOOP"].includes(d.action));
+    // A model that still emits the retired DELETE verb is downgraded, not obeyed.
+    for (const d of parsed) if ((d.action as string) === "DELETE") d.action = "CONFLICT";
+    const valid = parsed.filter((d) => ["ADD", "UPDATE", "CONFLICT", "NOOP"].includes(d.action));
     return valid.length > 0 ? valid : [{ action: "ADD", rationale: "LLM returned no valid decisions" }];
   } catch (err: any) {
     console.warn("[mem0] LLM classify failed:", err.message, "— heuristic fallback");
@@ -316,25 +655,55 @@ async function mem0Resolve(
   type: string,
   embedding: number[],
   excludeId?: string
-): Promise<Mem0Decision[]> {
+): Promise<{ decisions: Mem0Decision[]; candidates: Mem0Candidate[] }> {
   const { data: raw } = await supabase.rpc("match_memories", {
     query_embedding: JSON.stringify(embedding),
-    match_threshold: 0.72,
+    match_threshold: MEM0_CANDIDATE_FLOOR,
     match_count: 10,
   });
 
-  if (!raw?.length) return [{ action: "ADD", rationale: "No similar memories found" }];
+  if (!raw?.length) return { decisions: [{ action: "ADD", rationale: "No similar memories found" }], candidates: [] };
 
-  const candidates = (raw as any[])
+  const shortlist = (raw as any[])
     .filter((m) => m.id !== excludeId && m.type === type)
-    .map((m) => ({ id: m.id, name: m.name, content: m.content, similarity: m.similarity as number }))
     .slice(0, 8);
 
-  if (!candidates.length) return [{ action: "ADD", rationale: "No same-type candidates" }];
+  if (!shortlist.length) return { decisions: [{ action: "ADD", rationale: "No same-type candidates" }], candidates: [] };
 
-  return LLM_URL
-    ? llmMem0(name, content, candidates)
+  // Hydrate the guard inputs in ONE query. match_memories does not project
+  // is_point_in_time, and memory_names_are_series() (migration 135) is the
+  // single definition of "this name belongs to a recurring dated series" — it
+  // unions the research_producers templates (126) with memory_is_log_series() (087).
+  const guardById = new Map<string, { pit: boolean; series: boolean }>();
+  const { data: guards, error: guardErr } = await supabase
+    .from("memories")
+    .select("id, is_point_in_time")
+    .in("id", shortlist.map((m) => m.id));
+  if (guardErr) console.warn(`[mem0] guard hydrate failed: ${guardErr.message} — treating all candidates as protected`);
+  for (const g of (guards as any[]) ?? []) guardById.set(g.id, { pit: !!g.is_point_in_time, series: false });
+
+  const { data: seriesRows } = await supabase.rpc("memory_names_are_series", {
+    p_ids: shortlist.map((m) => m.id),
+  });
+  for (const r of (seriesRows as any[]) ?? []) {
+    const cur = guardById.get(r.id);
+    if (cur) cur.series = !!r.is_series;
+  }
+
+  const candidates: Mem0Candidate[] = shortlist.map((m) => {
+    // Fail CLOSED: an un-hydrated candidate is treated as protected, so a
+    // transient Supabase error degrades into "flag nothing", never "flag anything".
+    const g = guardById.get(m.id) ?? { pit: true, series: true };
+    return {
+      id: m.id, name: m.name, content: m.content, similarity: m.similarity as number,
+      is_point_in_time: g.pit, is_series: g.series,
+    };
+  });
+
+  const decisions = LLM_URL
+    ? await llmMem0(name, content, candidates)
     : heuristicMem0(name, content, candidates);
+  return { decisions, candidates };
 }
 
 // ── Embeddings ───────────────────────────────────────────────────────────────
@@ -358,8 +727,34 @@ function embedInput(name: string, description: string, content: string): string 
   return `${name}: ${description}\n\n${content}`.slice(0, 4000);
 }
 
+// Skill embed input. Triggers are part of the vector, not just poll_queue.py's
+// keyword matcher. Before 2026-08-23 they fed NOTHING on the recall path — a skill
+// could carry perfect triggers and rank no better for them — so the only consumer
+// was _match_skill, and the nightly gate's "unreachable" count was the only place
+// an empty triggers array ever showed up. Now an author who writes good triggers
+// improves both retrieval paths.
+function skillEmbedInput(name: string, description: string, content: string, triggers?: string[] | null): string {
+  const trig = triggers?.length ? `\nTriggers: ${triggers.join(", ")}` : "";
+  return `${name}: ${description}${trig}\n\n${content}`.slice(0, 4000);
+}
+
+// Episode embed input (migration 059, MemRL pattern): summary + outcome + learnings
+// are the retrieval-relevant fields — actions/input are noise for "what happened
+// last time I did something like this?" queries.
+function episodeEmbedInput(summary?: string | null, outcome?: string | null, learnings?: string | null): string {
+  return [summary, outcome && `Outcome: ${outcome}`, learnings && `Learnings: ${learnings}`]
+    .filter(Boolean).join("\n").slice(0, 4000);
+}
+
+// Rec #3 (2026-07-08 self-improvement research): SHA-256 of the exact embed input.
+// Stored on memories.content_hash so remember can skip the Ollama embed call when a
+// re-write/re-index is byte-identical to what was last embedded.
+function contentHashOf(embedText: string): string {
+  return createHash("sha256").update(embedText).digest("hex");
+}
+
 // ── TEI Cross-Encoder Reranking (primary) ─────────────────────────────────────
-// Calls bge-reranker-v2-m3 via HuggingFace TEI /rerank endpoint.
+// Calls the TEI cross-encoder (BAAI/bge-reranker-base, see compose.yml) via /rerank.
 // Returns reranked array on success, null on failure (triggers Nemotron fallback).
 // ~80ms latency, CPU-only, local — no external API required.
 async function rerankWithTEI(query: string, memories: any[]): Promise<any[] | null> {
@@ -378,7 +773,7 @@ async function rerankWithTEI(query: string, memories: any[]): Promise<any[] | nu
     const results = (await res.json()) as Array<{ index: number; score: number }>;
     const sorted = results.sort((a, b) => b.score - a.score);
     const reranked = sorted.map((r) => memories[r.index]);
-    console.log(`[rerank] TEI bge-reranker-v2-m3 reranked ${memories.length} memories`);
+    console.log(`[rerank] TEI cross-encoder reranked ${memories.length} memories`);
     return reranked;
   } catch (err: any) {
     console.warn("[rerank] TEI unavailable:", err.message, "— falling back to Nemotron");
@@ -469,7 +864,10 @@ const SOURCE_TRUST: Record<string, string> = {
 // silent-pollution gap flagged by 2606.24535 — without this, scheduled
 // triggers (ai-memory-research-trigger, etc.) write rows with no agent
 // attribution.
-const KNOWN_AGENTS = ["wren", "iris", "atlas", "forge", "volt", "hermes", "lumen"];
+// "forge" retired 2026-07-24: Atlas now covers both the Claude Desktop chat and
+// code surfaces (see the "Agent Names" memory). Historical rows keep the value;
+// it is no longer derivable for new writes.
+const KNOWN_AGENTS = ["wren", "iris", "atlas", "volt", "hermes", "lumen"];
 const KNOWN_AGENTS_SET = new Set(KNOWN_AGENTS);
 function deriveWriterAgent(explicit: string | undefined, src: string): string | undefined {
   if (explicit && KNOWN_AGENTS_SET.has(explicit.toLowerCase())) return explicit.toLowerCase();
@@ -761,23 +1159,10 @@ async function applyStartupMigrations(): Promise<void> {
     console.warn("Migration 020 skipped:", err.message);
   }
 
-  // Migration 021: Skills decay scoring — last_used, success_rate, updated match_skills RPC
-  // Apply migrations/021_skills_decay_scoring.sql via Supabase SQL editor if needed.
-  try {
-    const { data, error } = await supabase.rpc("apply_skills_decay_scoring_if_missing");
-    if (error) {
-      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
-          error.message?.includes("not found in the schema cache")) {
-        console.log("Migration 021 RPC not yet registered — apply migrations/021_skills_decay_scoring.sql in Supabase SQL editor.");
-      } else {
-        console.warn("Migration 021 warning:", error.message);
-      }
-    } else {
-      console.log("Migration 021 result:", data);
-    }
-  } catch (err: any) {
-    console.warn("Migration 021 skipped:", err.message);
-  }
+  // Migration 021 (skills decay scoring) was never applied and is SUPERSEDED by
+  // migration 058 (skills outcome tracking: success_count/fail_count/last_outcome/
+  // last_used_at, applied 2026-07-16). Do NOT apply 021 — its last_used/success_rate
+  // columns conflict with the 058 write paths.
 
   // Migration 022: Skill-memory auto-linking — skill_memory_links table + link_memories_to_skills()
   // Apply migrations/022_skill_memory_links.sql via Supabase SQL editor if needed.
@@ -873,8 +1258,11 @@ async function applyStartupMigrations(): Promise<void> {
   }
 
   // Migration 027: staleness_candidate column + flag_stale_memories() + hybrid_recall returns staleness_candidate
-  // Detects hot-to-cold staleness: memories with high historical access that went quiet for 21+ days.
-  // hybrid_recall now returns staleness_candidate so agents can trigger re-verification.
+  // Migration 057 replaced 027's predicate: staleness keys off VERIFICATION age, not access recency.
+  // Migration 060 then dropped 057's `access_count >= 10` gate, so the rule is now every
+  // project/reference row unverified for 14+ days (an explicit expires_at, when set, wins).
+  // Migration 085 moved that rule into memory_is_stale() and demoted staleness_candidate to a
+  // cache — read is_stale_now (or the review queue) for truth, not the column.
   try {
     const { data, error } = await supabase.rpc("apply_staleness_candidate_if_missing");
     if (error) {
@@ -945,6 +1333,24 @@ async function applyStartupMigrations(): Promise<void> {
   } catch (err: any) {
     console.warn("Migration 040 skipped:", err.message);
   }
+
+  // Migration 055: content_hash column + index (2026-07-08 research REC #3 — embedding cache).
+  // Lets remember skip the Ollama embed call when a re-write is byte-identical.
+  try {
+    const { data, error } = await supabase.rpc("apply_content_hash_if_missing");
+    if (error) {
+      if (error.message?.includes("PGRST202") || error.code === "PGRST202" ||
+          error.message?.includes("not found in the schema cache")) {
+        console.log("Migration 055 RPC not yet registered — apply migrations/055_content_hash_embedding_cache.sql in Supabase SQL editor.");
+      } else {
+        console.warn("Migration 055 warning:", error.message);
+      }
+    } else {
+      console.log("Migration 055 result:", data);
+    }
+  } catch (err: any) {
+    console.warn("Migration 055 skipped:", err.message);
+  }
 }
 
 // ── Staleness maintenance job (runs once at startup, then every 24h) ─────────
@@ -960,11 +1366,12 @@ function startStalenessJob(supabase: any): void {
       const newlyFlagged = data as number;
       if (newlyFlagged > 0) console.log(`[staleness] Newly flagged ${newlyFlagged} memories`);
 
-      // Queue a review task if there are any unresolved stale candidates and no pending task already
+      // Queue a review task if there are any unresolved stale candidates and no pending task already.
+      // Counted off the review queue itself (migration 085 made it derive staleness from
+      // verification age) so the number in the task matches the pages the agent will work.
       const { count: stalePending } = await supabase
-        .from("memories")
-        .select("id", { count: "exact", head: true })
-        .eq("staleness_candidate", true);
+        .from("stale_memories_review_queue")
+        .select("id", { count: "exact", head: true });
       if (!stalePending || stalePending <= 0) return;
 
       const { data: existingTask } = await supabase
@@ -975,19 +1382,39 @@ function startStalenessJob(supabase: any): void {
         .maybeSingle();
       if (existingTask) return;
 
+      // Source this off the SAME derived predicate as stalePending above.
+      // Migration 085 demoted staleness_candidate to a nightly cache; between a
+      // verification pass and the next sweep it still reads true for rows that
+      // are no longer stale. Reading the cache here made the "Top by importance"
+      // list name already-verified memories while the count came off the derived
+      // view — the two halves of one task brief disagreeing. is_stale_now is the
+      // PostgREST computed column over memory_is_stale(), so it can't drift.
+      // It also covers the immutable-log exclusion: migration 089 moved
+      // is_point_in_time INTO memory_is_stale(), so no separate filter is needed
+      // here and adding one back would just be a second copy of that rule.
       const { data: top } = await supabase
         .from("memories")
-        .select("name, importance_score, last_accessed")
-        .eq("staleness_candidate", true)
+        .select("name, importance_score, verified_at, created_at")
+        .eq("is_stale_now", true)
+        .not("is_active", "is", false)
         .order("importance_score", { ascending: false })
         .limit(5);
       const summary = (top || [])
-        .map((m: any) => `• ${m.name} (importance ${(m.importance_score ?? 0).toFixed(2)})`)
+        .map((m: any) => {
+          const since = m.verified_at ?? m.created_at;
+          const days = since
+            ? Math.floor((Date.now() - new Date(since).getTime()) / 86_400_000)
+            : null;
+          const age = days === null
+            ? "never verified"
+            : `${m.verified_at ? "unverified" : "never verified, created"} ${days}d`;
+          return `• ${m.name} (importance ${(m.importance_score ?? 0).toFixed(2)}, ${age})`;
+        })
         .join("\n");
       const { error: insertErr } = await supabase.from("task_queue").insert({
-        title: `Review ${stalePending} stale high-importance memories`,
+        title: `Re-verify ${stalePending} unverified standing-claim memories`,
         description:
-          `${stalePending} memories with importance>0.7 have gone cold (21+ days no access). Review top candidates and refresh, archive, or update:\n\n${summary}\n\nUse SELECT * FROM memories WHERE staleness_candidate=true to see all.`,
+          `${stalePending} project/reference memories that make STANDING claims about live state have gone 14+ days without anyone vouching for them (staleness keys off verification age, not access recency — migration 057). Recall already serves them at ${STALE_CONFIDENCE_FACTOR}x confidence with a +stale label, so this is a correctness backlog, not an outage.\n\nMigration 087 re-scoped this queue: immutable point-in-time logs (daily research, triage/closeout, dreaming, tech-breakthrough, weekly audits) carry \`is_point_in_time = true\` and are excluded, because their truth cannot drift and stamping them would destroy the signal verified_at exists to carry. That is why this number is now small and actually workable — 389 -> 62 at cutover. Migration 089 then moved that exclusion into \`memory_is_stale()\` itself, so immutable logs also stopped taking the recall confidence haircut and the +stale label. Headline metrics: SELECT * FROM memory_review_headline;\n\nDo NOT assume these are hot. Migration 060 dropped the old \`access_count >= 10\` gate, so median access_count is 0. access_count is now only a review-ORDERING term.\n\nWork it in pages off the review queue:\n  SELECT * FROM stale_memories_review_queue WHERE review_rank BETWEEN 1 AND 25;\n(ordering: expired-TTL first, then hot-and-stale, then oldest-unverified)\n\nFor each: re-read it, check its claims against live state, correct or annotate what drifted, then stamp verified_at — either update_memory_verified(memory_id) or a direct UPDATE works, since migration 085 made queue membership derive from verified_at. Only stamp what you actually checked — blanket-stamping destroys the signal. Do not archive on age alone.\n\nThe residue is one-off dated work/incident records that were deliberately NOT auto-excluded, because several assert live config (e.g. ha_vm_ram_bump_*, cadvisor-cpu-cap-*) and a name-regex would have silently exempted them from review forever. Disposition each one once: if it is purely historical narrative, set \`is_point_in_time = true\` and it leaves permanently; if it asserts live state, verify and stamp it.\n\nTop by importance:\n\n${summary}`,
         priority: 2,
         status: "pending",
         source: "system",
@@ -1133,16 +1560,172 @@ function startEmbeddingBackfillJob(supabase: any): void {
     } catch (err: any) {
       console.warn("[backfill] job error:", err.message);
     }
+
+    // ── Episodes lane (migration 059) — embed agent_episodes for semantic recall.
+    // Same sweep pattern; covers pre-059 rows and any write where Ollama was down.
+    try {
+      const { data: eps, error: epErr } = await supabase
+        .from("agent_episodes")
+        .select("id, summary, outcome, learnings")
+        .is("embedding", null)
+        .or("summary.not.is.null,learnings.not.is.null,outcome.not.is.null")
+        .order("created_at", { ascending: false })
+        .limit(50);
+      if (epErr) {
+        console.warn("[backfill:episodes] query failed:", epErr.message);
+        return;
+      }
+      if (!eps?.length) return;
+      let epEmbedded = 0;
+      for (const ep of eps) {
+        const vec = await embed(episodeEmbedInput(ep.summary, ep.outcome, ep.learnings));
+        if (!vec) {
+          console.warn("[backfill:episodes] Ollama unavailable — aborting sweep, will retry next cycle");
+          break;
+        }
+        const { error: upErr } = await supabase
+          .from("agent_episodes")
+          .update({ embedding: JSON.stringify(vec) })
+          .eq("id", ep.id);
+        if (upErr) { console.warn(`[backfill:episodes] update failed for ${ep.id}:`, upErr.message); continue; }
+        epEmbedded++;
+      }
+      if (epEmbedded > 0) console.log(`[backfill:episodes] Embedded ${epEmbedded}/${eps.length} episodes`);
+    } catch (err: any) {
+      console.warn("[backfill:episodes] job error:", err.message);
+    }
   };
   run();
   setInterval(run, 30 * 60 * 1000);
 }
 
+// ── Backflow invariant (migration 115's missing half) ────────────────────────
+// Migration 115 downweights inbound edges AT THE MOMENT a row is retired. That is
+// a sweep, and a sweep cannot see the future: a link created AFTER the retirement
+// keeps its full similarity strength, and spreading_activation_rerank then serves
+// the superseded row WITH a relevance boost. Observed 2026-08-31 (backflow_edges
+// 0 -> 1, first true positive of that gauge) and again 2026-09-02, when a single
+// remember() minted two more edges into rows retired earlier the same morning.
+//
+// The cause is that public.match_memories — BOTH overloads — selects
+// `FROM memories WHERE embedding IS NOT NULL` with no lifecycle predicate. It is
+// deliberately NOT fixed there: its other three callers (detectConflicts, the AMAC
+// novelty gate, mem0Resolve) legitimately want retired rows in their candidate
+// set, and silently filtering those would trade this defect for a new one. The
+// predicate belongs at the two sites that WRITE edges.
+//
+// Fails closed: if the hydrate errors we drop every candidate rather than link
+// blind, matching mem0Resolve's "treat all candidates as protected" stance.
+async function activeLinkTargets(ids: string[]): Promise<Set<string>> {
+  if (!ids.length) return new Set();
+  const { data, error } = await supabase
+    .from("memories")
+    .select("id")
+    .in("id", ids)
+    .not("is_active", "is", false);
+  if (error) {
+    console.warn(`[autolink] is_active hydrate failed: ${error.message} — creating no links`);
+    return new Set();
+  }
+  return new Set((data as any[]).map((r) => r.id));
+}
+
+// Single source of truth for the reported version. Keep in sync with
+// package.json. Two separate literals used to carry this — the MCP handshake and
+// GET /health — and on 2026-08-05 the /health one was missed on a version bump,
+// so the endpoint every dashboard and research run reads was a release behind.
+const SERVER_VERSION = "5.23.0";
+
+// ── Episode claim registry ───────────────────────────────────────────────────
+// Keyed by episode id, NOT a shared consult buffer — the consult ids themselves
+// never leave their own session. This exists because agent identity alone is not
+// a unique key when the queue poller has overlapping runs: three agent='wren'
+// episodes were open at once on 2026-08-14 and a recall from one run attached to
+// another's episode. A session claims an episode on its first recall and other
+// sessions then skip it, so concurrent same-agent runs cannot steal each other's
+// edges. Entries expire on the same 6h window the lookup uses, so the map cannot
+// grow and a crashed session cannot hold an episode hostage.
+const EPISODE_CLAIM_TTL_MS = 6 * 60 * 60 * 1000;
+const episodeClaims = new Map<string, { session: string; ts: number }>();
+function claimEpisodesHeldByOthers(sessionKey: string): string[] {
+  const now = Date.now();
+  const held: string[] = [];
+  for (const [epId, claim] of episodeClaims) {
+    if (now - claim.ts > EPISODE_CLAIM_TTL_MS) episodeClaims.delete(epId);
+    else if (claim.session !== sessionKey) held.push(epId);
+  }
+  return held;
+}
+
 // ── MCP Server Factory ───────────────────────────────────────────────────────
-function createMcpServer(callerIdentity: string | null = null): McpServer {
+function createMcpServer(caller: AipCaller | null = null): McpServer {
+  const callerIdentity: string | null = caller?.sub ?? null;
+  // ── Recall → episode consult correlation ───────────────────────────────────
+  // `agent_episodes.memories_consulted` has been in record_episode's schema since
+  // migration 059 and was populated exactly 0 times across 274 episodes: it is an
+  // optional arg and no agent has ever passed it by hand. That empty column is the
+  // whole reason the A-MAC utility term could never be fit — with no edge from a
+  // memory to the outcome of the task that used it, retention has stayed a 4-term
+  // score with the fifth weight normalized away (see migration 114).
+  //
+  // So recall records what it served and record_episode defaults the field to it.
+  // Scope is deliberate: one server instance per MCP session (see the sessions map
+  // at the bottom of this file), so this buffer is naturally per-agent-per-session
+  // with no keying and no cross-caller leakage. It is a best-effort correlation
+  // signal for retention scoring, NOT an audit log — a restart drops it, and the
+  // worst case is an episode with no consult edge, i.e. exactly today's behaviour.
+  //
+  // MEASURED 2026-08-14, two days after the v5.16.0 deploy: 1 of 37 new episodes
+  // had a consult edge. The buffer alone cannot work, because the two ends of an
+  // episode never meet in an MCP session — poll_queue.py opens and closes episodes
+  // directly over PostgREST (start_episode/end_episode), so record_episode is not
+  // in the loop at all and the buffer is discarded at session teardown with nothing
+  // to attach to. So the buffer is now a fallback for agents that DO drive their own
+  // episodes through record_episode, and the primary path is attach_episode_consults
+  // (migration 116): recall writes what it served straight onto the caller's open
+  // episode row. That crosses the session boundary because the state lives in the DB,
+  // and it keeps the same scoping — the RPC matches on `agent`, so a recall can only
+  // ever land on its own caller's episode, never another agent's.
+  const CONSULT_BUFFER_MAX = 64;
+  let consultBuffer: string[] = [];
+  // Unauthenticated local callers (the queue poller's Claude Code sessions connect
+  // over plain http with no AIP token) have no verified identity; they are the wren
+  // runs that own every episode in the table. Override via env if that changes.
+  const DEFAULT_EPISODE_AGENT = process.env.EPISODE_CONSULT_AGENT || "wren";
+  const sessionKey = crypto.randomUUID();
+  let boundEpisode: string | null = null;
+  const recordConsults = (ids: string[]) => {
+    if (!ids.length) return;
+    consultBuffer = [...new Set([...ids, ...consultBuffer])].slice(0, CONSULT_BUFFER_MAX);
+    // Best-effort and non-blocking: a retention signal must never fail a recall.
+    void (async () => {
+      try {
+        const { data, error } = await supabase.rpc("attach_episode_consults", {
+          p_agent: callerIdentity || DEFAULT_EPISODE_AGENT,
+          p_ids: ids,
+          p_episode_id: boundEpisode,
+          p_exclude: claimEpisodesHeldByOthers(sessionKey),
+        });
+        if (error) return console.warn("[consults] attach failed:", error.message);
+        if (data) {
+          boundEpisode = data;
+          episodeClaims.set(data, { session: sessionKey, ts: Date.now() });
+          console.log(`[consults] attached ${ids.length} to episode ${data}`);
+        } else if (boundEpisode) {
+          // The bound episode closed (the poller reached end_episode). Release it so
+          // the next recall in this session can bind to whatever run is live now.
+          episodeClaims.delete(boundEpisode);
+          boundEpisode = null;
+        }
+      } catch (err: any) {
+        console.warn("[consults] attach threw:", err?.message || err);
+      }
+    })();
+  };
+
   const server = new McpServer({
     name: "memory-mcp-server",
-    version: "5.11.0",
+    version: SERVER_VERSION,
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
@@ -1159,13 +1742,15 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       tags: z.array(z.string()).optional().describe("Tags for categorization and search"),
       source: z.string().optional().describe("Who is writing: claude-code, claude-ai, manual"),
       importance_score: z.number().min(0).max(1).optional().describe("Importance 0-1 (default 0.5). Higher = decays slower and ranks higher in recall. Use 0.8+ for critical long-term facts, 0.2 for ephemeral context."),
-      agent_id: z.string().optional().describe("Agent that owns this memory: wren, iris, atlas, forge, volt. Used with visibility=private for agent-scoped memories."),
+      agent_id: z.string().optional().describe("Agent that owns this memory: wren, iris, atlas, volt. Defaults to the agent derived from the caller/source. Used with visibility=private for agent-scoped memories."),
       visibility: z.enum(["shared", "private"]).optional().describe("shared (default): visible to all agents. private: visible only to agent_id owner."),
       agent_scope: z.array(z.string()).optional().describe("Which agents can see this memory. Default ['shared'] = all agents. E.g. ['wren','iris'] = only Wren and Iris. Requires migration 012."),
       confidence: z.number().min(0).max(1).optional().describe("Confidence 0-1 (default 0.8). Use < 0.5 for speculative or unverified facts. Memories below min_confidence threshold are excluded from recall when filtered."),
       memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Memory class: semantic (durable facts/prefs, default), episodic (event log), procedural (how-to/skill), working (short-term context). Defaults to 'semantic' for all existing types."),
+      ttl_days: z.number().min(1).optional().describe("Re-verification TTL in days. Set this on records that track LIVE infrastructure state (versions, IPs, deployed config) — they go stale in days, unlike incident write-ups which never do. After this many days the nightly sweep flags the memory +stale and recall discounts its confidence until an agent re-verifies it. Overrides the default 14-day rule. Omit for durable facts."),
+      is_point_in_time: z.boolean().optional().describe("True = immutable point-in-time record (dated digest, triage/closeout, incident write-up). Excluded from the stale-review queue AND from the recall staleness discount (migration 089), because its truth cannot drift and re-verifying it is meaningless — such a record is old, not low-confidence. Recurring log-series names (daily research, dreaming, tech-breakthrough, weekly audits) are auto-detected server-side, so only set this for one-off dated records. NEVER set it on a memory asserting live lab state — that would silently exempt it from review forever; use ttl_days for those instead."),
     },
-    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence, memory_class }) => {
+    async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence, memory_class, ttl_days, is_point_in_time }) => {
       // Security gate — scan all text fields before touching the DB
       const scanTargets: Array<[string, string]> = [
         ["name", name], ["description", description], ["content", content],
@@ -1184,18 +1769,33 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       // Fetch existing same-name memory (with content for NOOP check + concurrent write detection)
       const { data: existing } = await supabase
         .from("memories")
-        .select("id, content, agent_id, updated_at, version")
+        .select("id, content, agent_id, updated_at, version, content_hash")
         .eq("name", name)
         .maybeSingle();
 
-      const embedding = await embed(embedInput(name, description, content));
+      // Rec #3 (2026-07-08): content-hash embedding cache. If the same-name row already
+      // holds the identical embed input, the embedding is unchanged — skip the Ollama
+      // call and the write entirely.
+      const embedText = embedInput(name, description, content);
+      const embedHash = contentHashOf(embedText);
+      if (existing && existing.content_hash && existing.content_hash === embedHash) {
+        return { content: [{ type: "text" as const, text: `NOT WRITTEN — NOOP: "${name}" is byte-identical (SHA-256) to the stored version, so nothing was saved and the embedding was reused.` }] };
+      }
+
+      const embedding = await embed(embedText);
       const embedNote = embedding ? "" : " (no embedding — Ollama unavailable)";
 
       // ── Same-name path ──────────────────────────────────────────────────────
       if (existing) {
-        // Mem0 NOOP: content is essentially unchanged — skip write
-        if (existing.content && textSimilarity(existing.content, content) >= 0.85) {
-          return { content: [{ type: "text" as const, text: `NOOP: Memory "${name}" content is unchanged (Jaccard ≥ 85%). No write needed.` }] };
+        // Mem0 NOOP: content is essentially unchanged — skip write.
+        // An append must never land here (see isMaterialExtension).
+        if (existing.content
+            && textSimilarity(existing.content, content) >= 0.85
+            && !isMaterialExtension(existing.content, content)) {
+          return { content: [{ type: "text" as const, text:
+            `NOT WRITTEN — NOOP: "${name}" is ≥85% similar to the stored version and adds no material content, ` +
+            `so nothing was saved. If you meant to APPEND, the new text must contain the old text or add ` +
+            `>200 chars; if you meant to REPLACE a claim, use supersede_memory.` }] };
         }
 
         // ── Rec 3: Concurrent write detection (last-write-wins with conflict logging) ──
@@ -1224,19 +1824,28 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         }
 
         const update: Record<string, unknown> = { type, description, content, tags: memTags, source: src };
-        if (embedding) update.embedding = JSON.stringify(embedding);
+        if (embedding) { update.embedding = JSON.stringify(embedding); update.content_hash = embedHash; }
         if (importance_score !== undefined) update.importance_score = importance_score;
         if (confidence !== undefined) update.confidence = confidence;
         const derivedWriter = deriveWriterAgent(agent_id, src);
-        if (agent_id) {
-          update.agent_id = agent_id;
+        // Same agent_id fallback as the INSERT path below — see comment there.
+        const updateOwner = agent_id ?? derivedWriter;
+        if (updateOwner) {
+          update.agent_id = updateOwner;
           // Update provenance with contributing_agent (REC3, arXiv 2505.18279)
-          update.provenance = { contributing_agent: agent_id };
+          update.provenance = { contributing_agent: updateOwner };
         }
         if (derivedWriter) update.writer_agent = derivedWriter;
         if (visibility) update.visibility = visibility;
         if (agent_scope) update.agent_scope = agent_scope;
         if (memory_class) update.memory_class = memory_class;
+        if (ttl_days !== undefined) update.expires_at = ttlToExpiresAt(ttl_days);
+        if (is_point_in_time !== undefined) update.is_point_in_time = is_point_in_time;
+        // Reaching this path means the content materially changed (the NOOP guard
+        // above rejects near-identical rewrites), so the writer has just vouched
+        // for it — restart the verification clock instead of leaving the row +stale.
+        update.verified_at = new Date().toISOString();
+        update.staleness_candidate = false;
         update.version = (existing.version ?? 1) + 1;
         const { data: updatedRows, error } = await supabase
           .from("memories")
@@ -1257,8 +1866,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
             match_count: 5,
           });
           if (similar?.length) {
+            const liveTargets = await activeLinkTargets((similar as any[]).map((m: any) => m.id));
             const links = similar
-              .filter((m: any) => m.id !== existing.id)
+              .filter((m: any) => m.id !== existing.id && liveTargets.has(m.id))
               .map((m: any) => ({ source_id: existing.id, target_id: m.id, relationship: "related_to", link_type: "semantic", strength: Math.min(m.similarity, 1.0) }));
             if (links.length) {
               await supabase.from("memory_links").upsert(links, { onConflict: "source_id,target_id,relationship" });
@@ -1277,6 +1887,37 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       // near-duplicate. match_memories is the single-embedding analogue of
       // find_duplicate_memories (which operates corpus-wide on pairs).
       // The 0.7–0.92 band is left to mem0Resolve below.
+      //
+      // CONTRADICTION BYPASS — 2026-08-01 daily research REC 4.
+      //
+      // The gate as originally written was a synchronous hard reject that ran
+      // BEFORE any contradiction detection and persisted NOTHING: the twin got
+      // conflict_flagged, but the incoming content survived only in the caller's
+      // transcript. memory-contradiction-scan.timer at 03:30 cannot recover it,
+      // because that scan compares rows that EXIST.
+      //
+      // That is the exact failure mode named in MemTX: Transactional Belief Commit
+      // for Stateful Agent Memory (arXiv 2607.23929) — "a synchronous near-duplicate
+      // gate can prematurely reject contradictory writes before the asynchronous
+      // contradiction detector can evaluate them".
+      //
+      // Concretely for az-lab: a CORRECTION phrased like the thing it corrects —
+      // "RB5009 SSH times out from svc-podman-01" vs "RB5009 SSH now works from
+      // svc-podman-01" — is lexically and semantically near-identical, clears 0.92
+      // cosine, and was thrown away. The system was structurally biased toward
+      // keeping the OLDER belief, and whether a correction survived depended only on
+      // whether the writer happened to reuse the memory name: the same-name UPDATE
+      // path above calls detectConflicts() and keeps the write; only this new-name
+      // path rejected.
+      //
+      // Note this uses mightContradict() directly rather than detectConflicts().
+      // detectConflicts writes memory_conflicts rows keyed on newMemoryId, so it
+      // needs a row that exists — it cannot run before the insert. mightContradict
+      // is the pure negation+topic-overlap predicate detectConflicts is built on,
+      // so the gate now applies the SAME test, just at a point where there is no id
+      // yet. Once the row is persisted, detectConflicts runs over it normally at
+      // the end of the insert path and files the conflict pair for the 03:30 scan.
+      let tentativeTwin: { id: string; name: string; similarity: number } | null = null;
       if (embedding) {
         const { data: novCheck } = await supabase.rpc("match_memories", {
           query_embedding: JSON.stringify(embedding),
@@ -1286,23 +1927,43 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const top = (novCheck as any[] | null)?.[0];
         if (top && top.type === type && top.similarity >= 0.92) {
           const novelty = (1 - top.similarity).toFixed(3);
-          await supabase.from("memories").update({ conflict_flagged: true }).eq("id", top.id);
-          console.log(`[novelty] REJECT "${name}": novelty=${novelty} vs "${top.name}" (cosine=${top.similarity.toFixed(3)}) — flagged twin for review`);
-          return { content: [{ type: "text" as const, text: `Rejected: novelty=${novelty} (cosine=${top.similarity.toFixed(3)}) — near-duplicate of existing ${type} memory "${top.name}" (flagged for review). Update that memory or use a more distinct name to force a new entry.` }] };
+          if (mightContradict(content, top.content ?? "")) {
+            // Belief-commit: admit the write as TENTATIVE and let adjudication happen
+            // asynchronously. Rejecting is a decision the synchronous path does not
+            // have the evidence to make.
+            tentativeTwin = { id: top.id, name: top.name, similarity: top.similarity };
+            await supabase.from("memories").update({ conflict_flagged: true }).eq("id", top.id);
+            console.log(`[novelty] BYPASS "${name}": novelty=${novelty} vs "${top.name}" (cosine=${top.similarity.toFixed(3)}) — contradiction detected, admitting as tentative`);
+          } else {
+            await supabase.from("memories").update({ conflict_flagged: true }).eq("id", top.id);
+            console.log(`[novelty] REJECT "${name}": novelty=${novelty} vs "${top.name}" (cosine=${top.similarity.toFixed(3)}) — flagged twin for review`);
+            return { content: [{ type: "text" as const, text: `Rejected: novelty=${novelty} (cosine=${top.similarity.toFixed(3)}) — near-duplicate of existing ${type} memory "${top.name}" (flagged for review). Update that memory or use a more distinct name to force a new entry.` }] };
+          }
         }
       }
 
       // ── New-name path: full Mem0 conflict resolution ────────────────────────
-      // Migration 048 (2026-06-26): DELETE decisions are deferred to a
-      // non-destructive supersede_memory() call after the new row is
-      // inserted, so the old row + its content survive for audit/lineage.
+      // mem0 has no retire path (2026-08-24). CONFLICT decisions are gated
+      // below and deferred to a conflict_flagged write after the insert; see
+      // the block after the INSERT for the full history.
       let mem0Note = "";
-      const toSupersede: Array<{ id: string; name: string; rationale: string }> = [];
+      const toFlag: Array<{ id: string; name: string; rationale: string }> = [];
       if (embedding) {
-        const decisions = await mem0Resolve(name, content, type, embedding);
+        const { decisions, candidates: mem0Candidates } = await mem0Resolve(name, content, type, embedding);
+        const candidateById = new Map(mem0Candidates.map((c) => [c.id, c]));
 
         for (const d of decisions) {
           if (d.action === "NOOP") {
+            // A tentative contradiction must not be NOOP'd away — that would just
+            // move the silent loss the novelty gate used to cause from one
+            // synchronous decision point to the next one (REC 4, 2026-08-01).
+            // mem0Resolve sees a near-identical twin and can reasonably call the
+            // write redundant; it is exactly wrong when the near-identity is
+            // because one text NEGATES the other.
+            if (tentativeTwin) {
+              console.log(`[mem0] NOOP OVERRIDDEN "${name}": contradiction with "${tentativeTwin.name}" outranks redundancy (${d.rationale})`);
+              continue;
+            }
             console.log(`[mem0] NOOP "${name}": ${d.rationale}`);
             return { content: [{ type: "text" as const, text: `NOOP: Fact already captured in "${d.target_name}". No write needed. (${d.rationale})` }] };
           }
@@ -1312,6 +1973,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
             console.log(`[mem0] UPDATE "${d.target_name}": ${d.rationale}`);
             const upd: Record<string, unknown> = { description, content, tags: memTags, source: src };
             upd.embedding = JSON.stringify(embedding);
+            upd.content_hash = embedHash;
             if (importance_score !== undefined) upd.importance_score = importance_score;
             const mem0Writer = deriveWriterAgent(agent_id, src);
             if (mem0Writer) upd.writer_agent = mem0Writer;
@@ -1321,44 +1983,118 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
             }
           }
 
-          if (d.action === "DELETE" && d.target_id) {
-            // Defer: supersede after new memory is inserted (preserves history).
-            toSupersede.push({ id: d.target_id, name: d.target_name || "?", rationale: d.rationale });
+          if (d.action === "CONFLICT" && d.target_id) {
+            // ── THE GATE ───────────────────────────────────────────────────────
+            // Lives HERE, in the mem0 loop, and deliberately NOT in
+            // supersede_memory(): monthly_research_consolidation.py legitimately
+            // supersedes point-in-time dailies into a digest via that RPC, so an
+            // RPC-level point-in-time guard would break monthly consolidation
+            // outright. Only this path is untrustworthy; only this path is gated.
+            //
+            // Fail closed — an unknown candidate was hydrated as {pit:true,
+            // series:true} in mem0Resolve and is dropped here.
+            const c = candidateById.get(d.target_id);
+            if (!c) {
+              console.log(`[mem0] CONFLICT DROPPED "${d.target_name}": target not in candidate set (LLM hallucinated an id)`);
+              continue;
+            }
+            if (c.similarity < MEM0_CONFLICT_FLOOR) {
+              console.log(`[mem0] CONFLICT DROPPED "${c.name}": sim=${c.similarity.toFixed(3)} < floor ${MEM0_CONFLICT_FLOOR}`);
+              continue;
+            }
+            if (c.is_point_in_time) {
+              console.log(`[mem0] CONFLICT DROPPED "${c.name}": is_point_in_time — an immutable dated record is not a rival claim`);
+              continue;
+            }
+            if (c.is_series) {
+              console.log(`[mem0] CONFLICT DROPPED "${c.name}": registered dated series — two entries differ by DAY, not by disagreement`);
+              continue;
+            }
+            toFlag.push({ id: d.target_id, name: d.target_name || c.name, rationale: d.rationale });
           }
         }
       }
 
       // ── INSERT new memory ───────────────────────────────────────────────────
       const insert: Record<string, unknown> = { type, name, description, content, tags: memTags, source: src };
-      if (embedding) insert.embedding = JSON.stringify(embedding);
+      if (embedding) { insert.embedding = JSON.stringify(embedding); insert.content_hash = embedHash; }
       if (importance_score !== undefined) insert.importance_score = importance_score;
       if (confidence !== undefined) insert.confidence = confidence;
       const insertWriter = deriveWriterAgent(agent_id, src);
-      if (agent_id) insert.agent_id = agent_id;
+      // agent_id defaults to the derived writer. Without this fallback only
+      // callers that pass agent_id explicitly get scoped — which nobody does —
+      // so agent_id drifted to 338/813 null after the 2026-06-02 backfill.
+      // hybrid_recall filters on agent_id, so a null row falls outside every
+      // agent-scoped query the moment private memories exist.
+      const insertOwner = agent_id ?? insertWriter;
+      if (insertOwner) insert.agent_id = insertOwner;
       if (insertWriter) insert.writer_agent = insertWriter;
       if (visibility) insert.visibility = visibility;
       if (agent_scope) insert.agent_scope = agent_scope;
       // Default memory_class so p_memory_class filtering in hybrid_recall
       // doesn't silently drop new rows (Rec #4, 2026-05-29 audit).
       insert.memory_class = memory_class || "semantic";
+      const insertTtl = ttlToExpiresAt(ttl_days ?? CLASS_DEFAULT_TTL_DAYS[insert.memory_class as string]);
+      if (insertTtl) insert.expires_at = insertTtl;
+      // Migration 087: only send an explicit value. Omitting it lets the
+      // memories_set_point_in_time_bi trigger auto-flag recurring log series.
+      if (is_point_in_time !== undefined) insert.is_point_in_time = is_point_in_time;
       // Collaborative Memory provenance: track contributing agent (REC3, arXiv 2505.18279)
-      insert.provenance = agent_id ? { contributing_agent: agent_id } : {};
+      insert.provenance = insertOwner ? { contributing_agent: insertOwner } : {};
+      // MemTX tentative belief-commit (REC 4, 2026-08-01). This row was admitted
+      // over the 0.92 novelty gate because it CONTRADICTS its near-twin, so it
+      // enters flagged and unadjudicated rather than as an accepted fact.
+      //
+      // trust_tier is deliberately NOT set here even though the research asked for
+      // 'medium': it is trigger-owned. memories_set_writer_agent_biu runs
+      // derive_trust_tier(source, writer_agent) BEFORE INSERT and would overwrite
+      // any value written from here, so setting it would be decorative. The
+      // tentative state is carried by conflict_flagged + the `contradicts` link +
+      // the memory_conflicts pair that detectConflicts files below — all of which
+      // the 03:30 contradiction scan and resolve_conflict_auto already consume.
+      if (tentativeTwin) {
+        insert.conflict_flagged = true;
+        insert.provenance = {
+          ...(insert.provenance as Record<string, unknown>),
+          tentative: true,
+          contradicts_memory_id: tentativeTwin.id,
+          contradicts_memory_name: tentativeTwin.name,
+          admitted_over_novelty_gate: Number(tentativeTwin.similarity.toFixed(4)),
+        };
+      }
       const { data: inserted, error } = await supabase.from("memories").insert(insert).select("id").single();
 
       if (error) return { content: [{ type: "text" as const, text: `Error creating memory: ${error.message}` }] };
 
-      // Apply deferred supersessions now that we have the new id
-      for (const sup of toSupersede) {
-        const { error: supErr } = await supabase.rpc("supersede_memory", {
-          p_old_id: sup.id, p_new_id: inserted.id, p_reason: `mem0: ${sup.rationale}`,
-        });
-        if (supErr) {
-          console.warn(`[mem0] supersede_memory(${sup.id}, ${inserted.id}) failed: ${supErr.message}`);
-          mem0Note += ` Could not supersede stale "${sup.name}": ${supErr.message}.`;
-        } else {
-          console.log(`[mem0] SUPERSEDE "${sup.name}" → "${name}": ${sup.rationale}`);
-          mem0Note += ` Superseded stale memory "${sup.name}" (preserved for audit).`;
+      // mem0 NEVER retires a row. (2026-08-24, follow-up to commit 690f7df.)
+      //
+      // From migration 048 until 690f7df this loop applied mem0's DELETE
+      // decisions via supersede_memory(). All 23 auto-supersedes it ever wrote
+      // were false positives — 17 live memories silently retired on cosine
+      // 0.72-0.87 topical overlap, several of them is_point_in_time dated logs,
+      // and the audit insert inside supersede_memory() had been failing
+      // silently since migration 063 (migrations 131/132). 690f7df stopped the
+      // retirement but left mem0Resolve emitting DELETE at 0.72, which just
+      // moved the noise into the adjudication queue.
+      //
+      // So the DELETE branch is GONE, not suppressed: mem0Resolve now emits
+      // CONFLICT, gated above on similarity >= MEM0_CONFLICT_FLOOR, target not
+      // point-in-time, and target not a registered dated series. Adjudication
+      // belongs to the 03:30 contradiction scan / resolve_conflict_auto, which
+      // has the evidence a synchronous single-embedding write path does not.
+      // Explicit supersede_memory() callers (monthly research consolidation,
+      // the supersede_memory tool) are UNAFFECTED.
+      for (const flag of toFlag) {
+        const { error: flagErr } = await supabase
+          .from("memories")
+          .update({ conflict_flagged: true })
+          .in("id", [flag.id, inserted.id]);
+        if (flagErr) {
+          console.warn(`[mem0] conflict_flagged(${flag.id}) failed: ${flagErr.message}`);
+          continue;
         }
+        console.log(`[mem0] CONFLICT FLAGGED "${flag.name}" vs "${name}": ${flag.rationale}`);
+        mem0Note += ` ⚠️ Flagged a possible contradiction with "${flag.name}" for adjudication (NOT retired — mem0 has no retire path).`;
       }
 
       // Auto-link
@@ -1370,8 +2106,9 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
           match_count: 5,
         });
         if (similar?.length) {
+          const liveTargets = await activeLinkTargets((similar as any[]).map((m: any) => m.id));
           const links = similar
-            .filter((m: any) => m.id !== inserted.id)
+            .filter((m: any) => m.id !== inserted.id && liveTargets.has(m.id))
             .map((m: any) => ({ source_id: inserted.id, target_id: m.id, relationship: "related_to", link_type: "semantic", strength: Math.min(m.similarity, 1.0) }));
           if (links.length) {
             await supabase.from("memory_links").upsert(links, { onConflict: "source_id,target_id,relationship" });
@@ -1380,10 +2117,29 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         }
       }
 
+      // Explicit `contradicts` edge to the twin (REC 4). detectConflicts below files
+      // the memory_conflicts PAIR, but that table is the adjudication queue; the link
+      // graph is what get_linked_memories and spreading_activation_rerank traverse,
+      // so without this edge a reader of either memory would never see the other.
+      let tentativeNote = "";
+      if (tentativeTwin && inserted?.id) {
+        const { error: linkErr } = await supabase.from("memory_links").upsert({
+          source_id: inserted.id, target_id: tentativeTwin.id,
+          relationship: "contradicts", link_type: "semantic",
+          strength: Math.min(tentativeTwin.similarity, 1.0),
+        }, { onConflict: "source_id,target_id,relationship" });
+        if (linkErr) console.warn(`[novelty] contradicts-link failed: ${linkErr.message}`);
+        tentativeNote =
+          ` ⚠️ Admitted as TENTATIVE over the novelty gate (cosine=${tentativeTwin.similarity.toFixed(3)}` +
+          ` vs "${tentativeTwin.name}") because it appears to CONTRADICT it. Both rows are` +
+          ` conflict_flagged; the 03:30 contradiction scan will adjudicate. Previously this` +
+          ` write would have been silently rejected.`;
+      }
+
       const conflicts = await detectConflicts(inserted.id, content, type, memTags, embedding);
       const conflictNote = conflicts ? ` ⚠️ Possible contradiction with: ${conflicts}` : "";
 
-      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${mem0Note}${conflictNote}` }] };
+      return { content: [{ type: "text" as const, text: `Stored new ${type} memory "${name}"${embedNote}.${linkNote}${mem0Note}${tentativeNote}${conflictNote}` }] };
     }
   );
 
@@ -1403,13 +2159,27 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       agent_scope: z.string().optional().describe("Filter by agent_scope array: pass agent name (e.g. 'wren') to see only memories scoped to 'shared' or this agent. Requires migration 012."),
       min_confidence: z.number().min(0).max(1).optional().describe("Exclude memories with confidence below this threshold (default 0.0 = return all). Use 0.5 to hide speculative/unverified memories."),
       memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Filter by memory class. episodic=event log, semantic=durable facts (default for most), procedural=skills/how-to, working=short-term context."),
+      as_of: z.string().datetime({ offset: true }).optional().describe("BI-TEMPORAL time travel (migration 109). ISO-8601 timestamp — returns what was TRUE AS OF that moment (valid_from <= as_of < valid_to), re-admitting facts that have since been superseded. Omit for normal recall, which already filters to 'true now'. This is VALID time (when the fact held in the world), NOT ingestion time (created_at) — use it to answer 'what did we believe on the 3rd', not 'what did we write on the 3rd'."),
     },
-    async ({ query, topic_hint, type, tags, limit, semantic, recall_mode, agent_id, agent_scope, min_confidence, memory_class }) => {
+    async ({ query, topic_hint, type, tags, limit, semantic, recall_mode, agent_id, agent_scope, min_confidence, memory_class, as_of }) => {
+      // Adaptive router (RECALL_ROUTER=1). Only consulted when the caller expressed
+      // NO preference — an explicit recall_mode, or the legacy `semantic` boolean,
+      // always wins. A caller that asked for a mode gets that mode.
+      const callerChoseMode = recall_mode !== undefined || semantic !== undefined;
+      const route = (RECALL_ROUTER && !callerChoseMode && query)
+        ? routeRecall(query, topic_hint)
+        : null;
+
       const maxResults = limit || 10;
 
       // recall_mode supersedes the legacy `semantic` boolean. Default to 'hybrid'.
       const effectiveMode: "hybrid" | "semantic" | "lexical" =
-        recall_mode ?? (semantic === false ? "lexical" : "hybrid");
+        recall_mode ?? route?.mode ?? (semantic === false ? "lexical" : "hybrid");
+
+      if (route) {
+        console.log(`[recall-router] mode=${route.mode} rerank=${route.rerank} `
+          + `pool=x${route.poolMultiplier} — ${route.reason} — query="${query!.slice(0, 80)}"`);
+      }
 
       // Try hybrid recall (BM25 + vector RRF) when query is provided and semantic not explicitly disabled.
       // hybrid_recall with null embedding degrades gracefully to BM25-only (tsvector ts_rank),
@@ -1434,13 +2204,18 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
           p_query_text: lexicalQueryText,
           p_query_embedding: queryEmbedding ? JSON.stringify(queryEmbedding) : null,
           p_match_threshold: queryEmbedding ? 0.3 : 0.0,
-          p_match_count: maxResults * 2, // wider pool, filter below
+          p_match_count: maxResults * (route?.poolMultiplier ?? 2), // wider pool, filter below
           p_filter_type: type || null,
         };
         if (agent_id) rpcParams.p_agent_id = agent_id;
         if (agent_scope) rpcParams.p_agent_scope = agent_scope;
         if (min_confidence && min_confidence > 0) rpcParams.p_min_confidence = min_confidence;
         if (memory_class) rpcParams.p_memory_class = memory_class;
+        // Bi-temporal read (migration 109). Only sent when the caller actually asked
+        // for a point in time: hybrid_recall's own default is now(), so omitting the
+        // key and passing now() are the same query, and omitting it keeps the call
+        // compatible with the 11-arg function if a rollback ever puts it back.
+        if (as_of) rpcParams.p_as_of = as_of;
         // Active Retrieval (MIRIX): topic_hint is the highest-weight RRF lane.
         // Semantic-only mode skips the hint so results stay purely embedding-driven.
         if (wantsLexical && topic_hint && topic_hint.trim().length > 0) rpcParams.p_topic_hint = topic_hint.trim();
@@ -1451,9 +2226,13 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
           let filtered = data as any[];
           if (tags?.length) filtered = filtered.filter((m) => tags.some((t) => m.tags?.includes(t)));
           // Reranking: TEI cross-encoder (primary, local) → Nemotron LLM (fallback)
+          // Rerank depth stays capped at 20 regardless of a wider RRF pool: TEI
+          // enforces max_client_batch_size=32 and 422s the WHOLE request above it,
+          // which makes rerankWithTEI return null and silently fall through to the
+          // un-reranked order. Raising this needs request chunking first.
           const rerankPool = filtered.slice(0, 20);
           let rerankLabel = "";
-          if (rerankPool.length > 1) {
+          if (rerankPool.length > 1 && (route?.rerank ?? true)) {
             const teiResult = await rerankWithTEI(query, rerankPool);
             if (teiResult) {
               filtered = [...teiResult, ...filtered.slice(20)];
@@ -1472,17 +2251,40 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
           if (filtered.length > 0) {
             await Promise.all(filtered.map((m: any) => supabase.rpc("touch_memory", { memory_id: m.id })));
 
+            // Same set that just got its access_count bumped is the set this session
+            // "consulted" — hand it to record_episode so the outcome edge exists.
+            recordConsults(filtered.map((m: any) => m.id));
+
             // Attach verified_at to each result so the display can show verification age.
+            // is_stale_now is the PostgREST computed column over memory_is_stale()
+            // (migration 085) — the SAME predicate stale_memories_review_queue uses.
+            // Reading the derived value rather than the cached staleness_candidate column
+            // keeps the haircut and the +stale label in step with the review queue instead
+            // of trailing it by up to 24h until the nightly sweep materializes the flag.
             const verifiedRows = await supabase
               .from("memories")
-              .select("id, verified_at")
+              .select("id, verified_at, is_stale_now")
               .in("id", filtered.map((m: any) => m.id));
             const verifiedMap: Record<string, string | null> = {};
+            const staleMap: Record<string, boolean> = {};
             for (const row of (verifiedRows.data || []) as any[]) {
               verifiedMap[row.id] = row.verified_at;
+              staleMap[row.id] = row.is_stale_now === true;
             }
             for (const m of filtered as any[]) {
               m.verified_at = verifiedMap[m.id] ?? null;
+              m.staleness_candidate = staleMap[m.id] ?? m.staleness_candidate === true;
+            }
+
+            // Staleness confidence haircut (migration 057). A flagged row is one whose
+            // verification clock has expired, so it must not be served at the same trust
+            // as a re-verified one — stale-but-confident is the failure mode we care about.
+            // Applied here rather than in hybrid_recall so the raw stored confidence is
+            // preserved and only the served value is discounted.
+            for (const m of filtered as any[]) {
+              if (m.staleness_candidate) {
+                m.confidence = (m.confidence ?? 0.8) * STALE_CONFIDENCE_FACTOR;
+              }
             }
 
             // Skill-memory auto-linking: fire-and-forget, threshold 0.75 cosine
@@ -1506,27 +2308,53 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
                   .from("memory_links")
                   .select("target_id, link_type, strength")
                   .eq("source_id", m.id)
-                  .gte("strength", 0.72);
+                  .gte("strength", SPREAD_ACTIVATION_THRESHOLD);
                 return { sourceId: m.id, links: links || [] };
               })
             );
 
-            // Collect unique target IDs from spreading activation (cap at 5 extra memories)
-            const tcTargetIds: string[] = [];
+            // Collect unique candidate target IDs. Deliberately over-collect here and
+            // cap AFTER the retirement/validity filter below: capping at 5 during
+            // collection let retired rows consume the budget and starve live ones,
+            // so the fix has to widen the candidate pool, not just filter the output.
+            const tcCandidateIds: string[] = [];
             for (const { links } of linkFetches) {
               for (const link of links) {
-                if (!filteredIds.has(link.target_id) && !tcTargetIds.includes(link.target_id) && tcTargetIds.length < 5) {
-                  tcTargetIds.push(link.target_id);
+                if (!filteredIds.has(link.target_id) && !tcCandidateIds.includes(link.target_id)
+                    && tcCandidateIds.length < SPREAD_CANDIDATE_CAP) {
+                  tcCandidateIds.push(link.target_id);
                 }
               }
             }
 
-            // Fetch those extra memories and assign boosted scores
-            if (tcTargetIds.length > 0) {
+            // Fetch those extra memories and assign boosted scores.
+            //
+            // BACKFLOW GUARD: this fetch MUST carry the same retirement and bi-temporal
+            // predicates the primary path applies, or spreading activation becomes a
+            // side door around them. It previously had neither, so a row that
+            // supersede_memory deliberately retired could be pulled back into context
+            // through a link from a still-active row — and arrive with a RELEVANCE
+            // BOOST, ranked above the live rows it was superseded by. That is the
+            // "backflow" recontamination failure mode (arXiv 2602.17692, Agentic
+            // Unlearning): forgotten content persisting via a derived artifact (the
+            // link graph) and re-entering through the retrieval loop.
+            // Measured before the fix (2026-08-12): 56 edges from 15 active entry
+            // points reached 36 retired rows at or above the activation threshold.
+            // Hard forget was never affected — memory_links is ON DELETE CASCADE.
+            // Migration 115 is the other half: it stops NEW retirements from leaving
+            // high-strength inbound edges behind. This filter is the read-side backstop
+            // and stays even so — defence in depth, since edges are also hand-authored
+            // via add_memory_link and rewired by supersede_memory.
+            if (tcCandidateIds.length > 0) {
+              const validAt = as_of ?? new Date().toISOString();
               const { data: extraMems } = await supabase
                 .from("memories")
                 .select("id, type, name, description, content, tags, source, conflict_flagged")
-                .in("id", tcTargetIds);
+                .in("id", tcCandidateIds)
+                .not("is_active", "is", false)
+                .lte("valid_from", validAt)
+                .or(`valid_to.is.null,valid_to.gt.${validAt}`)
+                .limit(SPREAD_EXTRA_LIMIT);
               if (extraMems) {
                 for (const em of extraMems) {
                   // Find max boost from any temporal/causal link pointing to this memory
@@ -1543,10 +2371,33 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
               }
             }
 
-            // Fetch links for the top result to show in the link section
+            // Fetch links for the top result to show in the link section.
+            //
+            // get_linked_memories joins memories with NO is_active predicate and no
+            // strength floor at all, so it leaks retired rows independently of the
+            // spreading-activation path above — and independently of migration 115's
+            // downweight, which only moves edges below a threshold this display does
+            // not apply. It surfaces name + description rather than full content, so
+            // the blast radius is smaller, but it is the same backflow channel and an
+            // agent reads a retired row's summary as current. Filtered here rather
+            // than in the RPC because get_linked_memories is also called by callers
+            // that legitimately want lineage (which is retired rows by definition).
             let linkSection = "";
             const top = filtered[0];
-            const { data: linked } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
+            const { data: linkedRaw } = await supabase.rpc("get_linked_memories", { memory_id: top.id, max_depth: 1 });
+            let linked = linkedRaw as any[] | null;
+            if (linked?.length) {
+              const validAt = as_of ?? new Date().toISOString();
+              const { data: liveRows } = await supabase
+                .from("memories")
+                .select("id")
+                .in("id", linked.map((l: any) => l.id))
+                .not("is_active", "is", false)
+                .lte("valid_from", validAt)
+                .or(`valid_to.is.null,valid_to.gt.${validAt}`);
+              const liveIds = new Set((liveRows || []).map((r: any) => r.id));
+              linked = linked.filter((l: any) => liveIds.has(l.id));
+            }
             if (linked?.length) {
               // Fetch link_type for each linked memory from memory_links
               const { data: linkTypeRows } = await supabase
@@ -1573,12 +2424,15 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
               const confidenceStr = m.confidence !== undefined && m.confidence < 0.8 ? ` conf:${m.confidence.toFixed(2)}` : "";
               const trust = SOURCE_TRUST[m.source] ? ` · trust:${SOURCE_TRUST[m.source]}` : "";
               const conflictFlag = m.conflict_flagged ? " ⚠️" : "";
-              const staleFlag = m.staleness_candidate ? " [stale?]" : "";
+              // +stale means the verification clock expired and confidence above is
+              // already discounted by STALE_CONFIDENCE_FACTOR — re-verify before trusting,
+              // then call update_memory_verified to clear the flag.
+              const staleFlag = m.staleness_candidate ? " +stale" : "";
               let verifyStr = "";
               if (m.verified_at) {
                 const ageDays = (Date.now() - new Date(m.verified_at).getTime()) / 86400000;
                 verifyStr = ` verified:${ageDays.toFixed(0)}d`;
-              } else if ((m.access_count || 0) >= 10 && (m.importance_score || 0) >= 0.7) {
+              } else if (m.staleness_candidate || ((m.access_count || 0) >= 10 && (m.importance_score || 0) >= 0.7)) {
                 verifyStr = " verified:never";
               }
               return `## ${m.name} (${m.type})${tagStr}${scoreStr}${importanceStr}${accessStr}${confidenceStr}${trust}${conflictFlag}${staleFlag}${verifyStr}\n_${m.description}_\n\n${m.content}${i === 0 ? linkSection : ""}`;
@@ -1614,6 +2468,17 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (tags && tags.length > 0) q = q.overlaps("tags", tags);
       if (query) q = q.or(`name.ilike.%${query}%,description.ilike.%${query}%,content.ilike.%${query}%`);
       if (memory_class) q = q.eq("memory_class", memory_class);
+      // Bi-temporal filter (migration 109), mirroring hybrid_recall's default so the
+      // fallback cannot serve a fact the primary path would withhold. Unconditional
+      // for the same reason it is unconditional in the RPC: "no longer true" is not
+      // a filter the caller should have to remember to ask for.
+      // NOTE: this path has never filtered is_active either — a pre-existing gap,
+      // left alone here because relaxing/tightening it is a behaviour change the
+      // retrieval gate does not cover. Worth its own pass.
+      {
+        const validAt = as_of ?? new Date().toISOString();
+        q = q.lte("valid_from", validAt).or(`valid_to.is.null,valid_to.gt.${validAt}`);
+      }
       // Agent visibility filter: when agent_id set, return shared + own private; else return shared only (or all if visibility column not yet added)
       if (agent_id) q = q.or(`visibility.eq.shared,and(visibility.eq.private,agent_id.eq.${agent_id})`);
 
@@ -1641,6 +2506,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       name: z.string().describe("Exact name of the memory to delete"),
     },
     async ({ name }) => {
+      const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "forget");
+      if (denied) return denied;
       const { data: existing } = await supabase
         .from("memories")
         .select("id")
@@ -1671,6 +2538,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       reason: z.string().optional().describe("Why the supersession (e.g. 'IP address changed', 'service migrated to new host')"),
     },
     async ({ old_name, new_name, reason }) => {
+      const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "supersede_memory");
+      if (denied) return denied;
       const { data: oldMem } = await supabase.from("memories").select("id").eq("name", old_name).maybeSingle();
       if (!oldMem) return { content: [{ type: "text" as const, text: `No memory found with name "${old_name}"` }] };
       const { data: newMem } = await supabase.from("memories").select("id").eq("name", new_name).maybeSingle();
@@ -1897,6 +2766,17 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const key = `files/${Date.now()}-${filename}`;
         const body = Buffer.from(content_base64, "base64");
 
+        // Security gate (OWASP ASI06). Metadata always — it is what recall_file
+        // surfaces. Body only for agent-readable text; binary payloads are stored
+        // opaquely and never re-enter an agent's context as prose.
+        const fileThreat = scanFields([
+          ["filename", filename], ["description", description],
+          ["content", isAgentReadableText(mime) ? body.toString("utf-8") : undefined],
+        ]);
+        if (fileThreat) {
+          return { content: [{ type: "text" as const, text: `Blocked: ${fileThreat.split(":")[0]} matches threat pattern '${fileThreat.split(":")[1]}'. File not stored.` }] };
+        }
+
         try {
           await r2!.send(new PutObjectCommand({
             Bucket: R2_BUCKET,
@@ -1996,6 +2876,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         filename: z.string().describe("Exact filename to delete"),
       },
       async ({ filename }) => {
+        const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "forget_file");
+        if (denied) return denied;
         const { data: file } = await supabase
           .from("memory_files")
           .select("id, r2_key")
@@ -2033,6 +2915,14 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const ext = key.split(".").pop()?.toLowerCase() || "";
         const mime = content_type || (ext === "md" ? "text/markdown" : ext === "json" ? "application/json" : "text/plain");
         const body = Buffer.from(content, "utf-8");
+
+        // Security gate (OWASP ASI06). store_file payloads come back verbatim
+        // through get_file, so this lane is as readable as a memory row.
+        const storeThreat = scanFields([["key", key], ["content", content]]);
+        if (storeThreat) {
+          return { content: [{ type: "text" as const, text: `Blocked: ${storeThreat.split(":")[0]} matches threat pattern '${storeThreat.split(":")[1]}'. Nothing written to R2.` }] };
+        }
+
         try {
           await r2!.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: body, ContentType: mime }));
           return { content: [{ type: "text" as const, text: `Stored ${body.length.toLocaleString()} bytes → ${R2_BUCKET}/${key}` }] };
@@ -2082,11 +2972,21 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (threat) return { content: [{ type: "text" as const, text: `Blocked: ${field} matches threat pattern '${threat}'. Skill not saved.` }] };
       }
 
+      // A skill with no triggers is invisible to poll_queue.py::_match_skill, which
+      // scores triggers and nothing else. It can never be auto-attributed to a task
+      // no matter how often it is used, so it silently drops out of the outcome loop.
+      // Reject rather than warn: a warning in a tool result is advisory text an agent
+      // routinely ignores, and six months of ignoring it produced 12 unreachable
+      // duplicates of one skill. Rejecting is recoverable in one retry.
+      const skillTriggers = (triggers || []).map((t) => (t || "").trim()).filter(Boolean);
+      if (skillTriggers.length === 0) {
+        return { content: [{ type: "text" as const, text: `Refused: skill "${name}" has no triggers. A trigger-less skill cannot be matched to a task by poll_queue.py::_match_skill and will be reported as unreachable by the nightly skill gate. Re-call save_skill with triggers — 3-6 phrases an agent would plausibly have in a task title/description, e.g. ['daily research run', 'self-improvement research']. Multi-word phrases score higher (len(words)^2, min score 4), so prefer 'deploy podman service' over 'deploy'.` }] };
+      }
+
       // AIP: verified caller identity overrides client-supplied source
       const src = callerIdentity || source || "claude-code";
-      const skillTriggers = triggers || [];
       const skillPlatforms = platforms || [];
-      const embedding = await embed(embedInput(name, description, content));
+      const embedding = await embed(skillEmbedInput(name, description, content, skillTriggers));
 
       const { data: existing } = await supabase.from("skills").select("id").eq("name", name).maybeSingle();
 
@@ -2118,9 +3018,10 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       steps: z.array(z.string()).optional().describe("Key steps taken (ordered) — used to generate skill content"),
       agent_id: z.string().optional().describe("Agent completing the task (e.g. 'wren', 'iris')"),
       skill_name: z.string().optional().describe("Override auto-generated skill name slug (kebab-case)"),
-      success: z.boolean().optional().describe("Whether the task succeeded (true) or failed (false). Updates success_rate on the named skill if provided."),
+      success: z.boolean().optional().describe("Whether the task succeeded (true) or failed (false). Increments success_count/fail_count on the named skill if provided."),
+      outcome_note: z.string().optional().describe("Short note on the outcome — stored as skills.last_outcome for the named skill"),
     },
-    async ({ task_summary, tool_count, steps, agent_id, skill_name, success }) => {
+    async ({ task_summary, tool_count, steps, agent_id, skill_name, success, outcome_note }) => {
       const src = callerIdentity || agent_id || "claude-code";
 
       // Log task completion to agent_activity regardless of tool_count
@@ -2131,15 +3032,18 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         metadata: { tool_count, skill_captured: tool_count >= 5, success },
       });
 
-      // ── Update skill success_rate if skill_name + success provided ──────────
+      // ── Skill outcome telemetry (migration 058, CODESKILL pattern) ──────────
+      // Counts over a Bayesian rate: transparent, auditable, rate derives on read.
       if (skill_name !== undefined && success !== undefined) {
-        const { data: existingSkill } = await supabase.from("skills").select("id, use_count, success_rate").eq("name", skill_name).maybeSingle();
+        const { data: existingSkill } = await supabase.from("skills").select("id, success_count, fail_count").eq("name", skill_name).maybeSingle();
         if (existingSkill) {
-          const n = Math.max((existingSkill.use_count || 1), 1);
-          const oldRate = existingSkill.success_rate ?? 0.5;
-          // Bayesian incremental mean: new_rate = old_rate + (outcome - old_rate) / n
-          const newRate = Math.max(0, Math.min(1, oldRate + ((success ? 1.0 : 0.0) - oldRate) / n));
-          await supabase.from("skills").update({ success_rate: newRate }).eq("id", existingSkill.id);
+          const { error: outcomeErr } = await supabase.from("skills").update({
+            success_count: (existingSkill.success_count || 0) + (success ? 1 : 0),
+            fail_count: (existingSkill.fail_count || 0) + (success ? 0 : 1),
+            last_outcome: (outcome_note || `${success ? "success" : "failure"}: ${task_summary}`).slice(0, 500),
+            last_used_at: new Date().toISOString(),
+          }).eq("id", existingSkill.id);
+          if (outcomeErr) console.warn(`[skills] outcome update failed for "${skill_name}":`, outcomeErr.message);
         }
       }
 
@@ -2184,28 +3088,130 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       }
 
       // ── Check if skill already exists ───────────────────────────────────────
-      const { data: existingSkill } = await supabase.from("skills").select("id").eq("name", autoName).maybeSingle();
-      const skillEmbedding = await embed(embedInput(autoName, task_summary, skillContent));
+      // An exact-name lookup is not enough. autoName is the first five content words
+      // of task_summary, so a recurring task whose summary shifts by one word mints a
+      // NEW row every run: the daily research task produced twelve of them between
+      // 2026-05-13 and 2026-08-21 ("...-task", "...-run", "...-fleet", "...-found",
+      // "...-atlas"), each a one-line log of a single day rather than a reusable
+      // procedure. When the caller did not pin skill_name, fall back to a name-token
+      // overlap match so those land on one row.
+      //
+      // Threshold is >=4 shared tokens out of at most 5. That is deliberately strict:
+      // a false merge destroys a distinct skill, while a missed merge only leaves a
+      // duplicate for a human to fold in later. On the twelve real rows it merges the
+      // six "daily-self-improvement-research-*" variants and correctly declines to
+      // merge "research-review-verified-all-tiers" (2 shared tokens).
+      let existingSkill: { id: string; name: string } | null = null;
+      {
+        const exact = await supabase.from("skills").select("id, name").eq("name", autoName).maybeSingle();
+        existingSkill = exact.data ?? null;
+      }
+      let mergedFrom: string | null = null;
+      if (!existingSkill && !skill_name) {
+        const autoTokens = new Set(autoName.split("-").filter(Boolean));
+        const { data: allSkills } = await supabase.from("skills").select("id, name");
+        for (const cand of allSkills || []) {
+          const shared = cand.name.split("-").filter((t: string) => autoTokens.has(t)).length;
+          if (shared >= 4) { existingSkill = { id: cand.id, name: cand.name }; mergedFrom = autoName; break; }
+        }
+      }
+
+      const targetName = existingSkill?.name || autoName;
+
+      // Never write triggers: [] — that is what made all twelve rows unreachable to
+      // poll_queue.py::_match_skill. Derive them from the summary's own words so an
+      // auto-captured skill is at least matchable, then let a human refine via
+      // save_skill. A 2-word and a 3-word phrase clear the min score of 4 on their own.
+      const derivedTriggers = autoWords.length >= 2
+        ? Array.from(new Set([
+            autoWords.slice(0, 2).join(" "),
+            autoWords.slice(0, 3).join(" "),
+            autoWords.slice(0, 4).join(" "),
+          ].filter((t) => t.split(" ").length >= 2)))
+        : [];
+
+      const skillEmbedding = await embed(skillEmbedInput(targetName, task_summary, skillContent, derivedTriggers));
 
       if (existingSkill) {
-        const upd: Record<string, unknown> = { description: task_summary, content: skillContent, source: src };
-        if (skillEmbedding) upd.embedding = JSON.stringify(skillEmbedding);
+        const { data: cur } = await supabase.from("skills")
+          .select("triggers, description, content").eq("id", existingSkill.id).maybeSingle();
+
+        // NEVER replace a curated body with a one-line task summary. This update used
+        // to be `content: skillContent`, which meant every auto-capture onto an
+        // existing skill overwrote the procedure with "what I did today". That is the
+        // other half of why six months of daily-research knowledge was useless to the
+        // next run: not just twelve rows, but each row holding a day's log where a
+        // reusable procedure should have been. Verified the hard way on 2026-08-23 —
+        // this very call flattened a 4.5k-char consolidated procedure to 445 chars.
+        //
+        // A run IS worth recording, so append it to a bounded run log instead of
+        // discarding it. The curated prose above the log is never touched.
+        const RUN_LOG_HEADING = "## Run log (auto-captured — newest first, last 10)";
+        const RUN_LOG_MAX = 10;
+        const today = new Date().toISOString().slice(0, 10);
+        const entry = `- **${today}** (${src}, ${tool_count} calls): ${task_summary.replace(/\s+/g, " ").trim()}`;
+
+        const prior: string = cur?.content || "";
+        const idx = prior.indexOf(RUN_LOG_HEADING);
+        const body = (idx === -1 ? prior : prior.slice(0, idx)).replace(/\s+$/, "");
+        const priorEntries = idx === -1
+          ? []
+          : prior.slice(idx + RUN_LOG_HEADING.length).split("\n").map((l) => l.trim()).filter((l) => l.startsWith("- "));
+        const entries = [entry, ...priorEntries].slice(0, RUN_LOG_MAX);
+
+        // If the row has no curated body yet (a bare auto-captured stub), seed it with
+        // this run's content so the skill is not just a log with nothing above it.
+        const newBody = body.length > 0 ? body : skillContent;
+        const newContent = `${newBody}\n\n${RUN_LOG_HEADING}\n${entries.join("\n")}\n`;
+
+        const upd: Record<string, unknown> = { content: newContent, source: src };
+        // Same rule for description and triggers: backfill only, never clobber.
+        if (!cur?.description?.trim()) upd.description = task_summary;
+        if (!cur?.triggers?.length && derivedTriggers.length) upd.triggers = derivedTriggers;
+
+        const reEmbed = await embed(skillEmbedInput(
+          existingSkill.name,
+          (cur?.description?.trim() || task_summary),
+          newContent,
+          cur?.triggers?.length ? cur.triggers : derivedTriggers,
+        ));
+        if (reEmbed) upd.embedding = JSON.stringify(reEmbed);
+
         const { error } = await supabase.from("skills").update(upd).eq("id", existingSkill.id);
         if (error) return { content: [{ type: "text" as const, text: `Auto-capture failed (update): ${error.message}` }] };
-        return { content: [{ type: "text" as const, text: `Auto-updated skill "${autoName}" (${tool_count} tool calls, ${src}). Review with list_skills.` }] };
+        const note = mergedFrom ? ` (merged from proposed name "${mergedFrom}" — >=4 shared name tokens)` : "";
+        return { content: [{ type: "text" as const, text: `Appended run-log entry to skill "${existingSkill.name}"${note} (${tool_count} tool calls, ${src}). Curated body preserved. Review with list_skills.` }] };
       }
 
       const ins: Record<string, unknown> = {
         name: autoName, title: task_summary, description: task_summary,
-        content: skillContent, source: src, triggers: [], platforms: [],
+        content: skillContent, source: src, triggers: derivedTriggers, platforms: [],
       };
       if (skillEmbedding) ins.embedding = JSON.stringify(skillEmbedding);
 
       const { error } = await supabase.from("skills").insert(ins);
       if (error) return { content: [{ type: "text" as const, text: `Auto-capture failed (insert): ${error.message}` }] };
-      return { content: [{ type: "text" as const, text: `Auto-captured skill "${autoName}" from ${tool_count}-tool-call task. Review and refine with list_skills / save_skill.` }] };
+      const trigNote = derivedTriggers.length
+        ? ` Derived triggers: [${derivedTriggers.join(", ")}] — refine with save_skill.`
+        : ` WARNING: no triggers could be derived; this skill is unreachable to _match_skill until you set some with save_skill.`;
+      return { content: [{ type: "text" as const, text: `Auto-captured skill "${autoName}" from ${tool_count}-tool-call task.${trigNote}` }] };
     }
   );
+
+  // THE single writer for skills.use_count / last_used_at on selection (migration
+  // 112, research REC 3a). This used to be an inline
+  // `.update({ use_count: (s.use_count || 0) + 1 })` repeated in all three
+  // recall_skill branches — a read-modify-write that silently loses bumps when two
+  // agents recall the same skill at once, which is how use_count ended up BELOW
+  // success_count (discord-azlab-mcp read 1 vs 32). The RPC increments in one
+  // statement and stamps last_used_at in the same UPDATE, so the two columns can
+  // no longer disagree. Outcome counters stay with record_skill_outcome (080).
+  async function bumpSkillUsage(ids: string[]): Promise<void> {
+    if (!ids?.length) return;
+    // Telemetry must never fail a recall — the caller wanted the skill, not the counter.
+    const { error } = await supabase.rpc("bump_skill_usage", { p_skill_ids: ids });
+    if (error) console.error(`bump_skill_usage failed for ${ids.length} skill(s): ${error.message}`);
+  }
 
   // ── Tool: recall_skill ───────────────────────────────────────────────────────
   server.tool(
@@ -2222,7 +3228,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (name) {
         const { data, error } = await supabase.from("skills").select("*").eq("name", name).maybeSingle();
         if (error || !data) return { content: [{ type: "text" as const, text: `Skill "${name}" not found.` }] };
-        await supabase.from("skills").update({ use_count: (data.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", data.id);
+        await bumpSkillUsage([data.id]);
         return { content: [{ type: "text" as const, text: `# ${data.title}\n_${data.description}_\n\n${data.content}` }] };
       }
 
@@ -2230,8 +3236,16 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const queryEmbedding = await embed(query);
         if (queryEmbedding) {
           const { data, error } = await supabase.rpc("match_skills", { query_embedding: JSON.stringify(queryEmbedding), match_count: maxResults });
+          // Log the RPC error. This `if (!error && ...)` used to fall through in
+          // silence, and on 2026-08-23 that silence was found to have been hiding a
+          // TOTAL outage: match_skills had lost `extensions` from its search_path, so
+          // every call raised 42883 and every recall_skill quietly degraded to the
+          // ILIKE substring fallback below. Semantic skill recall was dead and the
+          // tool still answered, so nothing ever went red. Migration 127 fixed the
+          // function; this line is what makes the next such failure visible.
+          if (error) console.warn(`[skills] match_skills RPC failed — falling back to substring match: ${error.message}`);
           if (!error && data?.length > 0) {
-            for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", s.id);
+            await bumpSkillUsage(data.map((s: any) => s.id));
             const results = data.map((s: any) => `# ${s.title} (${(s.similarity * 100).toFixed(0)}% match)\n_${s.description}_\n\n${s.content}`);
             return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
           }
@@ -2240,7 +3254,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         const { data, error } = await supabase.from("skills").select("*")
           .or(`name.ilike.%${query}%,title.ilike.%${query}%,description.ilike.%${query}%`).limit(maxResults);
         if (error || !data?.length) return { content: [{ type: "text" as const, text: "No matching skills found." }] };
-        for (const s of data) await supabase.from("skills").update({ use_count: (s.use_count || 0) + 1, last_used: new Date().toISOString() }).eq("id", s.id);
+        await bumpSkillUsage(data.map((s: any) => s.id));
         const results = data.map((s: any) => `# ${s.title}\n_${s.description}_\n\n${s.content}`);
         return { content: [{ type: "text" as const, text: results.join("\n\n---\n\n") }] };
       }
@@ -2275,6 +3289,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       name: z.string().describe("Exact skill name to delete"),
     },
     async ({ name }) => {
+      const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "delete_skill");
+      if (denied) return denied;
       const { error } = await supabase.from("skills").delete().eq("name", name);
       if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
       console.log(`[aip] delete_skill "${name}" by ${callerIdentity || "unverified"}`);
@@ -2347,6 +3363,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       merged_content: z.string().optional().describe("Replacement content for the primary memory after merge. If omitted, primary content is unchanged."),
     },
     async ({ primary_name, secondary_name, merged_content }) => {
+      const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "merge_memories");
+      if (denied) return denied;
       // Fetch both
       const { data: primary } = await supabase.from("memories").select("id, type, description, content, tags, source, version").eq("name", primary_name).maybeSingle();
       const { data: secondary } = await supabase.from("memories").select("id, tags, content").eq("name", secondary_name).maybeSingle();
@@ -2431,6 +3449,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       dry_run: z.boolean().optional().describe("Preview what would be discarded without deleting (default false)"),
     },
     async ({ threshold = 0.92, max_discards = 10, dry_run = false }) => {
+      const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "discard_redundant");
+      if (denied) return denied;
       const { data, error } = await supabase.rpc("discard_redundant_memories", {
         p_similarity_threshold: threshold,
         p_max_discards: max_discards,
@@ -2605,6 +3625,8 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         data: z.record(z.unknown()).optional().describe("Additional service data (e.g. temperature, brightness, hvac_mode)"),
       },
       async ({ domain, service, entity_id, data }) => {
+        const denied = scopeDenied(caller, AIP_SCOPE_HA, "ha_call_service");
+        if (denied) return denied;
         const payload: Record<string, unknown> = { ...data };
         if (entity_id) payload.entity_id = entity_id;
         await haFetch(`/services/${domain}/${service}`, "POST", payload);
@@ -2640,7 +3662,7 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
     "record_episode",
     "Record or update an agent episode (task execution log). Captures input, actions, outcome, and learnings for episodic self-improvement (MemRL/CoALA pattern).",
     {
-      agent: z.string().describe("Agent name: wren, iris, atlas, forge, volt"),
+      agent: z.string().describe("Agent name: wren, iris, atlas, volt"),
       task_id: z.string().uuid().optional().describe("task_queue UUID this episode corresponds to"),
       status: z.enum(["in_progress", "completed", "failed", "partial"]).optional().describe("Episode status (default: in_progress)"),
       summary: z.string().optional().describe("1-2 sentence summary of what was done"),
@@ -2652,6 +3674,26 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       episode_id: z.string().uuid().optional().describe("Existing episode ID to update (omit to create new)"),
     },
     async ({ agent, task_id, status, summary, input_summary, actions, outcome, learnings, memories_consulted, episode_id }) => {
+      // Security gate (OWASP ASI06). Episodes are embedded and readable by every
+      // agent through recall_episodes, and episodic_distill.py promotes them into
+      // long-term memory — an unscanned episode is the "write once, fire later"
+      // surface, so the gate covers the update path too, not just the insert.
+      // `actions` is serialised because it is free-form JSON supplied by the caller.
+      const episodeThreat = scanFields([
+        ["summary", summary], ["input_summary", input_summary], ["outcome", outcome],
+        ["learnings", learnings], ["actions", actions ? JSON.stringify(actions) : undefined],
+      ]);
+      if (episodeThreat) {
+        return { content: [{ type: "text" as const, text: `Blocked: ${episodeThreat.split(":")[0]} matches threat pattern '${episodeThreat.split(":")[1]}'. Episode not recorded.` }] };
+      }
+
+      // An explicit argument always wins; the recall buffer only fills the gap the
+      // caller left. Undefined (not []) when there is nothing, so the field keeps
+      // its existing "never set" shape rather than gaining a meaningless empty array.
+      const resolvedConsults = memories_consulted?.length
+        ? memories_consulted
+        : (consultBuffer.length ? consultBuffer : undefined);
+
       if (episode_id) {
         // Update existing episode
         const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
@@ -2661,8 +3703,21 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
         if (actions) updates.actions = actions;
         if (outcome) updates.outcome = outcome;
         if (learnings) updates.learnings = learnings;
-        if (memories_consulted) updates.memories_consulted = memories_consulted;
+        // Union with what is already stored. A long task typically opens the episode,
+        // recalls more as it goes, then closes it — clobbering on the close-out call
+        // would drop every memory consulted before the last recall.
+        if (resolvedConsults) {
+          const { data: curMems } = await supabase.from("agent_episodes").select("memories_consulted").eq("id", episode_id).maybeSingle();
+          updates.memories_consulted = [...new Set([...(curMems?.memories_consulted || []), ...resolvedConsults])];
+        }
         if (status && status !== "in_progress") updates.ended_at = new Date().toISOString();
+        // Re-embed when semantic fields change (migration 059) — merge with stored
+        // values so a learnings-only update doesn't drop summary/outcome from the vector
+        if (summary || outcome || learnings) {
+          const { data: cur } = await supabase.from("agent_episodes").select("summary, outcome, learnings").eq("id", episode_id).maybeSingle();
+          const vec = await embed(episodeEmbedInput(summary ?? cur?.summary, outcome ?? cur?.outcome, learnings ?? cur?.learnings));
+          if (vec) updates.embedding = JSON.stringify(vec);
+        }
         const { error } = await supabase.from("agent_episodes").update(updates).eq("id", episode_id);
         if (error) return { content: [{ type: "text" as const, text: `Failed to update episode: ${error.message}` }] };
         return { content: [{ type: "text" as const, text: `Episode ${episode_id} updated (status: ${status || "unchanged"})` }] };
@@ -2679,8 +3734,14 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
       if (actions) row.actions = actions;
       if (outcome) row.outcome = outcome;
       if (learnings) row.learnings = learnings;
-      if (memories_consulted) row.memories_consulted = memories_consulted;
+      if (resolvedConsults) row.memories_consulted = resolvedConsults;
       if (status && status !== "in_progress") row.ended_at = new Date().toISOString();
+      // Embed semantic fields at write time (migration 059) — makes the episode
+      // recallable via recall_episodes(query). Backfill job covers Ollama outages.
+      if (summary || outcome || learnings) {
+        const vec = await embed(episodeEmbedInput(summary, outcome, learnings));
+        if (vec) row.embedding = JSON.stringify(vec);
+      }
       const { data, error } = await supabase.from("agent_episodes").insert(row).select("id").single();
       if (error) return { content: [{ type: "text" as const, text: `Failed to record episode: ${error.message}` }] };
       return { content: [{ type: "text" as const, text: `Episode recorded: ${data.id} (agent: ${agent}, status: ${row.status})` }] };
@@ -2690,24 +3751,47 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
   // ── Tool: recall_episodes ──────────────────────────────────────────────────
   server.tool(
     "recall_episodes",
-    "Recall recent agent episodes to learn from past task outcomes. Surfaces prior runs matching agent or status filters.",
+    "Recall agent episodes to learn from past task outcomes. Pass a query for semantic search (MemRL pattern — 'what happened last time I did X?'), or use agent/status filters for recency-ordered results. Call at task start to pull similar prior runs with their outcomes and learnings.",
     {
+      query: z.string().optional().describe("Semantic search over episode summaries/outcomes/learnings — describe the task you're about to do. Omit for recency-ordered listing."),
       agent: z.string().optional().describe("Filter by agent name"),
       status: z.enum(["in_progress", "completed", "failed", "partial"]).optional().describe("Filter by status"),
       limit: z.number().optional().describe("Max episodes to return (default 5)"),
       with_learnings_only: z.boolean().optional().describe("Only return episodes that have learnings captured"),
     },
-    async ({ agent, status, limit, with_learnings_only }) => {
-      let q = supabase
-        .from("agent_episodes")
-        .select("id, agent, task_id, started_at, ended_at, status, summary, input_summary, outcome, learnings, memories_consulted")
-        .order("created_at", { ascending: false })
-        .limit(limit || 5);
-      if (agent) q = q.eq("agent", agent);
-      if (status) q = q.eq("status", status);
-      if (with_learnings_only) q = q.not("learnings", "is", null);
-      const { data, error } = await q;
-      if (error) return { content: [{ type: "text" as const, text: `Episode recall failed: ${error.message}` }] };
+    async ({ query, agent, status, limit, with_learnings_only }) => {
+      let data: any[] | null = null;
+      let semantic = false;
+      // Semantic lane (migration 059): embed the query, cosine-match via match_episodes
+      if (query) {
+        const qVec = await embed(query);
+        if (qVec) {
+          const { data: matched, error: rpcErr } = await supabase.rpc("match_episodes", {
+            query_embedding: JSON.stringify(qVec),
+            match_count: limit || 5,
+            filter_agent: agent ?? null,
+            filter_status: status ?? null,
+          });
+          if (rpcErr) console.warn("[recall_episodes] match_episodes failed, falling back to filters:", rpcErr.message);
+          else if (matched?.length) {
+            data = with_learnings_only ? matched.filter((ep: any) => ep.learnings) : matched;
+            semantic = true;
+          }
+        }
+      }
+      if (!data) {
+        let q = supabase
+          .from("agent_episodes")
+          .select("id, agent, task_id, started_at, ended_at, status, summary, input_summary, outcome, learnings, memories_consulted")
+          .order("created_at", { ascending: false })
+          .limit(limit || 5);
+        if (agent) q = q.eq("agent", agent);
+        if (status) q = q.eq("status", status);
+        if (with_learnings_only) q = q.not("learnings", "is", null);
+        const { data: rows, error } = await q;
+        if (error) return { content: [{ type: "text" as const, text: `Episode recall failed: ${error.message}` }] };
+        data = rows;
+      }
       if (!data?.length) return { content: [{ type: "text" as const, text: "No episodes found matching criteria." }] };
       const lines = data.map((ep) => {
         const dur = ep.ended_at && ep.started_at
@@ -2715,15 +3799,16 @@ function createMcpServer(callerIdentity: string | null = null): McpServer {
           : "";
         const taskRef = ep.task_id ? ` task:${ep.task_id.slice(0, 8)}` : "";
         const memCount = ep.memories_consulted?.length ? ` mems:${ep.memories_consulted.length}` : "";
+        const sim = typeof ep.similarity === "number" ? ` sim:${ep.similarity.toFixed(2)}` : "";
         return [
-          `## ${ep.agent} — ${ep.status}${dur}${taskRef}${memCount}`,
+          `## ${ep.agent} — ${ep.status}${dur}${taskRef}${memCount}${sim}`,
           ep.input_summary ? `**Input:** ${ep.input_summary}` : null,
           ep.summary ? `**Summary:** ${ep.summary}` : null,
           ep.outcome ? `**Outcome:** ${ep.outcome}` : null,
           ep.learnings ? `**Learnings:** ${ep.learnings}` : null,
         ].filter(Boolean).join("\n");
       });
-      return { content: [{ type: "text" as const, text: `${data.length} episode(s):\n\n${lines.join("\n\n---\n\n")}` }] };
+      return { content: [{ type: "text" as const, text: `${data.length} episode(s)${semantic ? " (semantic match)" : ""}:\n\n${lines.join("\n\n---\n\n")}` }] };
     }
   );
 
@@ -2751,24 +3836,30 @@ app.use((req: Request, res: Response, next: () => void) => {
 
 const haEnabled = !!(HA_URL && HA_TOKEN);
 
+let cachedToolCount: number | null = null;
+
+function getToolCount(server: McpServer): number {
+  return Object.keys((server as any)._registeredTools).length;
+}
+
 app.get("/health", (_req: Request, res: Response) => {
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 10; // +10: memory blocks (get/set) + add_memory_link + record_task_completion + discard_redundant + check_stale_context + update_read_watermark; r2: remember_file, recall_file, forget_file, store_file, get_file
-  res.json({ status: "ok", service: "memory-mcp-server", version: "5.11.0", tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
+  const toolCount = cachedToolCount ?? 0;
+  res.json({ status: "ok", service: "memory-mcp-server", version: SERVER_VERSION, tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
 // Map to store transports and their servers by session ID
 const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
 
 app.post("/mcp", async (req: Request, res: Response) => {
-  // AIP: extract and verify caller-identity JWT from Authorization header
-  let callerIdentity: string | null = null;
+  // AIP: extract and verify caller-identity JWT from Authorization header.
+  // Scopes are pinned at session establishment, not re-checked per request —
+  // a token that expires mid-session keeps the session it opened.
+  let caller: AipCaller | null = null;
   const authHeader = req.headers.authorization || "";
   if (authHeader.startsWith("Bearer ") && AIP_SECRET) {
-    const token = authHeader.slice(7);
-    const payload = verifyAipJwt(token);
-    if (payload) {
-      callerIdentity = payload.sub;
-      console.log(`[aip] verified caller: ${callerIdentity}`);
+    caller = verifyAipJwt(authHeader.slice(7));
+    if (caller) {
+      console.log(`[aip] verified caller: ${caller.sub} scopes=${caller.scopes ? `[${caller.scopes.join(" ")}]` : "(unscoped)"}`);
     } else {
       console.warn("[aip] invalid/expired JWT presented — caller unverified");
     }
@@ -2784,7 +3875,8 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
   // New session — new server instance with verified caller identity bound
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
-  const server = createMcpServer(callerIdentity);
+  const server = createMcpServer(caller);
+  if (!cachedToolCount) cachedToolCount = getToolCount(server);
 
   transport.onclose = () => {
     const sid = (transport as any).sessionId;
@@ -2822,9 +3914,13 @@ app.delete("/mcp", async (req: Request, res: Response) => {
   res.status(400).json({ error: "No session found." });
 });
 
+// Pre-compute tool count at startup by creating a template server
+const templateServer = createMcpServer(null);
+cachedToolCount = getToolCount(templateServer);
+
 app.listen(PORT, "0.0.0.0", async () => {
-  const toolCount = (r2 ? 15 : 10) + (haEnabled ? 3 : 0) + 9;
-  console.log(`Memory MCP Server v5.11.0 — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
+  const toolCount = cachedToolCount!;
+  console.log(`Memory MCP Server v${SERVER_VERSION} — http://0.0.0.0:${PORT}/mcp (${toolCount} tools, R2: ${r2Enabled ? "enabled" : "disabled"}, HA: ${haEnabled ? "enabled" : "disabled"}, AIP: ${AIP_SECRET ? "enabled" : "disabled"})`);
   console.log(`Health check — http://0.0.0.0:${PORT}/health`);
   await applyStartupMigrations();
   startMemorySyncListener();

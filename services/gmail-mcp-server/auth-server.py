@@ -16,18 +16,20 @@ import subprocess
 import sys
 import threading
 
-CLIENT_ID = "552673314433-h7hfganol73q0s75tn73d80iaa7k4d31.apps.googleusercontent.com"
-CLIENT_SECRET_FILE = "/home/almty1/azlab/services/gmail-mcp-server/.env"
 REDIRECT_URI = "http://localhost:3000/callback"
 SCOPES = "https://mail.google.com/ https://www.googleapis.com/auth/gmail.settings.sharing"
 ENV_FILE = "/home/almty1/azlab/services/gmail-mcp-server/.env"
 
-def read_client_secret():
-    with open(CLIENT_SECRET_FILE) as f:
+def read_env(key):
+    with open(ENV_FILE) as f:
         for line in f:
-            if line.startswith("GMAIL_CLIENT_SECRET="):
+            if line.startswith(f"{key}="):
                 return line.strip().split("=", 1)[1]
-    raise ValueError("GMAIL_CLIENT_SECRET not found in .env")
+    raise ValueError(f"{key} not found in .env")
+
+# The client id lives in .env alongside the secret and the container env --
+# hardcoding it here silently mints tokens for a different OAuth client.
+CLIENT_ID = read_env("GMAIL_CLIENT_ID")
 
 def build_auth_url():
     params = {
@@ -107,7 +109,7 @@ class CallbackHandler(http.server.BaseHTTPRequestHandler):
         pass  # Suppress log output
 
 def main():
-    client_secret = read_client_secret()
+    client_secret = read_env("GMAIL_CLIENT_SECRET")
     auth_url = build_auth_url()
 
     print("\n=== Gmail MCP Auth Server ===\n")

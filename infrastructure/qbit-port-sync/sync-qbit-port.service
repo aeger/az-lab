@@ -1,0 +1,20 @@
+[Unit]
+# Keep qBittorrent's listen port equal to gluetun's VPN forwarded port.
+#
+# gluetun negotiates a NEW forwarded port on every recreate of the downloads
+# stack (59165 -> 52459 -> 59220 across three recreates in six days), and it can
+# also re-negotiate mid-session without a restart. qBittorrent's Session\Port
+# does not follow, and when they disagree inbound peers hit a dead port --
+# torrents keep working over outbound connections, so it degrades silently.
+#
+# Runs on a timer rather than only after the stack starts, because the
+# mid-session re-negotiation has no event to hook.
+Description=Sync qBittorrent listen port to gluetun forwarded port
+After=compose-stack@downloads.service
+Wants=compose-stack@downloads.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/almty1/azlab/infrastructure/qbit-port-sync/sync_qbit_port.py
+# The script exits 0 when the stack is simply down, so a non-zero result here
+# means a real sync failure worth seeing in the security widget's job list.

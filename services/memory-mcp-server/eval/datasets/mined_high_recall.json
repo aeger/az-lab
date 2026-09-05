@@ -1,0 +1,182 @@
+[
+  {
+    "question": "SSH key and connection details for claude.ai/Cowork sessions to reach svc-podman-01",
+    "topic_hint": "cowork ssh access svc podman",
+    "gold_memory_ids": [
+      "ed370aaf-1498-40a6-8530-c55bc6abddff"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: Cowork SSH Access to svc-podman-01 (recall_count=112)",
+    "active": true
+  },
+  {
+    "question": "MIRIX-paper protocol \u2014 every agent must pass topic_hint on every recall MCP call.",
+    "topic_hint": "active retrieval protocol topic first",
+    "gold_memory_ids": [
+      "cf6fba29-e29d-405b-a93d-0aae18f02c22"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: Active Retrieval Protocol \u2014 topic-first recall (recall_count=76)",
+    "active": true
+  },
+  {
+    "question": "SSH key and connection details for Claude Desktop app to reach svc-podman-01",
+    "topic_hint": "claude desktop ssh access svc",
+    "gold_memory_ids": [
+      "2f909eee-e150-4118-9f58-c5a7f2c68eec"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: Claude Desktop SSH Access to svc-podman-01 (recall_count=56)",
+    "active": true
+  },
+  {
+    "question": "Complete list of files/services holding SUPABASE_SECRET_KEY + R2/NVIDIA/HA \u2014 update ALL + RESTART all long-running consumers on rotation",
+    "topic_hint": "supabase secret rotation filelist",
+    "gold_memory_ids": [
+      "3c95092f-3e3c-440c-9765-1970aad32aba"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: supabase-secret-rotation-filelist (recall_count=32)",
+    "active": true
+  },
+  {
+    "question": "az-lab dashboard feature backlog \u2014 re-verified 2026-07-22, most /lab candidates have since shipped; remaining open items listed.",
+    "topic_hint": "dashboard feature backlog",
+    "gold_memory_ids": [
+      "d2f8e045-f56f-47d5-8cd7-cdb9f6603106"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: Dashboard Feature Backlog (recall_count=29)",
+    "active": true
+  },
+  {
+    "question": "Every place the Wren Discord bot token is stored \u2014 all 5 locations re-verified present 2026-07-22.",
+    "topic_hint": "discord bot token locations",
+    "gold_memory_ids": [
+      "8012c3d2-a55c-400a-90e2-351050c0431b"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: discord-bot-token-locations (recall_count=28)",
+    "active": true
+  },
+  {
+    "question": "Google Gemini 3 Deep Think went live in API March 27-28 2026 \u2014 new frontier reasoning model, seismic tier",
+    "topic_hint": "gemini 3 deep think api",
+    "gold_memory_ids": [
+      "b535bce7-7b06-469e-aa99-89e868febd29"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: Gemini 3 Deep Think API \u2014 Live March 2026 (recall_count=22)",
+    "active": true
+  },
+  {
+    "question": "Read/write conventions for the shared memories table across Wren/Iris/Atlas/Forge. Re-verified 2026-07-22 \u2014 propagation_scope corrected.",
+    "topic_hint": "multi agent memory governance conventions",
+    "gold_memory_ids": [
+      "c20f402c-ddf0-49fa-80d3-c47d777eb4fb"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: multi-agent-memory-governance-conventions (recall_count=20)",
+    "active": true
+  },
+  {
+    "question": "Cowork quick reference for adding tasks to the cross-Claude work queue. Re-verified 2026-07-22.",
+    "topic_hint": "task queue cowork usage",
+    "gold_memory_ids": [
+      "19e722fb-c4c3-44e8-9461-7aa61021b08b"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: task-queue-cowork-usage (recall_count=13)",
+    "active": true
+  },
+  {
+    "question": "Working context saved before context compaction \u2014 session continuity (context-autopilot)",
+    "topic_hint": "wren session context",
+    "gold_memory_ids": [
+      "7b751f8b-f20e-44b5-8844-2d84acbd1158"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: wren-session-context (recall_count=11)",
+    "active": true
+  },
+  {
+    "question": "Goals quick-add + auto-queue chip + unified progress; HA live dashboard/view picker via websocket discovery (dashboard commit, beta)",
+    "topic_hint": "goals ha improvements 20260704",
+    "gold_memory_ids": [
+      "b71d24c3-c7dc-4e73-a5f6-fc9047b00033"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: goals_ha_improvements_20260704 (recall_count=11)",
+    "active": true
+  },
+  {
+    "question": "Gmail send-as for almty1@msn.com still blocked by Cox port 587 filtering. Partially re-verified 2026-07-22.",
+    "topic_hint": "msn send as blocked pending",
+    "gold_memory_ids": [
+      "1005f5a8-9382-4809-aec6-07ee7eccd8cf"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: MSN Send-As Blocked \u2014 Pending Cox Support (recall_count=9)",
+    "active": true
+  },
+  {
+    "question": "Lab page round 4: Grafana-parity board system, widget mockup restyles, pill rework, Traefik+CRS309 monitoring fixes (dashboard 9ae218e, azlab 7a9636d)",
+    "topic_hint": "lab page grafana parity boards",
+    "gold_memory_ids": [
+      "110bfff1-8c9a-41b8-bb04-ad8086d958cf"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: lab_page_grafana_parity_boards_20260704 (recall_count=8)",
+    "active": true
+  },
+  {
+    "question": "Phase 2 dashboard modernization COMPLETE + deployed + pushed (beta a6ca6ee); ntfy stack built, not yet deployed",
+    "topic_hint": "phase2 dashboard progress 20260701",
+    "gold_memory_ids": [
+      "f34bce30-2b29-4d63-b67a-55287a52bb36"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: phase2_dashboard_progress_20260701 (recall_count=8)",
+    "active": true
+  },
+  {
+    "question": "Iris/research agents must clean up bench data after eval runs \u2014 production memories table is shared with Wren/Atlas/Forge.",
+    "topic_hint": "locomo bench requires explicit cleanup",
+    "gold_memory_ids": [
+      "d3bd99e5-ed4e-471c-8603-a824f7862c74"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: LOCOMO bench requires explicit cleanup (recall_count=8)",
+    "active": true
+  },
+  {
+    "question": "5-day restart loop caused by broken claude-code v2.1.129 release",
+    "topic_hint": "claude code v2 1 129",
+    "gold_memory_ids": [
+      "c2277a0e-212a-4fb8-a148-4cc7f15e4d48"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: claude-code v2.1.129 restart loop incident (recall_count=7)",
+    "active": true
+  },
+  {
+    "question": "2026-07-04 round 5: Immich VectorChord fix, pagerank/scheduled-control loop killed, blackbox overhaul, ZFS datasets, proxies AdGuard sync, RustDesk security, taskqueue DNS fix (dashboard d5c2525, azlab afc84d2)",
+    "topic_hint": "lab fixes round5 20260704",
+    "gold_memory_ids": [
+      "5499ff79-f6b3-4431-b6f4-400f7cad4482"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: lab_fixes_round5_20260704 (recall_count=6)",
+    "active": true
+  },
+  {
+    "question": "aardvark-dns/netavark upgraded to 1.12.2 via ~/.config/containers/containers.conf helper_binaries_dir (fixes EAI_AGAIN DNS bursts); dashboard terminal/rustdesk/proxies now behind Authelia at the edge",
+    "topic_hint": "aardvark dns upgrade helper binaries",
+    "gold_memory_ids": [
+      "1c1f0f2e-8526-4730-8eb3-51d74a54db72"
+    ],
+    "category": "mined_high_recall",
+    "notes": "auto-mined: aardvark_dns_upgrade_helper_binaries_20260704 (recall_count=6)",
+    "active": true
+  }
+]

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# NOTE: compose.yml (deployed via compose-stack@traefik.service) is the SOURCE OF
+# TRUTH. This standalone runner is a fallback and is intentionally NOT feature-
+# complete (no metrics entrypoint / authelia+strip-www middleware). Keep the image
+# tag in sync with compose.yml (currently v3.7) so it can never downgrade Traefik.
+#
 # Traefik v3 rootless Podman runner (Docker provider + File provider)
 # - Network: proxy
 # - Env: ~/traefik/cf.env (Cloudflare token, etc.)
@@ -72,7 +77,7 @@ cmd=(
   -l "traefik.http.middlewares.traefik-allow.ipallowlist.sourcerange=192.168.1.0/24,192.168.99.0/24,10.7.0.0/24,10.89.0.0/16"
   -l "traefik.http.routers.traefik.middlewares=traefik-allow,traefik-auth"
 
-  docker.io/traefik:v3.1
+  docker.io/traefik:v3.7
 
   --log.level=INFO
   --accesslog=true

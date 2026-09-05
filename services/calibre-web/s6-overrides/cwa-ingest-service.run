@@ -1,0 +1,41 @@
+#!/usr/bin/with-contenv bash
+# ---------------------------------------------------------------------------
+# az-lab override: CWA auto-ingest is PERMANENTLY DISABLED.
+#
+# Why: the ingest watcher races manual Calibre imports and creates phantom
+#      library records (root cause #4 in the 2026-06-23 calibre library
+#      recovery; memory: calibre-library-recovery-20260623).
+#
+# Why this file: `s6-svc -d /run/service/cwa-ingest-service` is runtime-only
+#      state under /run and is lost on every container recreate, so the disable
+#      silently reverted (found by the 2026-08-05 stale-memory re-verification
+#      pass). s6-rc explicitly `s6-svc -u`s every service in the `user` bundle
+#      at startup, so a `down` file cannot win either. Replacing the run script
+#      itself is the only disable that survives a recreate AND an image update.
+#
+# This is bind-mounted read-only over
+#   /etc/s6-overlay/s6-rc.d/cwa-ingest-service/run
+# by ~/azlab/services/calibre-web/compose.yml. s6-overlay compiles
+# /etc/s6-overlay/s6-rc.d into /run/s6-rc at container start, so the stub is
+# what gets supervised.
+#
+# TO RE-ENABLE: comment out the corresponding volume line in compose.yml and
+# recreate the container. Nothing else to undo.
+# ---------------------------------------------------------------------------
+
+SERVICEDIR=/run/service/cwa-ingest-service
+
+echo "========== CWA-INGEST SERVICE DISABLED (az-lab policy) =========="
+echo "[cwa-ingest-service] auto-ingest is intentionally off; see calibre-library-recovery-20260623"
+echo "[cwa-ingest-service] import books manually via the Calibre-Web UI"
+
+# Flag the service "do not restart" so s6-supervise leaves it down for good
+# once this stub exits. -O marks once-only without starting anything.
+s6-svc -O "$SERVICEDIR" 2>/dev/null || true
+
+# Stay alive briefly so s6-rc's `s6-svc -wU` up-wait is satisfied before we
+# exit; without this the startup transition can race and stall the bundle.
+sleep 5
+
+echo "[cwa-ingest-service] exiting; service will remain down"
+exit 0

@@ -1,0 +1,16 @@
+[Unit]
+Description=Hourly agent_episodes staleness reap
+Requires=episode-lifecycle-sweep.service
+
+[Timer]
+# Hourly, matching memories-ttl-sweep.timer — both are TTL backstops for rows a
+# writer was supposed to close and didn't, and neither is urgent: the reap
+# threshold is 6h, so sweeping faster than hourly cannot close anything sooner.
+# Offset off :00 and :13 so this does not pile onto the other Supabase timers.
+OnCalendar=*-*-* *:37:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Deployment-integrity audit (podman healthchecks + unit source drift)
+Documentation=file:///home/almty1/azlab/infrastructure/container-health/container_health_audit.py
+Documentation=file:///home/almty1/azlab/infrastructure/unit-integrity/unit_source_audit.py
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Two audits, one timer. Both answer "is what is RUNNING what we think it is?" —
+# the first for container healthchecks, the second for deployed-vs-repo file
+# drift (added 2026-08-16 after claude-queue-poll.service was found running a
+# two-day-stale copy of poll_queue.py). Deliberately sharing this unit rather
+# than adding a second alerting lane: both post through agent-bus notify.py and
+# both alert only on a change in their finding set.
+#
+# Both scripts always exit 0, so the first cannot suppress the second.
+ExecStart=/usr/bin/python3 /home/almty1/azlab/infrastructure/container-health/container_health_audit.py
+ExecStart=/usr/bin/python3 /home/almty1/azlab/infrastructure/unit-integrity/unit_source_audit.py
+StandardOutput=journal
+StandardError=journal

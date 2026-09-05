@@ -1,0 +1,18 @@
+[Unit]
+Description=Periodic podman healthcheck for %i
+Requires=podman-healthcheck@%i.service
+
+[Timer]
+# Fallback scheduler for containers podman does not create a transient
+# healthcheck timer for. Podman 4.9.3 only schedules some of them — notably not
+# containers run attached as a systemd unit's main process (cadvisor-host) —
+# and a healthcheck with no scheduler leaves Health.Status frozen forever at
+# whatever it was born with, which is unalertable in both directions:
+# frozen-`starting` never reaches `unhealthy`, frozen-`healthy` reads green
+# while nothing is probed. Interval matches the usual healthcheck interval.
+OnBootSec=90s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

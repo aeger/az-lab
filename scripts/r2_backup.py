@@ -425,13 +425,48 @@ def backup_lldap() -> None:
         raise RuntimeError("lldap upload failed")
 
 
-# ── 5. SSH key inventory (weekly — Sundays only) ──────────────────────────────
+# ── Weekly cadence gate ───────────────────────────────────────────────────────
+WEEKLY_CATCHUP_AGE = datetime.timedelta(days=7)
+
+
+def weekly_due(name: str) -> bool:
+    """True if a weekly task should run now.
+
+    Sunday is the normal cadence, but a host that is down over a Sunday would
+    otherwise skip the whole week and not retry until the next Sunday — a 14-day
+    gap against a 192h staleness threshold. So also run if the last recorded
+    success is missing or older than a week, which catches the run up on the
+    next daily pass and re-establishes the Sunday rhythm.
+    """
+    if WEEKDAY == 6:
+        return True
+    rows = _supabase_get(
+        f"backup_status_latest?select=last_success_at&name=eq.{urllib.parse.quote(name)}"
+    )
+    if not rows:
+        # No status row, or Supabase unreachable — fall back to Sunday-only so a
+        # transient API failure can't trigger a backup on every daily run.
+        if rows is None:
+            log.info("  skipping (not Sunday; status lookup unavailable)")
+        return False
+    last = rows[0].get("last_success_at")
+    if not last:
+        log.info(f"  running: {name} has never succeeded")
+        return True
+    age = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(last)
+    if age >= WEEKLY_CATCHUP_AGE:
+        log.info(f"  running: catching up missed weekly run (last success {age.days}d ago)")
+        return True
+    return False
+
+
+# ── 5. SSH key inventory (weekly — Sunday, with catch-up) ─────────────────────
 def backup_ssh_inventory() -> None:
     started = datetime.datetime.now(datetime.timezone.utc)
-    if WEEKDAY != 6:
-        log.info("  skipping (not Sunday)")
+    if not weekly_due("ssh-inventory"):
+        log.info("  skipping (weekly — not due)")
         record_status("ssh-inventory", "ssh-inventory/", "weekly", 192, "skipped",
-                      started, error="not Sunday")
+                      started, error="not due (weekly)")
         return
 
     ssh_dir = Path.home() / ".ssh"
@@ -507,7 +542,7 @@ def backup_claude_config() -> None:
         raise RuntimeError("claude-config upload failed")
 
 
-# ── 7. Weekly full repo+state tarball (Sundays only) ──────────────────────────
+# ── 7. Weekly full repo+state tarball (Sunday, with catch-up) ─────────────────
 WEEKLY_FULL_INCLUDE = [
     "~/azlab",                          # mono repo
     "~/dashboard",                      # dashboard source
@@ -530,20 +565,44 @@ WEEKLY_FULL_EXCLUDE_PATTERNS = (
 )
 
 
-def _tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
-    name = tarinfo.name
-    for pat in WEEKLY_FULL_EXCLUDE_PATTERNS:
-        if pat in name:
-            return None
-    return tarinfo
+def _make_tar_filter(root: Path):
+    """Build the member filter for one include path.
+
+    Drops the excluded patterns, and also drops anything the backup user cannot
+    read. The readability check matters: tarfile.add() opens each regular file
+    *after* the filter runs, so an unreadable file raises PermissionError out of
+    the recursive walk and aborts every sibling still queued at each level above
+    it. That silently truncated the tarball — one unreadable
+    dashboard/data/gmail_refresh_token.txt dropped lib/, public/, scripts/,
+    server.js and package.json from the 2026-08-11 backup while it still
+    reported success. Returning None instead skips just the one member.
+
+    tarinfo.name is the arcname, whose first component is root.name, so the
+    on-disk path is root.parent / arcname.
+    """
+    def _tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        name = tarinfo.name
+        for pat in WEEKLY_FULL_EXCLUDE_PATTERNS:
+            if pat in name:
+                return None
+        # Symlinks are stored as links and never opened — don't test the target.
+        if tarinfo.isreg() or tarinfo.isdir():
+            src = root.parent / name
+            mode = os.R_OK | os.X_OK if tarinfo.isdir() else os.R_OK
+            if not os.access(src, mode):
+                log.warning(f"  unreadable, skipping: {src}")
+                return None
+        return tarinfo
+
+    return _tar_filter
 
 
 def backup_weekly_full() -> None:
     started = datetime.datetime.now(datetime.timezone.utc)
-    if WEEKDAY != 6:
-        log.info("  skipping (not Sunday)")
+    if not weekly_due("weekly-full"):
+        log.info("  skipping (weekly — not due)")
         record_status("weekly-full", "weekly-full/", "weekly", 192, "skipped",
-                      started, error="not Sunday")
+                      started, error="not due (weekly)")
         return
 
     paths = [Path(p).expanduser() for p in WEEKLY_FULL_INCLUDE]
@@ -559,9 +618,11 @@ def backup_weekly_full() -> None:
     with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=6) as tf:
         for p in existing:
             try:
-                tf.add(str(p), arcname=p.name, filter=_tar_filter)
+                tf.add(str(p), arcname=p.name, filter=_make_tar_filter(p))
             except PermissionError as e:
-                log.warning(f"  permission error adding {p}: {e}")
+                # Backstop only — the filter should have skipped it. Reaching
+                # here means the rest of p's tree was dropped from the tarball.
+                log.error(f"  permission error adding {p} — TREE TRUNCATED: {e}")
     data = buf.getvalue()
 
     key = f"weekly-full/{TODAY}.tar.gz"
@@ -598,9 +659,11 @@ def _supabase_get(path: str) -> list | None:
 def _has_open_audit_task(name: str) -> bool:
     """Return True if an open audit task already exists for this backup name."""
     title_q = urllib.parse.quote(f"%backup failure: {name}%")
+    # review_needed dropped 2026-08-17 (migration 121): the status is gone from
+    # task_queue_status_check, so listing it here can only ever match zero rows.
     rows = _supabase_get(
         f"task_queue?select=id,status,title"
-        f"&status=in.(ready,in_progress_agent,in_progress_jeff,pending_jeff_action,review_needed,blocked,pending,claimed)"
+        f"&status=in.(ready,in_progress_agent,in_progress_jeff,pending_jeff_action,blocked,pending,claimed)"
         f"&title=ilike.{title_q}"
         f"&limit=1"
     )

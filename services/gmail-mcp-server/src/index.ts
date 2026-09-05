@@ -114,13 +114,70 @@ setInterval(() => {
 const ENV_PATH = process.env.GMAIL_ENV_PATH ?? ''
 const AUTH_BASE = process.env.GMAIL_AUTH_BASE ?? 'https://gmail-mcp.az-lab.dev'
 
+// Load the persisted env file back into process.env at startup.
+//
+// WHY THIS EXISTS: persistRefreshToken() writes the re-authed token to ENV_PATH,
+// but nothing ever read it back — the app only consulted process.env, which
+// compose bakes in as -e flags at container CREATE time. `env_file:` does NOT
+// change that; it is also read by compose at create, not by the container at
+// start. So the file was write-only from the app's point of view: every /auth
+// wrote a good token to disk, and the next `podman restart` silently loaded the
+// STALE baked value and reverted Gmail to a dead token. Measured 2026-08-24 —
+// file held 0122aafc while the baked env var still held 64c7a28b.
+//
+// The file is the persistence layer for exactly this app, so on a conflict the
+// FILE WINS: it is newer by construction, since only /auth writes it. Every
+// override is logged, because a value silently changing under an operator who
+// set it deliberately is its own kind of trap.
+function loadPersistedEnv(): void {
+  if (!ENV_PATH) return
+  let raw: string
+  try {
+    raw = readFileSync(ENV_PATH, 'utf-8')
+  } catch (e) {
+    // Not fatal: the baked env vars still work. But say so — a silent skip here
+    // is how the original bug hid for weeks.
+    console.error(`[env] could NOT read ${ENV_PATH} — falling back to baked env vars only:`, e)
+    return
+  }
+  const overridden: string[] = []
+  for (const line of raw.split('\n')) {
+    const t = line.trim()
+    if (!t || t.startsWith('#')) continue
+    const eq = t.indexOf('=')
+    if (eq <= 0) continue
+    const key = t.slice(0, eq).trim()
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key)) continue
+    let val = t.slice(eq + 1).trim()
+    // strip a single layer of matching quotes
+    if (val.length >= 2 && ((val[0] === '"' && val.endsWith('"')) || (val[0] === "'" && val.endsWith("'")))) {
+      val = val.slice(1, -1)
+    }
+    if (process.env[key] !== val) {
+      if (process.env[key] !== undefined) overridden.push(key)
+      process.env[key] = val
+    }
+  }
+  console.log(
+    `[env] loaded ${ENV_PATH}` +
+      (overridden.length ? ` — file overrode baked value for: ${overridden.join(', ')}` : ' — no differences from baked env'),
+  )
+}
+
+loadPersistedEnv()
+
 function persistRefreshToken(token: string): void {
   if (!ENV_PATH) return
   try {
     const content = readFileSync(ENV_PATH, 'utf-8')
     const updated = content.replace(/^GMAIL_REFRESH_TOKEN=.*$/m, `GMAIL_REFRESH_TOKEN=${token}`)
     writeFileSync(ENV_PATH, updated, 'utf-8')
-  } catch { /* best-effort */ }
+    console.log(`[auth] refresh token persisted to ${ENV_PATH}`)
+  } catch (e) {
+    // Do NOT swallow: a failed persist means the new token lives only in memory
+    // and the container silently reverts to the dead one on the next restart.
+    console.error(`[auth] FAILED to persist refresh token to ${ENV_PATH} — token is in-memory only, it will be lost on restart:`, e)
+  }
 }
 
 // ── OAuth2 Auth ────────────────────────────────────────────────────────────────
@@ -1018,7 +1075,7 @@ async function main(): Promise<void> {
 
   // Health check
   app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', service: 'gmail-mcp-server', version: '1.3.0' })
+    res.json({ status: 'ok', service: 'gmail-mcp-server', version: '1.4.0' })
   })
 
   // ── Gmail OAuth reauth flow ───────────────────────────────────────────────────
@@ -1109,6 +1166,26 @@ async function main(): Promise<void> {
     await transport.handleRequest(req, res, req.body)
   })
 
+  // GET/DELETE /mcp — this server is deliberately stateless: no sessions, and
+  // no server-initiated messages anywhere in it (no resources, no progress, no
+  // logging notifications), so there is nothing for an SSE stream to carry.
+  //
+  // Answer 405, not 404. Streamable HTTP clients treat 405 as "this server does
+  // not offer the GET stream" and move on silently, but surface any other
+  // status as a transport error — which is why leaving these unrouted made
+  // Express's default 404 spam `StreamableHTTPError: Failed to open SSE stream`
+  // into the Claude Desktop log on every startup. If this server ever grows
+  // notifications, replace this with a real session map (see memory-mcp-server).
+  const noStream = (_req: express.Request, res: express.Response): void => {
+    res.status(405).set('Allow', 'POST').json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method Not Allowed: this server does not offer an SSE stream.' },
+      id: null,
+    })
+  }
+  app.get('/mcp', noStream)
+  app.delete('/mcp', noStream)
+
   const port = parseInt(process.env.PORT ?? '3000', 10)
   app.listen(port, '0.0.0.0', () => {
     console.log(`Gmail MCP Server running — http://0.0.0.0:${port}/mcp (26 tools)`)
@@ -1143,7 +1220,9 @@ async function main(): Promise<void> {
             metadata: { gmail_auth_expired: gmailAuthExpired, port },
           }),
         })
-      } catch { /* best-effort */ }
+      } catch (e) {
+        console.error('[heartbeat] upsert failed:', e instanceof Error ? e.message : e)
+      }
     }
     sendHeartbeat()
     setInterval(sendHeartbeat, 60_000)

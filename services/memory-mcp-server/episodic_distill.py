@@ -2,6 +2,9 @@
 """
 Episodic → Semantic → Procedural auto-distillation pipeline.
 
+Phase 0: Consolidates pure memory_class=episodic rows (any access count, older
+than 6h) into semantic memories.
+
 Phase 1: Queries episodic memories with access_count >= 3 (not yet consolidated),
 clusters by semantic similarity, distills each cluster into a stable
 semantic fact, and inserts as type=semantic with Zettelkasten links
@@ -10,6 +13,15 @@ back to the source episodes.
 Phase 2: Queries project memories 7-14 days old with access_count >= 2 (not yet
 consolidated), distills each cluster into a reference memory (permanent
 operational knowledge).
+
+Phase 3: Weekly 30-day consolidation (only runs under --weekly).
+
+Phase 4: Staleness sweep — delegates to the flag_stale_memories() DB function,
+the single shared rule also driven every 24h by startStalenessJob in src/index.ts.
+(Migration 057's comments called this "Phase 3"; that was wrong — corrected in 060.)
+
+Phase numbering is non-contiguous on a normal nightly run: 0, 1, 2, 4 execute and
+3 is weekly-only. That is intentional, not a gap.
 
 Based on ElephantBroker 3-session promotion threshold and CraniMem
 scheduled consolidation replay pattern.
@@ -32,6 +44,7 @@ Systemd timer: episodic-distill.timer (nightly at 03:00 UTC)
 """
 
 import os
+import re
 import sys
 import json
 import logging
@@ -113,6 +126,52 @@ def supa_patch(path: str, params: dict, data: dict):
     }
     r = httpx.patch(f"{SUPABASE_URL}/rest/v1/{path}", headers=headers, params=params, json=data, timeout=30)
     r.raise_for_status()
+
+def upsert_memory_by_name(payload: dict) -> str | None:
+    """Insert a memory, or UPDATE the existing active row with the same name in
+    place. The distillation writers re-emit stable names (e.g. 'weekly-ref:...',
+    'ref:...', 'semantic:...') on every run; a blind POST created a NEW active row
+    each time, so a name accumulated one duplicate per run (the MEMORY.md churn
+    root cause). This mirrors the MCP `remember` tool's name-keyed update-in-place
+    and is enforced at the DB layer by the partial unique index
+    `memories(name) WHERE is_active`. Returns the row id."""
+    name = payload["name"]
+    existing = supa_get("memories", {
+        "name": f"eq.{name}", "is_active": "eq.true",
+        "select": "id", "order": "created_at.desc", "limit": "1",
+    })
+    if existing:
+        mid = existing[0]["id"]
+        patch = {k: payload[k] for k in
+                 ("type", "description", "content", "tags", "source", "importance_score")
+                 if k in payload}
+        patch["updated_at"] = datetime.now(timezone.utc).isoformat()
+        supa_patch("memories", {"id": f"eq.{mid}"}, patch)
+        return mid
+    result = supa_post("memories", payload)
+    if isinstance(result, list) and result:
+        return result[0].get("id")
+    return None
+
+DATE_FRAG_RE = re.compile(r"\s*[-—:]?\s*\d{4}-\d{2}-\d{2}\s*")
+
+
+def cluster_ref_name(cluster_mems: list, prefix: str = "weekly-ref") -> str:
+    """Stable, honest name for a consolidated cluster, under the given prefix.
+
+    The name has to be a function of cluster *membership*, not of a mutable
+    counter. Naming the reference after the highest-`access_count` member made
+    the key wobble between runs: as read counts shifted, one cluster could
+    re-emit under a new name (starting a fresh duplicate family) while an
+    unrelated cluster silently overwrote an old name in place. Dated log titles
+    are stripped too — the summariser is told to omit ephemeral dates, so
+    inheriting one labels the reference with a date it does not describe.
+    """
+    names = sorted(m["name"] for m in cluster_mems)
+    undated = [n for n in names if not DATE_FRAG_RE.search(n)]
+    label = DATE_FRAG_RE.sub(" ", (undated or names)[0])
+    label = re.sub(r"\s{2,}", " ", label).strip(" -—:/|,")
+    return f"{prefix}:{label or (undated or names)[0]}"
 
 # ── Clustering ────────────────────────────────────────────────────────────────
 def cosine_sim(a: list, b: list) -> float:
@@ -209,13 +268,17 @@ def _haiku_available() -> bool:
 
 
 def _call_claude_haiku(prompt: str, max_tokens: int = 256) -> str | None:
-    """Distill via Claude, routed through the shared Max-plan chain (Tier 0 OAuth ->
-    Tier 1 API key). Returns text, or None on failure (caller then uses the heuristic)."""
+    """Distill via Claude on the Max subscription (Tier 0 only). Returns text, or
+    None on failure — the caller then falls back to NemoClaw or the heuristic.
+
+    Deliberately NOT allowed to reach the billable Tier 1 API key: this is an
+    unattended background job, and a silent charge is worse than a cheaper
+    distillation."""
     if _shared_claude_call is not None:
         try:
             res = _shared_claude_call(
                 [{"role": "user", "content": prompt}],
-                model=HAIKU_MODEL, max_tokens=max_tokens, allow_tiers=(0, 1))
+                model=HAIKU_MODEL, max_tokens=max_tokens, allow_tiers=(0,))
             return (res.get("content") or "").strip() or None
         except Exception as e:
             log.warning(f"shared claude_call failed: {e}")
@@ -286,7 +349,7 @@ def summarize_project_cluster_haiku(memories: list) -> str | None:
 # ── Memory write (direct Supabase — MCP server speaks JSON-RPC, not REST) ─────
 def write_semantic_memory(name: str, description: str, content: str, tags: list) -> str | None:
     try:
-        result = supa_post("memories", {
+        return upsert_memory_by_name({
             "type": "semantic",
             "name": name,
             "description": description,
@@ -295,13 +358,35 @@ def write_semantic_memory(name: str, description: str, content: str, tags: list)
             "source": "claude-code",
             "importance_score": 0.75,
         })
-        if isinstance(result, list) and result:
-            return result[0].get("id")
     except Exception as e:
         log.error(f"Supabase write failed: {e}")
     return None
 
+def link_target_is_live(target_id: str) -> bool:
+    """True if target_id is an ACTIVE memory row.
+
+    The backflow invariant ('no strong edge may point at a retired row') is
+    enforced at RETIREMENT by supersede_memory (migration 115) and
+    retire_cold_memories (migration 148). Both are one-shot: they downweight the
+    edges that exist AT THAT MOMENT. Neither can defend against an edge minted
+    LATER, and this script's cluster fetches did not filter is_active, so it
+    routinely linked to rows that had already been superseded days earlier
+    (62 such edges as of 2026-09-04). Retirement-time downweighting is
+    structurally blind to retire-then-link; only a creation-time check closes it.
+    """
+    try:
+        row = supa_get("memories", {"id": f"eq.{target_id}", "select": "is_active", "limit": "1"})
+        return bool(row) and row[0].get("is_active") is not False
+    except Exception as e:
+        # Fail CLOSED: an unverifiable target does not get a strong edge.
+        log.warning(f"Liveness check failed for {target_id}, skipping link: {e}")
+        return False
+
+
 def create_link(source_id: str, target_id: str, relationship: str, link_type: str = "semantic"):
+    if not link_target_is_live(target_id):
+        log.info(f"Skipping link {source_id}->{target_id}: target is retired/inactive")
+        return
     try:
         supa_post("memory_links", {
             "source_id": source_id,
@@ -341,6 +426,7 @@ def fetch_stale_project_memories() -> list:
     try:
         mems = supa_get("memories", {
             "type": "eq.project",
+            "is_active": "eq.true",
             "access_count": f"gte.{PROJECT_MIN_ACCESS_COUNT}",
             "tags": f"not.cs.{{{CONSOLIDATED_TAG}}}",
             "updated_at": f"gte.{date_min}",
@@ -399,7 +485,7 @@ def summarize_project_cluster(memories: list) -> str | None:
 
 def write_reference_memory(name: str, description: str, content: str, tags: list) -> str | None:
     try:
-        result = supa_post("memories", {
+        return upsert_memory_by_name({
             "type": "reference",
             "name": name,
             "description": description,
@@ -408,8 +494,6 @@ def write_reference_memory(name: str, description: str, content: str, tags: list
             "source": "claude-code",
             "importance_score": 0.80,
         })
-        if isinstance(result, list) and result:
-            return result[0].get("id")
     except Exception as e:
         log.error(f"Supabase reference write failed: {e}")
     return None
@@ -448,8 +532,7 @@ def run_project_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int,
         if not content:
             content = summarize_cluster_heuristic(cluster_mems)
 
-        top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
-        ref_name = f"ref:{top_mem['name']}"
+        ref_name = cluster_ref_name(cluster_mems, "ref")
         description = f"Consolidated from {len(cluster_mems)} project memories"
         tags = ["auto-consolidated", "project-distilled"] + [
             t for m in cluster_mems for t in (m.get("tags") or [])
@@ -462,7 +545,7 @@ def run_project_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int,
             continue
 
         if ref_id == "ok":
-            result = supa_get("memories", {"name": f"eq.{ref_name}", "select": "id"})
+            result = supa_get("memories", {"name": f"eq.{ref_name}", "is_active": "eq.true", "select": "id"})
             ref_id = result[0]["id"] if result else None
 
         if ref_id:
@@ -505,6 +588,7 @@ def main():
     try:
         episodic_memories = supa_get("memories", {
             "type": "eq.episodic",
+            "is_active": "eq.true",
             # Overlap-exclude BOTH tag dialects: this script's 'consolidated' and the
             # legacy consolidate_episodic_memories.py 'consolidated=true' — the two
             # jobs were blind to each other's done-markers (double-processing risk).
@@ -524,6 +608,7 @@ def main():
     try:
         memories = supa_get("memories", {
             "type": "in.(project,feedback,reference)",
+            "is_active": "eq.true",
             "access_count": f"gte.{MIN_ACCESS_COUNT}",
             "tags": f"not.cs.{{{CONSOLIDATED_TAG}}}",
             "select": "id,name,description,content,tags,access_count,embedding",
@@ -573,14 +658,13 @@ def main():
                     content = summarize_cluster_haiku(batch)
                 if not content:
                     content = summarize_cluster_heuristic(batch)
-                top_mem = max(batch, key=lambda m: m.get("access_count", 0))
-                sem_name = f"semantic:{top_mem['name']}"
+                sem_name = cluster_ref_name(batch, "semantic")
                 sem_id = write_semantic_memory(sem_name,
                     f"Distilled from {len(batch)} episodic memories ({llm_status})",
                     content, ["distilled", "episodic-origin"])
                 if sem_id:
                     if sem_id == "ok":
-                        result = supa_get("memories", {"name": f"eq.{sem_name}", "select": "id"})
+                        result = supa_get("memories", {"name": f"eq.{sem_name}", "is_active": "eq.true", "select": "id"})
                         sem_id = result[0]["id"] if result else None
                     if sem_id:
                         for ep in batch:
@@ -600,14 +684,13 @@ def main():
                     content = summarize_cluster_haiku(cluster_mems)
                 if not content:
                     content = summarize_cluster_heuristic(cluster_mems)
-                top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
-                sem_name = f"semantic:{top_mem['name']}"
+                sem_name = cluster_ref_name(cluster_mems, "semantic")
                 sem_id = write_semantic_memory(sem_name,
                     f"Distilled from {len(cluster_mems)} episodic memories ({llm_status})",
                     content, ["distilled", "episodic-origin"])
                 if sem_id:
                     if sem_id == "ok":
-                        result = supa_get("memories", {"name": f"eq.{sem_name}", "select": "id"})
+                        result = supa_get("memories", {"name": f"eq.{sem_name}", "is_active": "eq.true", "select": "id"})
                         sem_id = result[0]["id"] if result else None
                     if sem_id:
                         for ep in cluster_mems:
@@ -655,8 +738,7 @@ def main():
             content = summarize_cluster_heuristic(cluster_mems)
 
         # Generate semantic memory name from top memory
-        top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
-        semantic_name = f"semantic:{top_mem['name']}"
+        semantic_name = cluster_ref_name(cluster_mems, "semantic")
         description = f"Distilled from {len(cluster_mems)} episodic memories ({llm_status})"
         tags = ["distilled", "auto-consolidated"] + [
             t for m in cluster_mems for t in (m.get("tags") or [])
@@ -671,7 +753,7 @@ def main():
 
         # 5. Get the newly created memory's ID if we got "ok" back
         if semantic_id == "ok":
-            result = supa_get("memories", {"name": f"eq.{semantic_name}", "select": "id"})
+            result = supa_get("memories", {"name": f"eq.{semantic_name}", "is_active": "eq.true", "select": "id"})
             semantic_id = result[0]["id"] if result else None
 
         if semantic_id:
@@ -698,8 +780,14 @@ def main():
     p2_created, p2_processed = run_project_consolidation(use_nemoclaw, use_haiku)
     elapsed2 = (datetime.now(timezone.utc) - start).total_seconds() - elapsed1
 
-    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     log.info(f"=== Phase 2 complete: {p2_created}/{p2_processed} clusters → reference memories ({elapsed2:.1f}s) ===")
+
+    # ── Phase 4: Staleness sweep ─────────────────────────────────────────────
+    # (Phase 3 is the weekly 30-day consolidation, run from --weekly.)
+    log.info("=== Phase 4: Staleness sweep started ===")
+    stale_changed, stale_total = run_staleness_sweep()
+
+    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     log.info(f"=== Total: {p0_created + created_semantic + p2_created} new memories created in {elapsed:.1f}s ===")
 
     total_created = p0_created + created_semantic + p2_created
@@ -708,10 +796,43 @@ def main():
         ep_note = f"{created_semantic} semantic from high-access" if created_semantic > 0 else ""
         pr_note = f"{p2_created} reference from project" if p2_created > 0 else ""
         parts = [p for p in [p0_note, ep_note, pr_note] if p]
+        if stale_changed:
+            parts.append(f"{stale_changed} staleness flag change(s), {stale_total} flagged")
         send_discord(
             f"🧠 Memory consolidation: {', '.join(parts)} "
             f"({llm_status}, {elapsed:.0f}s)"
         )
+
+
+def run_staleness_sweep() -> tuple[int, int]:
+    """Materialize the staleness rule into staleness_candidate (migrations 057/060/085).
+
+    Delegates the whole rule to flag_stale_memories() so this job and the 24h
+    startStalenessJob in src/index.ts cannot drift apart. Returns
+    (rows_changed, total_currently_flagged).
+
+    Since migration 085 the rule itself lives in memory_is_stale(), and
+    stale_memories_review_queue derives membership from it directly rather than
+    reading the column this writes. So a lapse here degrades only recall's
+    confidence haircut and +stale label — never the review queue's correctness.
+    An agent clears a row by stamping verified_at (update_memory_verified() or a
+    direct UPDATE both work).
+    """
+    try:
+        result = supa_post("rpc/flag_stale_memories", {})
+        changed = result if isinstance(result, int) else 0
+    except Exception as e:
+        log.warning(f"[Phase 4] staleness sweep failed: {e}")
+        return 0, 0
+
+    try:
+        flagged = supa_get("memories", {"staleness_candidate": "eq.true", "select": "name"})
+        total = len(flagged)
+    except Exception:
+        total = 0
+
+    log.info(f"=== Phase 4 complete: {changed} flag change(s), {total} memories now flagged stale ===")
+    return changed, total
 
 
 # ── Phase 3: Weekly 30-day project consolidation → reference/consolidation ────
@@ -722,6 +843,7 @@ def fetch_project_30day_memories() -> list:
     try:
         mems = supa_get("memories", {
             "type": "eq.project",
+            "is_active": "eq.true",
             "tags": f"not.cs.{{auto-consolidated}}",
             "updated_at": f"gte.{date_cutoff}",
             "select": "id,name,description,content,tags,access_count,embedding,updated_at",
@@ -736,7 +858,7 @@ def fetch_project_30day_memories() -> list:
 
 def write_consolidation_memory(name: str, description: str, content: str, tags: list) -> str | None:
     try:
-        result = supa_post("memories", {
+        return upsert_memory_by_name({
             "type": "reference",
             "name": name,
             "description": description,
@@ -745,8 +867,6 @@ def write_consolidation_memory(name: str, description: str, content: str, tags: 
             "source": "consolidation",
             "importance_score": 0.80,
         })
-        if isinstance(result, list) and result:
-            return result[0].get("id")
     except Exception as e:
         log.error(f"[Phase 3] Supabase write failed: {e}")
     return None
@@ -772,6 +892,7 @@ def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, 
 
     created = 0
     processed = 0
+    window_end = datetime.now(timezone.utc).date().isoformat()
 
     for cluster_idxs in clusters[:MAX_CLUSTERS]:
         cluster_mems = [memories[i] for i in cluster_idxs]
@@ -784,9 +905,11 @@ def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, 
         if not content:
             content = summarize_cluster_heuristic(cluster_mems)
 
-        top_mem = max(cluster_mems, key=lambda m: m.get("access_count", 0))
-        ref_name = f"weekly-ref:{top_mem['name']}"
-        description = f"Weekly consolidation of {len(cluster_mems)} project memories (30-day window)"
+        ref_name = cluster_ref_name(cluster_mems)
+        description = (
+            f"Weekly consolidation of {len(cluster_mems)} project memories "
+            f"({WEEKLY_LOOKBACK_DAYS}-day window ending {window_end})"
+        )
         tags = ["auto-consolidated", "weekly-consolidated"] + [
             t for m in cluster_mems for t in (m.get("tags") or [])
             if t not in (CONSOLIDATED_TAG, "auto-consolidated", "weekly-consolidated")
@@ -798,7 +921,7 @@ def run_weekly_consolidation(use_nemoclaw: bool, use_haiku: bool) -> tuple[int, 
             continue
 
         if ref_id == "ok":
-            result = supa_get("memories", {"name": f"eq.{ref_name}", "select": "id"})
+            result = supa_get("memories", {"name": f"eq.{ref_name}", "is_active": "eq.true", "select": "id"})
             ref_id = result[0]["id"] if result else None
 
         if ref_id:

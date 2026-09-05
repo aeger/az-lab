@@ -49,6 +49,20 @@ export interface WatchdogConfig {
    * and self-loops. Crash / stale-heartbeat detection is unaffected.
    */
   hangDetectionEnabled: boolean;
+  /**
+   * Channel-health detector — asserts the bridge still has its Discord MCP
+   * server attached. The canary cannot see this: on 2026-09-04 it answered
+   * "alive, idle" for 11h while the bridge had no Discord tooling at all.
+   */
+  channelHealthEnabled: boolean;
+  /** argv fragment identifying the bridge's own `claude` process. */
+  channelBridgeMatch: string;
+  /** argv fragments that must all appear among the bridge's descendants. */
+  channelMcpMatch: string[];
+  /** Seconds the bridge may look deaf before it counts (debounces restarts). */
+  channelDeafThresholdSec: number;
+  /** Seconds after any restart during which deafness is expected, not acted on. */
+  channelRestartGraceSec: number;
 }
 
 /** Expand ~ in paths */
@@ -130,6 +144,14 @@ export async function loadConfig(): Promise<WatchdogConfig> {
   // Re-enabled by default 2026-06-16 after the signal redesign (file-based,
   // canary-proof). Set HANG_DETECTION_ENABLED=0 to disable auto-restart-on-hang.
   const hangDetectionEnabled = get('HANG_DETECTION_ENABLED', '1') === '1';
+  const channelHealthEnabled = get('CHANNEL_HEALTH_ENABLED', '1') === '1';
+  const channelBridgeMatch = get('CHANNEL_BRIDGE_MATCH', '--name discord-bridge');
+  const channelMcpMatch = get(
+    'CHANNEL_MCP_MATCH',
+    'claude-plugins-official/discord,server.ts',
+  ).split(',').map(v => v.trim()).filter(Boolean);
+  const channelDeafThresholdSec = parseInt(get('CHANNEL_DEAF_THRESHOLD_SEC', '120'), 10);
+  const channelRestartGraceSec = parseInt(get('CHANNEL_RESTART_GRACE_SEC', '180'), 10);
 
   // Discord token: prefer env var, fall back to ~/.claude/channels/discord/.env
   let discordBotToken = process.env['BOT_TOKEN'] ?? envVars['BOT_TOKEN'] ?? '';
@@ -171,5 +193,10 @@ export async function loadConfig(): Promise<WatchdogConfig> {
     hangRestartCooldownSec,
     hangSelfTest,
     hangDetectionEnabled,
+    channelHealthEnabled,
+    channelBridgeMatch,
+    channelMcpMatch,
+    channelDeafThresholdSec,
+    channelRestartGraceSec,
   };
 }

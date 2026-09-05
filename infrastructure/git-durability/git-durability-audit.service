@@ -1,0 +1,27 @@
+[Unit]
+Description=Git durability audit (unpushed commits + long-dirty working trees)
+Documentation=file:///home/almty1/azlab/infrastructure/git-durability/git_durability_audit.py
+# Answers "is the work on this disk anywhere else?", the sibling question to
+# container-health-audit's "is what is running what we think it is?". Kept as a
+# separate unit rather than a third ExecStart there because this one fetches
+# from GitHub and so wants a much slower cadence than that timer's 15 minutes.
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Always prints `git status --porcelain` and `git rev-list --count
+# origin/<branch>..HEAD` verbatim to the journal, clean or dirty. That is the
+# point of the unit: on 2026-08-15 and 08-16 the daily research run recorded
+# "Working tree CLEAN" while five files had been dirty for 24-36 days, because
+# the check was a claim in a report and never a command whose output was read.
+# Supabase creds: the applied-migration ledger (supabase_migrations.schema_migrations,
+# via memory_state_ground_truth) is what lets an APPLIED migration be a finding at
+# age 0. Optional (leading '-') on purpose — the raw-print contract must survive a
+# missing .env — and the script fails CLOSED without it, flagging any dirty
+# migration file rather than assuming it is unapplied.
+EnvironmentFile=-/home/almty1/azlab/services/memory-mcp-server/.env
+ExecStart=/usr/bin/python3 /home/almty1/azlab/infrastructure/git-durability/git_durability_audit.py
+StandardOutput=journal
+StandardError=journal
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,112 @@
+[
+ {
+  "w_recency": 0.1316,
+  "w_access": 0.1053,
+  "w_novelty": 0.0789,
+  "w_importance": 0.1316,
+  "w_recall_count": 0.0526,
+  "w_relevance": 0.6,
+  "trgm_floor": 0.05,
+  "w_lane_trgm": 0.5,
+  "name": "rel0.60-fl0.05"
+ },
+ {
+  "w_recency": 0.1316,
+  "w_access": 0.1053,
+  "w_novelty": 0.0789,
+  "w_importance": 0.1316,
+  "w_recall_count": 0.0526,
+  "w_relevance": 0.6,
+  "trgm_floor": 0.25,
+  "w_lane_trgm": 0.5,
+  "name": "rel0.60-fl0.25"
+ },
+ {
+  "w_recency": 0.1316,
+  "w_access": 0.1053,
+  "w_novelty": 0.0789,
+  "w_importance": 0.1316,
+  "w_recall_count": 0.0526,
+  "w_relevance": 0.6,
+  "trgm_floor": 0.4,
+  "w_lane_trgm": 0.5,
+  "name": "rel0.60-fl0.40"
+ },
+ {
+  "w_recency": 0.0921,
+  "w_access": 0.0737,
+  "w_novelty": 0.0553,
+  "w_importance": 0.0921,
+  "w_recall_count": 0.0368,
+  "w_relevance": 0.75,
+  "trgm_floor": 0.05,
+  "w_lane_trgm": 0.5,
+  "name": "rel0.75-fl0.05"
+ },
+ {
+  "w_recency": 0.0921,
+  "w_access": 0.0737,
+  "w_novelty": 0.0553,
+  "w_importance": 0.0921,
+  "w_recall_count": 0.0368,
+  "w_relevance": 0.75,
+  "trgm_floor": 0.25,
+  "w_lane_trgm": 0.5,
+  "name": "rel0.75-fl0.25"
+ },
+ {
+  "w_recency": 0.0921,
+  "w_access": 0.0737,
+  "w_novelty": 0.0553,
+  "w_importance": 0.0921,
+  "w_recall_count": 0.0368,
+  "w_relevance": 0.75,
+  "trgm_floor": 0.4,
+  "w_lane_trgm": 0.5,
+  "name": "rel0.75-fl0.40"
+ },
+ {
+  "w_recency": 0.0526,
+  "w_access": 0.0421,
+  "w_novelty": 0.0316,
+  "w_importance": 0.0526,
+  "w_recall_count": 0.0211,
+  "w_relevance": 0.9,
+  "trgm_floor": 0.25,
+  "w_lane_trgm": 0.5,
+  "name": "rel0.90-fl0.25"
+ },
+ {
+  "w_recency": 0.0921,
+  "w_access": 0.0737,
+  "w_novelty": 0.0553,
+  "w_importance": 0.0921,
+  "w_recall_count": 0.0368,
+  "w_relevance": 0.75,
+  "trgm_floor": 2.0,
+  "w_lane_trgm": 0.5,
+  "name": "rel0.75-trgm-OFF"
+ },
+ {
+  "w_recency": 0.25,
+  "w_access": 0.2,
+  "w_novelty": 0.15,
+  "w_importance": 0.25,
+  "w_recall_count": 0.1,
+  "w_relevance": 0.15,
+  "trgm_floor": 0.05,
+  "w_lane_trgm": 0.5,
+  "name": "pre086-weights"
+ },
+ {
+  "w_recency": 0.1584,
+  "w_access": 0.0,
+  "w_novelty": 0.0,
+  "w_importance": 0.1916,
+  "w_recall_count": 0.0,
+  "w_relevance": 0.75,
+  "trgm_floor": 0.25,
+  "w_lane_trgm": 0.5,
+  "name": "rel0.75-fl0.25-nopop"
+ }
+]

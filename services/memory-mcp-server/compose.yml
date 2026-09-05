@@ -19,25 +19,58 @@ services:
       - PORT=3100
       - OLLAMA_URL=http://ollama:11434
       - EMBED_MODEL=nomic-embed-text
+      # Embedding backend selector (2026-07-24 research rec 1 — kill the Ollama
+      # silent-wedge failure mode from 2026-07-15). Default 'ollama' keeps current
+      # behaviour; flip to 'tei' ONLY after the gated cutover in
+      # docs/EMBEDDING_TEI_MIGRATION.md (needs a full corpus re-embed + a green
+      # retrieval_regression.py run). TEI has a real /health readiness gate, so a
+      # wedge surfaces instead of silently attaching stale/NULL embeddings for 38h.
+      - EMBED_BACKEND=${EMBED_BACKEND:-ollama}
+      - TEI_EMBED_URL=${TEI_EMBED_URL:-http://tei-embed:8081}
       # Mem0 LLM classification (optional — heuristic mode if unset)
       # Set to NemoClaw NIM API for LLM-based ADD/UPDATE/DELETE/NOOP decisions
       - LLM_URL=${LLM_URL:-}
       - LLM_MODEL=${LLM_MODEL:-llama3.2:3b}
-      # TEI cross-encoder reranking (primary — local, fast, ~80ms)
-      # bge-reranker-v2-m3 served by tei-reranker container below
-      - RERANKER_URL=http://tei-reranker:8080
-      # Nemotron reranking (fallback when TEI unavailable — skipped if NVIDIA_API_KEY unset)
+      # Cross-encoder reranking (primary — local, CPU).
+      # 2026-08-08: repointed from tei-reranker (bge-reranker-base, fp32) to
+      # rerank-onnx (the SAME model, INT8-quantized). Measured A/B, N=97
+      # (eval/results/rerank_ab_int8_20260807.json):
+      #   fp32  nDCG@5 0.7470 · recall@5 0.8351 · MRR 0.7650 · p50 4587ms
+      #   int8  nDCG@5 0.7370 · recall@5 0.8454 · MRR 0.7486 · p50 1517ms
+      # -0.010 nDCG@5 (-1.3% rel) for 3.0x lower p50 and BETTER recall@5.
+      # Both containers stay up, so rollback is this one variable:
+      #   RERANKER_URL=http://tei-reranker:8080 in .env, then restart memory-mcp.
+      - RERANKER_URL=${RERANKER_URL:-http://rerank-onnx:8080}
+      # Nemotron reranking (fallback when the cross-encoder is unavailable —
+      # skipped if NVIDIA_API_KEY unset). src/index.ts posts
+      # `${RERANK_URL}/v1/chat/completions` with a Bearer NVIDIA_API_KEY, i.e.
+      # the OpenAI-compatible NIM contract.
+      # 2026-08-08: repointed off http://192.168.1.183:8000. NemoClaw-01 is UP
+      # (39d uptime, pings) but serves NOTHING on :8000 — no listener, only a
+      # container that exited 4 months ago — so this fallback has been a
+      # guaranteed 20s timeout into unranked passthrough. NemoClaw is the CLOUD
+      # NIM API (per CLAUDE.md and eval/memory_eval.py), never a local server;
+      # the host:port default was the stale assumption. Cloud endpoint verified
+      # HTTP 200 with the key at ~/.nvidia_api_key on 2026-08-08.
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
-      - RERANK_URL=${RERANK_URL:-http://192.168.1.183:8000}
+      - RERANK_URL=${RERANK_URL:-https://integrate.api.nvidia.com}
       - RERANK_MODEL=${RERANK_MODEL:-nvidia/nemotron-3-super-120b-a12b}
       - RERANK_TOP_K=${RERANK_TOP_K:-5}
       - HA_URL=${HA_URL}
       - HA_TOKEN=${HA_TOKEN}
       # AIP: Agent Identity Protocol — shared HS256 secret for caller-identity JWTs
-      # Agents sign: {"sub":"wren","iss":"az-lab","iat":<unix>,"exp":<unix+3600>}
+      # Agents sign: {"sub":"wren","iss":"az-lab","iat":<unix>,"exp":<unix+3600>,"scope":"memory:read memory:write"}
+      # Mint with ./mint-aip-token.mjs; see docs/aip-tokens.md.
       # If unset, AIP verification is disabled (backward-compatible)
       - AIP_SECRET=${AIP_SECRET:-}
+      - AIP_ISSUER=${AIP_ISSUER:-az-lab}
+      # Ceiling on token lifetime, enforced against the token's own exp-iat span.
+      # Raising this re-admits every over-long token already in circulation.
+      - AIP_MAX_TTL_DAYS=${AIP_MAX_TTL_DAYS:-30}
     depends_on:
+      rerank-onnx:
+        condition: service_healthy
+        required: false
       tei-reranker:
         condition: service_healthy
         required: false
@@ -54,10 +87,101 @@ services:
       - "traefik.http.routers.memory-mcp.middlewares=lan-allow@file"
       - "traefik.http.services.memory-mcp.loadbalancer.server.port=3100"
 
-  # ─── TEI Cross-Encoder Reranker ─────────────────────────────────────────────
-  # bge-reranker-base: lightweight cross-encoder, ~330MB, CPU-only, ~100ms latency
+  # ─── INT8 ONNX Cross-Encoder Reranker (PRIMARY as of 2026-08-08) ────────────
+  # The SAME model as tei-reranker — BAAI/bge-reranker-base — dynamically
+  # quantized to INT8 and served through an ONNX Runtime shim that speaks TEI's
+  # /rerank + /info contract byte-for-byte (eval/onnx_reranker/serve.py). TEI's
+  # CPU image runs Candle, not ONNX Runtime, so it cannot serve the quantized
+  # artifact itself; the shim exists for that reason alone.
+  #
+  # Promoted from eval/onnx_reranker/compose.yml, which was explicitly a
+  # measure-only arm ("NOT part of the production stack") and therefore would
+  # not have survived a stack rebuild. Its promotion gate — INT8 holds
+  # nDCG@5 >= 0.73 while getting p50 under 2000ms — was met: 0.7370 / 1517ms.
+  # See the RERANKER_URL comment above for the full A/B.
+  #
+  # NOT bge-reranker-v2-m3. That proposal is closed as WONT FIX on CPU, and as of
+  # 2026-08-11 that is a MEASUREMENT rather than an assertion. It needed to be:
+  # the arm in eval/results/rerank_ab_20260806.json that the earlier "research v9"
+  # closure rested on has n_probes = 0 — the endpoint was down and the arm never
+  # ran, so the file records all zeros, not a result.
+  #
+  # Measured against az-tei-probe-v2m3 on :8087, identical 20-doc payload per arm:
+  #   onnx-int8 (this service, production)   1,746 ms
+  #   bge-reranker-base fp32                 5,873 ms
+  #   bge-reranker-v2-m3 fp32               23,016 ms
+  # v2-m3 is 13.2x the production path and 3.9x even the fp32 base. 23 seconds on
+  # an interactive recall path is not a quality/latency tradeoff — there is no
+  # attainable nDCG gain that buys it back, so the arm was not run to completion
+  # for quality. Reopen only if this host gains a GPU.
+  #
+  # This service quantizes the model already deployed instead.
+  #
+  # First start quantizes into the models volume (a HuggingFace download, several
+  # minutes); every later start finds the artifact and skips. No `internal: true`
+  # on its network for exactly that reason — an internal network turns the
+  # first-run download into a silent hang rather than an error.
+  rerank-onnx:
+    image: az-rerank-onnx:latest
+    build:
+      context: ./eval/onnx_reranker
+      dockerfile: Dockerfile
+    container_name: az-rerank-onnx
+    restart: unless-stopped
+    environment:
+      - MODEL_DIR=/models/int8
+      - MAX_INPUT_LENGTH=512
+      - MAX_CLIENT_BATCH_SIZE=32
+      # 4-core host. ORT does not read cgroup limits, so leaving this to its
+      # default is how the box ends up measuring thread thrash instead of work.
+      - ORT_THREADS=4
+    ports:
+      # Kept published so eval/rerank_ab.py and retrieval_regression.py sweep
+      # can keep addressing this arm as 127.0.0.1:8088 without a compose edit.
+      - "127.0.0.1:8088:8080"
+    volumes:
+      - rerank-onnx-models:/models
+    networks:
+      - proxy
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    healthcheck:
+      # A SCRIPT, not an inline `python3 -c`. podman-compose flattens this list
+      # into one shell string without re-quoting, so inline Python with parens
+      # dies as `sh: Syntax error: word unexpected` and the container never
+      # leaves `starting` while the service under it is answering 200s.
+      # See eval/onnx_reranker/healthcheck.py. (curl/wget are absent from the
+      # python:3.12-slim base, which is why this isn't the usual curl probe.)
+      #
+      # CMD-SHELL, not CMD: podman-compose 1.0.6 renders exec-form CMD by
+      # joining argv with a literal quote-space-quote and then handing the
+      # result to `--healthcheck-command /bin/sh -c ...`, so the stored Test
+      # reads `/bin/sh -c python3' '/app/healthcheck.py`. That survives by
+      # accident here (the quoted spaces re-concatenate into one word), but it
+      # breaks outright the moment any argv entry contains a real space.
+      # CMD-SHELL passes one already-quoted string through untouched.
+      test: ["CMD-SHELL", "python3 /app/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Generous: covers the first-start download + quantize, not just a warm boot.
+      start_period: 600s
+
+  # ─── TEI Cross-Encoder Reranker (fp32 — now the ROLLBACK arm) ───────────────
+  # bge-reranker-base: lightweight cross-encoder, ~330MB, CPU-only
   # v2-m3 lacks ONNX files on HF → switched to -base with verified ONNX support
   # First start downloads model from HuggingFace into tei-model-cache volume
+  #
+  # Demoted from primary 2026-08-08 but deliberately left RUNNING: it is the
+  # instant rollback for the INT8 cutover (set RERANKER_URL back to
+  # http://tei-reranker:8080), and it is the fp32 control arm every future
+  # rerank A/B measures against. Retiring it is a separate decision.
   tei-reranker:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
     container_name: az-tei-reranker
@@ -76,14 +200,61 @@ services:
           cpus: '1.0'
           memory: 2G
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      # CMD-SHELL, not CMD — see the rerank-onnx healthcheck note above.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 120s
 
+  # ─── TEI Embedding server (2026-07-24 research rec 1) ────────────────────────
+  # Serves nomic-embed-text-v1.5 (768d — DIMENSION-IDENTICAL to the current Ollama
+  # nomic-embed-text and the vector(768) column, so no pgvector schema change).
+  # Purpose: replace the Ollama embed dependency, whose container silently wedged
+  # ~38h on 2026-07-15 (podman ps "Up" while every embed failed). TEI exposes a real
+  # /health readiness gate, so a wedge is detectable instead of silently degrading.
+  #
+  # DEPLOYED-BUT-DORMANT: nothing reads this until memory-mcp's EMBED_BACKEND=tei.
+  # That flip requires the gated cutover in docs/EMBEDDING_TEI_MIGRATION.md (full
+  # corpus re-embed + prefix parity + a green retrieval_regression.py run) — do NOT
+  # flip it here. Starting this container early just warms the model cache.
+  tei-embed:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    container_name: az-tei-embed
+    restart: unless-stopped
+    command: --model-id nomic-ai/nomic-embed-text-v1.5 --port 8081
+    volumes:
+      - tei-embed-cache:/data
+    networks:
+      - proxy
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 8G
+        reservations:
+          cpus: '1.0'
+          memory: 4G
+    healthcheck:
+      # CMD-SHELL, not CMD — see the rerank-onnx healthcheck note above.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
 volumes:
   tei-model-cache:
+  tei-embed-cache:
+  # External, and named for the stack the eval arm ran under (az-rerank-onnx).
+  # The INT8 artifact is ALREADY quantized in this volume. Letting compose create
+  # a fresh az-lab-memory-mcp_rerank-onnx-models would throw that away and make
+  # the cutover re-download + re-quantize from HuggingFace on first start —
+  # minutes of dead rerank path for no gain. Reusing it makes the promotion a
+  # pure re-parent of a container that is already warm.
+  rerank-onnx-models:
+    external: true
+    name: az-rerank-onnx_rerank-onnx-models
 
 networks:
   proxy:

@@ -1,10 +1,29 @@
 #!/usr/bin/env python3
 """Daily Supabase export — dumps every public table from the azlab-memory
-project to versioned JSON files. Runs from a systemd timer; output is
-pinned by ZFS snapshots on nvme-fast for immutability.
+project to versioned JSON files, plus the full public-schema DDL. Runs from a
+systemd timer; output is pinned by ZFS snapshots on nvme-fast for immutability.
 
 Reads SUPABASE_URL + SUPABASE_SECRET_KEY from environment (loaded by the
-systemd unit) and writes to BACKUP_ROOT/YYYY-MM-DD/<table>.json.gz.
+systemd unit) and writes to BACKUP_ROOT/YYYY-MM-DD/<table>.json.gz plus
+BACKUP_ROOT/YYYY-MM-DD/schema.sql.gz.
+
+SCHEMA LANE (added 2026-08-01, daily research REC 1.3)
+    Until 2026-08-01 this script dumped ROWS ONLY. It enumerates tables via the
+    PostgREST OpenAPI spec, which describes tables and views and nothing else —
+    so it never touched function DDL. The live `hybrid_recall` ranker (6-lane RRF
+    + A-MAC + trust weighting, ~22 KB of plpgsql) was therefore in NO backup and,
+    because migrations 093a/093b/094 were applied direct-SQL, in no git object
+    either. Restoring from this backup would have given every memory row back and
+    no ranker to retrieve them with.
+
+    There is no DATABASE_URL on this host — the unit holds the REST key only — so
+    `pg_dump --schema-only` is not an option. Migration 095 adds
+    public.export_schema_ddl(), a service_role-only RPC returning extensions,
+    tables, constraints, indexes, views, functions, triggers and RLS policies as
+    text. That is what this lane writes to schema.sql.gz.
+
+    A schema dump failure is a FAILURE, not a warning: a rows-only backup is what
+    this lane exists to stop shipping.
 """
 
 import gzip
@@ -118,6 +137,40 @@ def dump_table(table: str, out: Path) -> tuple[int, int]:
     return rows_written, out.stat().st_size
 
 
+def dump_schema(out: Path) -> tuple[int, int]:
+    """Write the full public-schema DDL to schema.sql.gz via the export_schema_ddl
+    RPC (migration 095). Returns (chars, compressed_bytes).
+
+    Sanity-checked before it is written: the DDL must contain hybrid_recall, the
+    function this lane exists to protect. A truncated or empty response that still
+    returned HTTP 200 would otherwise silently overwrite yesterday's good dump —
+    which is the same class of failure as having no dump at all.
+    """
+    req = request.Request(
+        f"{SUPABASE_URL}/rest/v1/rpc/export_schema_ddl",
+        data=b"{}",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    with request.urlopen(req, timeout=300) as resp:
+        ddl = json.loads(resp.read())
+    if not isinstance(ddl, str):
+        raise RuntimeError(f"export_schema_ddl returned {type(ddl).__name__}, expected text")
+    for required in ("CREATE OR REPLACE FUNCTION public.hybrid_recall", "===== TABLES ====="):
+        if required not in ddl:
+            raise RuntimeError(f"schema DDL missing {required!r} — refusing to write a partial dump")
+    tmp = out.with_suffix(out.suffix + ".partial")
+    with gzip.open(tmp, "wt", encoding="utf-8") as fh:
+        fh.write(ddl)
+    tmp.replace(out)
+    return len(ddl), out.stat().st_size
+
+
 def prune_old(root: Path, keep_days: int) -> int:
     cutoff = time.time() - keep_days * 86400
     removed = 0
@@ -170,6 +223,16 @@ def main() -> int:
             failures += 1
             manifest["tables"][table] = {"error": str(e)}
             log.exception("failed %s", table)
+
+    # Schema lane — REC 1.3. Rows without schema is not a restorable backup.
+    try:
+        chars, size = dump_schema(out_dir / "schema.sql.gz")
+        manifest["schema"] = {"chars": chars, "bytes": size}
+        log.info("dumped schema DDL: %d chars, %d bytes", chars, size)
+    except Exception as e:
+        failures += 1
+        manifest["schema"] = {"error": str(e)}
+        log.exception("failed schema DDL dump — this backup is rows-only")
 
     manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
     manifest["elapsed_seconds"] = round(time.time() - started, 2)

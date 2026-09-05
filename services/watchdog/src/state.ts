@@ -19,6 +19,8 @@ export interface WatchdogState {
   lastSeenActivityAt: number | null;
   /** Hang detector — when the most recent hang was confirmed (epoch sec). */
   hangDetectedAt: number | null;
+  /** Channel health — when the bridge first looked deaf (epoch sec). */
+  channelDeafSince: number | null;
 }
 
 const DEFAULT_STATE: WatchdogState = {
@@ -32,6 +34,7 @@ const DEFAULT_STATE: WatchdogState = {
   lastSeenPromptCountAt: null,
   lastSeenActivityAt: null,
   hangDetectedAt: null,
+  channelDeafSince: null,
 };
 
 export class StateManager {
@@ -57,6 +60,7 @@ export class StateManager {
         lastSeenPromptCountAt: parsed.lastSeenPromptCountAt ?? null,
         lastSeenActivityAt: parsed.lastSeenActivityAt ?? null,
         hangDetectedAt: parsed.hangDetectedAt ?? null,
+        channelDeafSince: parsed.channelDeafSince ?? null,
       };
     } catch {
       return { ...DEFAULT_STATE };

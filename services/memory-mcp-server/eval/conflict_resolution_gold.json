@@ -1,0 +1,240 @@
+{
+  "note": "Gold set for the deterministic conflict resolver (migration 063). Each entry is an adjudicated (loser, winner) supersession pair. Frozen deliberately \u2014 re-run with --freeze to update.",
+  "pairs": [
+    {
+      "loser_id": "a39a230b-1962-4097-b187-97d9bf21f392",
+      "winner_id": "7bc3cf6b-49be-430d-846a-41786e08884f",
+      "loser_name": "Shared Memory Database (Supabase)",
+      "winner_name": "memory-mcp-server",
+      "loser_type": "project"
+    },
+    {
+      "loser_id": "236767ae-b6ee-43f7-9c24-b3d7a0b7cf3f",
+      "winner_id": "c7e7344b-3f6a-4653-9b55-53b2fbe84b48",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "46fdf570-30a0-46c4-90a1-7d4e3f4d0d93",
+      "winner_id": "c7e7344b-3f6a-4653-9b55-53b2fbe84b48",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "4d4ca7dc-0b1d-408e-8902-f5900c823af8",
+      "winner_id": "c7e7344b-3f6a-4653-9b55-53b2fbe84b48",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "accb7964-2e32-4404-9999-96910f3ee2c5",
+      "winner_id": "c7e7344b-3f6a-4653-9b55-53b2fbe84b48",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "b67c0c2a-21d0-404a-b679-52880435756f",
+      "winner_id": "c7e7344b-3f6a-4653-9b55-53b2fbe84b48",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "f4b7368a-7fae-45b9-852f-1b8544de466c",
+      "winner_id": "c7e7344b-3f6a-4653-9b55-53b2fbe84b48",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "02c231c6-9e34-441a-8df4-323b8c717ecb",
+      "winner_id": "7d1f19af-f011-4227-9211-c11fe1004171",
+      "loser_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "winner_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "21a918a7-49b1-43cf-a862-29fd15f89f2a",
+      "winner_id": "33bd2860-b659-4949-a7c0-11697365a98f",
+      "loser_name": "weekly-ref:supabase-key-rotation-2026-04-30",
+      "winner_name": "weekly-ref:supabase-key-rotation-2026-04-30",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "236767ae-b6ee-43f7-9c24-b3d7a0b7cf3f",
+      "winner_id": "5f23ebca-be34-48be-905f-978e4529c980",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "25ead254-83b2-48fc-b319-9c6f6d0c9c05",
+      "winner_id": "21e1a540-1bd9-4932-a0b6-796a73098df4",
+      "loser_name": "Daily AI Memory Research - 2026-05-23 Triage",
+      "winner_name": "Daily AI Memory Research - 2026-05-23 Triage",
+      "loser_type": "project"
+    },
+    {
+      "loser_id": "2f188b84-82c1-468d-95e7-28a5943d095a",
+      "winner_id": "f36b7636-bad7-41b9-a499-9c71f3a90ca5",
+      "loser_name": "weekly-ref:Daily Self-Improvement Research - 2026-04-11",
+      "winner_name": "weekly-ref:Daily Self-Improvement Research - 2026-04-11",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "3dd48c65-24ae-4757-9c77-15c09c218576",
+      "winner_id": "7d1f19af-f011-4227-9211-c11fe1004171",
+      "loser_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "winner_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "43dd3485-d575-4828-b0d4-8459ee3ff465",
+      "winner_id": "b56d08e8-de0a-4297-9ec7-31b1d7e74c2d",
+      "loser_name": "weekly-ref:Daily AI Memory Research - 2026-05-15 Triage",
+      "winner_name": "weekly-ref:Daily AI Memory Research - 2026-05-15 Triage",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "46fdf570-30a0-46c4-90a1-7d4e3f4d0d93",
+      "winner_id": "5f23ebca-be34-48be-905f-978e4529c980",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "4d4ca7dc-0b1d-408e-8902-f5900c823af8",
+      "winner_id": "5f23ebca-be34-48be-905f-978e4529c980",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "4f935a0c-a479-4e12-980f-b09b3932c8e1",
+      "winner_id": "135d05cd-e3f1-4732-a060-088e1970d4db",
+      "loser_name": "weekly-ref:Daily AI Memory Research - 2026-06-01 Triage",
+      "winner_name": "weekly-ref:Daily AI Memory Research - 2026-06-01 Triage",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "536e3074-e2c2-46f7-b5d1-dd9094f5baf1",
+      "winner_id": "f36b7636-bad7-41b9-a499-9c71f3a90ca5",
+      "loser_name": "weekly-ref:Daily Self-Improvement Research - 2026-04-11",
+      "winner_name": "weekly-ref:Daily Self-Improvement Research - 2026-04-11",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "68373477-0f2e-4b6b-8494-598795f1b315",
+      "winner_id": "d79a8401-22b0-4a93-b68a-99c951afff2c",
+      "loser_name": "Daily AI Memory Research - 2026-05-22 Triage",
+      "winner_name": "Daily AI Memory Research - 2026-05-22 Triage",
+      "loser_type": "project"
+    },
+    {
+      "loser_id": "69446720-baf7-4a6c-83f1-de96aadb521c",
+      "winner_id": "31181bdc-98fd-4f91-94b3-2b93aa85d69e",
+      "loser_name": "AI Memory Research - 2026-04-19",
+      "winner_name": "AI Memory Research - 2026-04-19",
+      "loser_type": "project"
+    },
+    {
+      "loser_id": "8b468d3a-0bd5-4315-b010-fd33f7687b24",
+      "winner_id": "afdfcede-d8bf-411e-ab41-59734e3f36dd",
+      "loser_name": "weekly-ref:Research Review 2026-06-02 \u2014 RECs already shipped + provenance backfill",
+      "winner_name": "weekly-ref:Research Review 2026-06-02 \u2014 RECs already shipped + provenance backfill",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "8b7ebabb-6326-455c-95a3-2f7ccfd90234",
+      "winner_id": "2cf32882-643a-4382-89e2-03f5c614b1a3",
+      "loser_name": "weekly-ref:Daily AI Memory Research Trigger",
+      "winner_name": "weekly-ref:Daily AI Memory Research Trigger",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "9df3f5e3-2850-45a2-ab37-9275909a5fe7",
+      "winner_id": "7d1f19af-f011-4227-9211-c11fe1004171",
+      "loser_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "winner_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "a9a3c8c2-04a5-47af-8dd5-1f1e4c0d0de3",
+      "winner_id": "21e1a540-1bd9-4932-a0b6-796a73098df4",
+      "loser_name": "Daily AI Memory Research - 2026-05-23 Triage",
+      "winner_name": "Daily AI Memory Research - 2026-05-23 Triage",
+      "loser_type": "project"
+    },
+    {
+      "loser_id": "accb7964-2e32-4404-9999-96910f3ee2c5",
+      "winner_id": "5f23ebca-be34-48be-905f-978e4529c980",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "b4be1b44-7c07-47f4-90fd-44403eed9fee",
+      "winner_id": "7d1f19af-f011-4227-9211-c11fe1004171",
+      "loser_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "winner_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "b67c0c2a-21d0-404a-b679-52880435756f",
+      "winner_id": "5f23ebca-be34-48be-905f-978e4529c980",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "c7e7344b-3f6a-4653-9b55-53b2fbe84b48",
+      "winner_id": "5f23ebca-be34-48be-905f-978e4529c980",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "e00727fd-9fdb-462b-99a5-c35f27ccb5fb",
+      "winner_id": "fe269168-9c48-410f-a571-e1fda015c375",
+      "loser_name": "Research Synthesis 2026-03-30",
+      "winner_name": "Research Synthesis 2026-03-30",
+      "loser_type": "project"
+    },
+    {
+      "loser_id": "f1ca728d-2916-4d88-9469-55453755afe0",
+      "winner_id": "ef0879f5-8720-4e34-96e0-bfa838c96306",
+      "loser_name": "weekly-ref:constitution-audit-2026-05-31",
+      "winner_name": "weekly-ref:constitution-audit-2026-05-31",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "f23fffeb-7762-4a36-b876-b938a9c7cea4",
+      "winner_id": "7d1f19af-f011-4227-9211-c11fe1004171",
+      "loser_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "winner_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "f4b7368a-7fae-45b9-852f-1b8544de466c",
+      "winner_id": "5f23ebca-be34-48be-905f-978e4529c980",
+      "loser_name": "weekly-ref:memory-mcp-server",
+      "winner_name": "weekly-ref:memory-mcp-server",
+      "loser_type": "reference"
+    },
+    {
+      "loser_id": "ff6caa79-8aba-4540-97e3-1420faf0d4db",
+      "winner_id": "7d1f19af-f011-4227-9211-c11fe1004171",
+      "loser_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "winner_name": "weekly-ref:Daily AI Memory Research - 2026-05-24 Triage",
+      "loser_type": "reference"
+    }
+  ],
+  "baseline": {
+    "acc_content": 1.0,
+    "acc_updated": 1.0
+  }
+}

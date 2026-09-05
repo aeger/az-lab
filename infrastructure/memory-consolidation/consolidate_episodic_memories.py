@@ -1,7 +1,26 @@
 #!/usr/bin/env python3
 """
-Episodic-to-Semantic Memory Consolidation
+Episodic-to-Semantic Memory Consolidation  [DEPRECATED 2026-07-21 — Wren]
 ==========================================
+DEPRECATED / SUPERSEDED. Do NOT run this and do NOT re-diagnose it.
+
+The live episodic→semantic consolidation is `episodic_distill.py` Phase 0
+(installed as episodic-distill.timer, daily 03:00 UTC). Phase 0 gates on
+embedding cosine-similarity clustering with NO access_count prefilter — the
+correct "recurred across sessions" signal — and it works: 76 semantic
+memories produced, most recent 2026-07-21 03:00.
+
+This legacy script gated the episodic fetch on `access_count >= 3`, a counter
+that episodic retrieval never increments, so it always printed
+"No eligible episodic memories found" — a misleading clean exit that read as
+success while nothing happened. It was never installed to a timer; it only ran
+when an agent manually invoked it via the (now retired) cowork nightly
+"Run nightly episodic memory consolidation" task.
+
+Retained for history only. Running it is a no-op unless --force-legacy is
+passed. See memory: nightly-consolidation-task-is-redundant-20260715.
+
+--- ORIGINAL DOCSTRING (historical) ---
 Daily job (04:00 UTC) that promotes high-access episodic memories into
 the durable semantic layer shared by Wren, Iris, and Atlas.
 
@@ -323,6 +342,12 @@ def log(message):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
+    if "--force-legacy" not in sys.argv:
+        log("DEPRECATED: superseded by episodic_distill.py Phase 0 "
+            "(episodic-distill.timer, daily 03:00). No-op. Pass --force-legacy to override. "
+            "See memory nightly-consolidation-task-is-redundant-20260715.")
+        return
+
     if DRY_RUN:
         log("DRY RUN mode — no writes will occur")
 

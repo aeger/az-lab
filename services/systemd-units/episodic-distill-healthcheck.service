@@ -1,0 +1,11 @@
+[Unit]
+Description=Health check for the episodic→semantic distillation pipeline
+# Replaces the retired nightly cowork queue task pair (see migration 088
+# 088_retire_nightly_consolidation_generator.sql). Silent when healthy.
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/azlab/services/memory-mcp-server/episodic_distill_healthcheck.sh
+Nice=10
+IOSchedulingClass=idle

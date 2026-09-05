@@ -1,0 +1,39 @@
+{
+  // az-lab task-queue ingest+consumer Worker.
+  // Producers POST /enqueue -> validated -> Cloudflare Queue -> consumer writes to Supabase.
+  // Replaces direct `curl -sf .../task_queue &>/dev/null` inserts that silently swallowed
+  // NOT NULL rejections (see memory: project_taskqueue_null_description_hook_fix_20260708).
+  "name": "az-task-queue-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "account_id": "157265a71e207b62e3e2d9f36dcd3f3d",
+  "observability": {
+    "enabled": true
+  },
+  "queues": {
+    "producers": [
+      { "queue": "az-task-queue", "binding": "TASK_QUEUE" }
+    ],
+    "consumers": [
+      {
+        "queue": "az-task-queue",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "dead_letter_queue": "az-task-queue-dlq"
+      },
+      {
+        // The DLQ is consumed by this same Worker so dead-lettered tasks are
+        // surfaced (Discord + Observability), never silently dropped.
+        "queue": "az-task-queue-dlq",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 1
+      }
+    ]
+  },
+  "vars": {
+    "SUPABASE_URL": "https://ogqjjlbupqnvlcyrfnxi.supabase.co"
+  }
+  // Secrets (set via `wrangler secret put`): SUPABASE_SERVICE_KEY, INGEST_SECRET, DISCORD_WEBHOOK
+}

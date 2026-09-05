@@ -5,7 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/claude-queue/poll_queue.py
+# Invoke through the interpreter explicitly. Since 2026-08-16 the installed path
+# is a symlink to the repo file, and the repo file is mode 644 — relying on the
+# shebang + exec bit would break the poller the first time install.sh ran.
+ExecStart=/usr/bin/python3 %h/claude-queue/poll_queue.py
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=claude-queue-poll

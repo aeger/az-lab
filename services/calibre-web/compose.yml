@@ -20,8 +20,31 @@ services:
       - /mnt/calibre/ingest:/cwa-book-ingest
       - /mnt/calibre/library:/calibre-library
       - /home/almty1/calibre-metadata/metadata.db:/calibre-library/metadata.db
+      # Durable disable of the CWA auto-ingest watcher. Jeff wants auto-ingest
+      # permanently OFF — it races manual imports and creates phantom library
+      # records (calibre-library-recovery-20260623 root cause #4). `s6-svc -d`
+      # only lives in /run and was silently lost on every recreate, so the run
+      # script itself is replaced with a no-op stub that marks the service down.
+      # To re-enable auto-ingest: comment out this line and recreate.
+      - /home/almty1/azlab/services/calibre-web/s6-overrides/cwa-ingest-service.run:/etc/s6-overlay/s6-rc.d/cwa-ingest-service/run:ro
     networks:
       - proxy
+    # Stated here even though the CWA image already ships a HEALTHCHECK: podman
+    # 4.9.3 only creates the per-container healthcheck TIMER when the probe is
+    # passed on the podman command line, which for a compose service means an
+    # explicit `healthcheck:` block (podman-compose then emits
+    # --healthcheck-command). Inherited-from-image healthchecks populate
+    # .Config.Healthcheck and schedule NOTHING, so Health.Status freezes at the
+    # single result recorded when the container was born. This container had
+    # been reading a frozen `healthy` — the dangerous direction, because it
+    # shows green on every dashboard while nothing is actually being probed.
+    # CMD-SHELL (not exec-form CMD): podman-compose 1.0.6 mangles exec-form argv.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/ || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.calibre.rule=Host(`calibre.az-lab.dev`)"

@@ -13,6 +13,10 @@ services:
       - uptime-kuma-data:/app/data
     networks:
       - proxy
+    # Force AdGuard so monitors resolve *.az-lab.dev to the LAN IP; host
+    # resolver still lists 1.1.1.1 first and returns the WAN IP (hairpin fails).
+    dns:
+      - 192.168.99.2
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.uptime-kuma.rule=Host(`uptime.az-lab.dev`)"

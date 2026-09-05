@@ -77,6 +77,12 @@ services:
       - ./prometheus/config/blackbox.yml:/etc/blackbox_exporter/blackbox.yml:ro,Z
     networks:
       - proxy
+    # Force AdGuard (LAN split-DNS) so *.az-lab.dev → 192.168.1.181 instead of
+    # the host resolver's public Cloudflare A record (WAN hairpin fails).
+    # Host resolver ordering fix is pending Jeff's sudo; this override keeps
+    # probes accurate in the meantime.
+    dns:
+      - 192.168.99.2
     restart: unless-stopped
     labels:
       - "traefik.enable=false"

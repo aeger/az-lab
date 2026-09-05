@@ -27,7 +27,6 @@ Agent cards live in `agent-cards/` and follow the A2A Agent Card spec. Each card
 | Wren | `wren.json` | claude-code | svc-podman-01 |
 | Iris | `iris.json` | claude-cowork | claude.ai |
 | Atlas | `atlas.json` | claude-desktop | windows-workstation |
-| Forge | `forge.json` | claude-code-desktop | windows-workstation |
 | Volt | `volt.json` | nvidia-nim | nemoclaw-01 |
 
 Fetch a card: `curl http://192.168.1.181:8765/agents/wren/card`

@@ -8,14 +8,25 @@ services:
       dockerfile: /home/almty1/grimoire/Dockerfile
     container_name: az-grimoire
     restart: unless-stopped
+    # Run as the container's userns-root so that (rootless podman uid_map 0->1000)
+    # the process maps to almty1 on the host and can read the 0600 token mount
+    # below. Same pattern as the dashboard stack.
+    user: "0:0"
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # No ANTHROPIC_API_KEY on purpose. Grimoire runs on the Max-plan
+      # subscription via the token mount below — an API key here would restore
+      # pay-as-you-go billing (the ~$94 early-July incident).
+      - CLAUDE_OAUTH_TOKEN_FILE=/run/secrets/claude-oauth-token
       - SUPABASE_URL=${SUPABASE_URL:-}
       - SUPABASE_PUBLISHABLE_KEY=${SUPABASE_PUBLISHABLE_KEY:-}
       - SUPABASE_SECRET_KEY=${SUPABASE_SECRET_KEY:-}
       - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-}
       - NEXTAUTH_URL=https://grimoire.az-lab.dev
       - AUTH_TRUST_HOST=true
+    volumes:
+      # Subscription token, mirrored by claude-token-broker.service. Read-only:
+      # the app consumes it, never rotates it.
+      - /home/almty1/.config/claude-oauth/access_token:/run/secrets/claude-oauth-token:ro
     networks:
       - proxy
     labels:

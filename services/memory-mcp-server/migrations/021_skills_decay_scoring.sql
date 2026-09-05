@@ -1,3 +1,7 @@
+-- SUPERSEDED by 058_skills_outcome_tracking.sql (2026-07-16) — DO NOT APPLY.
+-- Never landed in production; 058 uses success_count/fail_count/last_outcome/last_used_at
+-- instead of success_rate/last_used, and code (v5.13.0+) writes to the 058 columns.
+
 -- Migration 021: Skills decay scoring — last_used, success_rate, updated match_skills RPC
 --
 -- Adds episodic feedback columns to skills table to enable decay-based ranking:

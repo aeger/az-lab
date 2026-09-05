@@ -1,0 +1,9 @@
+[Unit]
+Description=Max-plan (Tier 0) subscription token health probe
+Documentation=file:///home/almty1/claude/claude-token-broker/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/almty1/claude/claude-token-broker/tier0_probe.py
+# A degraded probe exits 1 on purpose; that is a finding, not a unit failure.
+SuccessExitStatus=0 1
