@@ -15,6 +15,7 @@
 import { loadConfig } from './config.js';
 import { HeartbeatMonitor } from './heartbeat.js';
 import { CanarySender } from './canary.js';
+import { ChannelHealthChecker, decideChannelAction } from './channel-health.js';
 import { CircuitBreaker } from './circuit-breaker.js';
 import { DiscordNotifier } from './discord.js';
 import { SupabaseReporter } from './supabase-reporter.js';
@@ -59,6 +60,10 @@ async function main() {
     serviceKey: config.supabaseServiceKey,
     fallbackLogFile: config.logFile,
   });
+  const channelHealth = new ChannelHealthChecker({
+    bridgeMatch: config.channelBridgeMatch,
+    mcpMatch: config.channelMcpMatch,
+  });
   const hangDetector = new HangDetector({
     lastPromptAtFile: config.lastPromptAtFile,
     lastResponseAtFile: config.lastResponseAtFile,
@@ -93,7 +98,7 @@ async function main() {
   // Main poll loop
   const poll = async () => {
     try {
-      await tick(config, logger, stateMgr, heartbeat, canary, breaker, discord, supabase, dashboard, hangDetector);
+      await tick(config, logger, stateMgr, heartbeat, canary, breaker, discord, supabase, dashboard, hangDetector, channelHealth);
     } catch (err) {
       await logger.log(`Unhandled error in tick: ${err}`).catch(() => {});
     }
@@ -115,6 +120,7 @@ async function tick(
   supabase: SupabaseReporter,
   dashboard: WatchdogDashboard,
   hangDetector: HangDetector,
+  channelHealth: ChannelHealthChecker,
 ) {
   const now = Math.floor(Date.now() / 1000);
 
@@ -155,6 +161,65 @@ async function tick(
 
   // ── HEALTHY path ────────────────────────────────────────────────────────────
   if (!hbResult.stale) {
+    // A fresh heartbeat and an answering canary only prove the session is
+    // alive. Neither can see whether it still has its Discord MCP server, and
+    // on 2026-09-04 it did not: the canary said "alive, idle" every ten minutes
+    // for eleven hours while every Discord question went unanswered and systemd
+    // reported the unit healthy throughout. Check the thing they cannot.
+    if (config.channelHealthEnabled) {
+      const health = await channelHealth.check();
+      const sinceRestartSec = state.lastRestartAt
+        ? now - Math.floor(new Date(state.lastRestartAt).getTime() / 1000)
+        : Infinity;
+      const decision = decideChannelAction({
+        healthy: health.healthy,
+        channelDeafSince: state.channelDeafSince,
+        nowSec: now,
+        deafThresholdSec: config.channelDeafThresholdSec,
+        sinceRestartSec,
+        restartGraceSec: config.channelRestartGraceSec,
+      });
+
+      if (decision.action === 'act') {
+        await handleDeafChannel(
+          config, logger, stateMgr, state, breaker, discord, supabase, dashboard,
+          breakerStatus, health, decision.deafForSec,
+        );
+        return;
+      }
+
+      if (decision.action === 'grace') {
+        // The MCP server takes tens of seconds to attach after a bounce.
+        await logger.log(
+          `Channel looks deaf but within post-restart grace ` +
+            `(${sinceRestartSec}s / ${config.channelRestartGraceSec}s) — ${health.reason}`,
+        );
+      }
+
+      if (decision.action === 'hold') {
+        // Must return: the healthy path below saves channelDeafSince: null, so
+        // falling through here would reset the clock on every tick and the
+        // threshold would never be reached.
+        await logger.log(
+          state.channelDeafSince === null
+            ? `Channel may be deaf — ${health.reason}`
+            : `Channel deaf for ${decision.deafForSec}s ` +
+              `(threshold ${config.channelDeafThresholdSec}s) — holding`,
+        );
+        await stateMgr.save({ ...state, channelDeafSince: decision.deafSince, lastStatus: 'degraded' });
+        await supabase
+          .updateStatus('degraded', { reason: 'channel_deaf', detail: health.reason })
+          .catch(() => {});
+        dashboard.updateStatus({ status: 'degraded' });
+        return;
+      }
+
+      if (state.channelDeafSince !== null && decision.deafSince === null) {
+        await logger.log(`Channel health recovered — ${health.reason}`);
+        state.channelDeafSince = null;
+      }
+    }
+
     // Heartbeat looks fresh — but a slow hang can keep heartbeats ticking via
     // Stop hooks fired by canary replies / Discord reactions while the actual
     // work loop is wedged (2026-06-16 incident). Run hang detection BEFORE
@@ -199,7 +264,7 @@ async function tick(
       await supabase.updateStatus('healthy', { prompt_count: promptCount });
     }
 
-    await stateMgr.save({ ...trackedState, lastStatus: 'healthy', canarySentAt: null, hangDetectedAt: null });
+    await stateMgr.save({ ...trackedState, lastStatus: 'healthy', canarySentAt: null, hangDetectedAt: null, channelDeafSince: null });
     dashboard.updateStatus({ status: 'healthy' });
 
     // Proactive overnight restart
@@ -309,6 +374,91 @@ async function tick(
 
   await discord.send(msg, color).catch(() => {});
   await logger.log('Restart issued');
+}
+
+/**
+ * Deaf-channel handler. Runs when the session is alive and answering but has
+ * lost the MCP server that carries Discord traffic — it can neither hear a
+ * message nor reply to one, while every other signal reads healthy. Restarting
+ * the unit reattaches the server; that is the fix that worked by hand on
+ * 2026-09-04. Breaker-gated like every other restart path.
+ */
+async function handleDeafChannel(
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  logger: LocalLogger,
+  stateMgr: StateManager,
+  state: WatchdogState,
+  breaker: CircuitBreaker,
+  discord: DiscordNotifier,
+  supabase: SupabaseReporter,
+  dashboard: WatchdogDashboard,
+  breakerStatus: { tripped: boolean; restartsInLastHour: number; cooldownRemaining: number },
+  health: import('./channel-health.js').ChannelHealthResult,
+  deafForSec: number,
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  await logger.log(`CHANNEL DEAF (${deafForSec}s) — ${health.reason}`);
+
+  const metadata = {
+    detail: health.reason,
+    bridge_pid: health.bridgePid,
+    mcp_pids: health.mcpPids,
+    deaf_for_sec: deafForSec,
+  };
+
+  await supabase.logActivity(
+    'channel_deaf',
+    `Discord bridge alive but has no MCP server attached: ${health.reason}`,
+    metadata,
+  ).catch(() => {});
+
+  await supabase.emitSentinelNotification(
+    'critical',
+    'Discord bridge is deaf',
+    `The bridge session is responsive but cannot send or receive on Discord.\n\n${health.reason}`,
+    `channel-deaf:${health.bridgePid ?? 'none'}:${now}`,
+    metadata,
+    'channel_deaf',
+  ).catch(() => {});
+
+  if (breakerStatus.tripped || !(await breaker.allowsRestart())) {
+    await logger.log('Channel deaf but circuit breaker tripped — paging without restart');
+    await stateMgr.save({ ...state, lastStatus: 'critical', channelDeafSince: null });
+    await supabase.updateStatus('critical', { ...metadata, breaker_tripped: true }).catch(() => {});
+    dashboard.updateStatus({ status: 'critical' });
+    await discord.send(
+      `CRITICAL: Discord bridge is deaf (no MCP server) and the breaker is tripped.\n` +
+        `It is answering canaries but cannot see your messages.\n` +
+        `\`\`\`\ntouch ~/.wren-watchdog/reset\nsystemctl --user restart claude-discord.service\n\`\`\``,
+      15158332,
+    ).catch(() => {});
+    return;
+  }
+
+  const tier = breakerStatus.restartsInLastHour + 1;
+  await breaker.recordRestart();
+  const restartAt = new Date().toISOString();
+  await stateMgr.save({
+    ...state,
+    canarySentAt: null,
+    channelDeafSince: null,
+    lastStatus: 'restarting',
+    lastRestartAt: restartAt,
+  });
+  await supabase.updateStatus('restarting', { reason: 'channel_deaf', tier, ...metadata }).catch(() => {});
+  await supabase.updateLastRestart(restartAt, tier).catch(() => {});
+
+  await exec('systemctl --user restart claude-discord.service').catch(async err => {
+    await logger.log(`Deaf-channel restart failed: ${err}`);
+  });
+
+  dashboard.updateStatus({ status: 'restarting', last_restart: restartAt });
+  await discord.send(
+    `Discord bridge had lost its MCP server — auto-restarted (tier ${tier}). ` +
+      `It was responsive but deaf for ${deafForSec}s.`,
+    16744448,
+  ).catch(() => {});
+  await logger.log('Deaf-channel restart issued');
 }
 
 /**

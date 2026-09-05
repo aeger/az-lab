@@ -16,7 +16,15 @@ export interface SupabaseReporterConfig {
   fallbackLogFile?: string;
 }
 
+/** Members of the notification_severity enum — anything else is a 400. */
+export type NotificationSeverity = 'info' | 'warning' | 'critical';
+
 export class SupabaseReporter {
+  /** Members of the agent_activity.activity_type CHECK constraint. */
+  private static readonly ACTIVITY_TYPES = new Set([
+    'thinking', 'tool_call', 'result', 'status', 'error', 'progress',
+  ]);
+
   private readonly config: SupabaseReporterConfig;
   private readonly fetchFn: FetchFn;
   private readonly fallbackLogger: LocalLogger | null;
@@ -69,11 +77,19 @@ export class SupabaseReporter {
     content: string,
     metadata: Record<string, unknown>,
   ): Promise<void> {
+    // agent_activity.activity_type is CHECK-constrained to this set. Callers
+    // pass a semantic event name ('hang_detected', 'channel_deaf'), which the
+    // database rejects with a 400 — so every audit row this method has ever
+    // written for those events went to the local fallback log instead of the
+    // table it was meant to reach (found 2026-09-05). Keep the caller's label
+    // in metadata.event and file the row under a permitted type. Both current
+    // callers report faults, hence 'error'.
+    const allowed = SupabaseReporter.ACTIVITY_TYPES.has(activityType);
     const payload = {
       agent: 'wren-watchdog',
-      activity_type: activityType,
+      activity_type: allowed ? activityType : 'error',
       content,
-      metadata,
+      metadata: allowed ? metadata : { ...metadata, event: activityType },
       created_at: new Date().toISOString(),
     };
     try {
@@ -103,21 +119,29 @@ export class SupabaseReporter {
    * page through this channel in addition to Discord.
    */
   async emitSentinelNotification(
-    severity: 'critical' | 'high' | 'warn' | 'info',
+    severity: NotificationSeverity,
     title: string,
     body: string,
     sourceId: string,
     metadata: Record<string, unknown>,
+    category = 'agent_hang',
   ): Promise<void> {
+    // Three of these fields are constrained and all three were wrong, so no
+    // watchdog notification has ever reached the dashboard ribbon (2026-09-05):
+    //   source   — enum notification_source, which has no 'wren_watchdog';
+    //              'agent_health' is the member this belongs to
+    //   severity — enum notification_severity is {info, warning, critical};
+    //              the old signature also offered 'high' and 'warn'
+    //   urgency  — CHECK {critical, high, medium, low}; 'normal' is not one
     const payload = {
-      source: 'wren_watchdog',
+      source: 'agent_health',
       severity,
       status: 'unread',
       title,
       body,
-      category: 'agent_hang',
+      category,
       source_id: sourceId,
-      urgency: severity === 'critical' ? 'high' : 'normal',
+      urgency: severity === 'critical' ? 'critical' : 'medium',
       metadata,
     };
     try {
