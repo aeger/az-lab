@@ -27,12 +27,20 @@ export class Poller {
       console.log(`[sentinel-api] collectors disabled (missing config): ${disabled.map(c => c.name).join(', ')}`);
     }
 
-    for (const collector of enabled) {
-      // Run immediately, then on interval
-      this.runCollector(collector);
-      const timer = setInterval(() => this.runCollector(collector), collector.intervalMs);
-      this.timers.push(timer);
-    }
+    // The dedup set is rebuilt from Supabase asynchronously at store.start().
+    // Collectors run IMMEDIATELY, so without this await the first tick races the
+    // seed, re-emits every still-open condition, and duplicates a row per
+    // restart -- the bug the seed exists to fix, silently un-fixed.
+    // Intervals are only armed after the seed resolves, so no tick can outrun it.
+    this.store.whenReady()
+      .then(() => {
+        for (const collector of enabled) {
+          this.runCollector(collector);
+          const timer = setInterval(() => this.runCollector(collector), collector.intervalMs);
+          this.timers.push(timer);
+        }
+      })
+      .catch(err => console.error(`[sentinel-api] collectors failed to start: ${err.message}`));
   }
 
   stop() {

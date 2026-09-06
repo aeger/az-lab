@@ -12,9 +12,17 @@ export function createAgentHealthCollector() {
     if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text()}`);
     const agents: any[] = await res.json() as any[];
 
+    // Only states a human would ACT on. `active`, `busy` and `inactive` are
+    // telemetry -- "Sage agent status: active" is the system working correctly,
+    // and it was being filed at the same visibility as a tripped kill switch.
+    // Over 48h these produced 13 of Jeff's 48 notifications and told him nothing.
+    // Live agent state already belongs to the dashboard, which reads
+    // agent_heartbeat directly; it does not need to be a notification too.
+    const ACTIONABLE = new Set(['critical', 'degraded', 'restarting', 'down']);
+
     const notifications: SentinelNotification[] = [];
     for (const agent of agents) {
-      if (agent.status === 'healthy' || agent.status === 'unknown') continue;
+      if (!ACTIONABLE.has(agent.status)) continue;
 
       const name = agent.agent.charAt(0).toUpperCase() + agent.agent.slice(1);
       let severity: 'critical' | 'warning' | 'info' = 'info';
