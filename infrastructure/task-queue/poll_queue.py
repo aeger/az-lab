@@ -1265,12 +1265,20 @@ _JEFF_MARKER = ">>JEFF:"
 # Safety net for when an agent forgets the marker -- which is exactly what
 # happened for a month. Deliberately specific: these phrases are second-person
 # and address a reader, so they do not fire on ordinary narration.
+# Keep these SHORT and second-person. Over-specifying is not caution, it is a
+# miss: the first version used "your call on" and sailed straight past
+# "Left open -- deliberately, and it's your call", which was a SECURITY decision
+# gate (migration 150, the 14 anon-readable SECURITY DEFINER functions). The
+# highest-value note of the week went unsurfaced because of two trailing words.
+# Prefer a false positive Jeff can dismiss over a silent miss he never learns of.
 _JEFF_CUES = (
-    "worth your attention", "worth your call", "your call on", "still yours",
+    "your call", "worth your attention", "still yours",
     "needs your", "need your", "awaiting your", "waiting on you",
-    "i deliberately did not", "i did not close", "i did not fix",
+    "say the word",                       # "say the word and I'll ..."
+    "left open", "deliberately did not", "did not close", "did not fix",
     "two things for you", "one thing worth", "two things worth",
-    "flagged for jeff", "awaiting jeff", "jeff decision",
+    "things worth your", "flagged for jeff", "awaiting jeff", "jeff decision",
+    "needs a decision", "decision gate", "your decision", "up to you",
 )
 
 _NOTE_MAX_BLOCKS = 4       # never mint a wall of notes from one task
