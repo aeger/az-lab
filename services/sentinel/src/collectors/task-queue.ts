@@ -44,6 +44,20 @@ export function createTaskQueueCollector() {
         }
       }
 
+      // A task merely being pending/claimed/in_progress is lifecycle telemetry,
+      // not something Jeff acts on -- the queue moving is the system working.
+      // Those produced 21 of his 48 notifications over 48h and buried the 2 that
+      // mattered. Only escalated states earn a notification; ordinary queue state
+      // is already on the dashboard, which reads task_queue directly.
+      //
+      // Note this is deliberately keyed off the ESCALATED category rather than
+      // task.status, so the age-based promotions above (task_stale, task_stuck)
+      // still surface -- those are the ones that mean something is wrong.
+      const ACTIONABLE_CATEGORIES = new Set([
+        'task_failed', 'task_blocked', 'task_stale', 'task_stuck',
+      ]);
+      if (!ACTIONABLE_CATEGORIES.has(category)) continue;
+
       const notif: SentinelNotification = {
         id: uuidv4(),
         source: 'task_queue' as const,

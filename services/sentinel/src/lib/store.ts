@@ -18,6 +18,7 @@ export class NotificationStore {
   private persistErrors = new Map<string, number>();
   private settings: NotificationSettings | null = null;
   private snoozed = new Map<string, number>(); // key -> until timestamp
+  private seedPromise: Promise<void> = Promise.resolve();
 
   onNew(cb: (n: SentinelNotification) => void) {
     this.onNewCallbacks.push(cb);
@@ -25,6 +26,48 @@ export class NotificationStore {
 
   start() {
     this.pruneTimer = setInterval(() => this.prune(), config.store.pruneInterval);
+    // Rebuild the dedup set from what is already on record, BEFORE the first
+    // collector tick. Without this, dedup lives only as long as the process:
+    // every restart forgets everything, the next tick re-emits every still-true
+    // condition, and Supabase accumulates a duplicate row per restart. That is
+    // why `goal_stale` appeared 8 times for 4 goals in 48h -- not a goals bug,
+    // a restart-amnesia bug affecting every category equally.
+    //
+    // Poller.start() awaits whenReady() before its first tick. Without that the
+    // seed loses a race against the immediate tick and this fix does nothing at
+    // all, while still looking correct in review.
+    this.seedPromise = this.seedSeenFromSupabase().catch(err =>
+      console.warn(`[store] could not seed dedup set, duplicates possible this run: ${err.message}`));
+  }
+
+  /** Resolves once the dedup set has been seeded (or seeding has failed). */
+  whenReady(): Promise<void> {
+    return this.seedPromise;
+  }
+
+  /** Seed `seen` from undismissed rows so dedup survives a restart. */
+  private async seedSeenFromSupabase(): Promise<void> {
+    const key = config.supabase.serviceKey || config.supabase.anonKey;
+    if (!config.supabase.url || !key) return;
+
+    // Dismissed rows are deliberately excluded: Jeff dismissing a notification
+    // means "dealt with", so an identical condition recurring later SHOULD
+    // notify again. Only still-open rows suppress a re-emit.
+    const since = new Date(Date.now() - 7 * 86_400_000).toISOString();
+    const url = `${config.supabase.url}/rest/v1/sentinel_notifications`
+      + `?dismissed_at=is.null&received_at=gte.${encodeURIComponent(since)}`
+      + `&select=source,category,source_id&limit=2000`;
+
+    const res = await fetch(url, {
+      headers: { 'apikey': key, 'Authorization': `Bearer ${key}` },
+    });
+    if (!res.ok) throw new Error(`Supabase ${res.status}`);
+
+    const rows = (await res.json()) as Array<{ source: string; category: string; source_id: string | null }>;
+    for (const r of rows) {
+      this.seen.add(`${r.source}:${r.category}:${r.source_id}`);
+    }
+    console.log(`[store] dedup set seeded with ${rows.length} open notification(s) — restarts no longer re-emit`);
   }
 
   stop() {
