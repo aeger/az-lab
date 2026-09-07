@@ -3955,8 +3955,37 @@ function startMemorySyncListener() {
   let ref = 0;
 
   function cleanup() {
+    // retryTimer MUST be cleared here. Without it this reconnect loop doubles.
+    //
+    // 2026-09-07: az-memory-mcp emitted 148,074 lines in one hour (~41/sec) of
+    // "WS error: ... reconnecting in 30s", and 134,010 the hour before. Two
+    // bursts produced 282k of its 292k lines in two days, against a normal
+    // baseline of 8-22 lines/HOUR. That flood is what tripped journald's rate
+    // limiter (23,900 + 18,048 messages suppressed in one 30s window) and helped
+    // collapse the journal horizon that was evicting the 09-04 incident evidence.
+    //
+    // The doubling: a failed connect fires `error`, which called cleanup() and
+    // scheduled T1. cleanup() called ws.close(), which fired `close`, which
+    // scheduled T2 -- and T1 was never cancelled, only its handle overwritten.
+    // So every failure left two pending reconnects, each of which failed and left
+    // two more. 30s doubling reaches thousands of concurrent reconnects in
+    // minutes. It only ever stopped because the container restarted.
+    //
+    // Two guards, both needed: clear the pending timer, and drop the listeners
+    // before closing so our own close() cannot re-enter the close handler.
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
     if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
-    if (ws) { try { ws.close(); } catch {} ws = null; }
+    if (ws) {
+      try { ws.removeAllListeners(); ws.close(); } catch {}
+      ws = null;
+    }
+  }
+
+  /** Schedule exactly one reconnect. Never stacks. */
+  function scheduleReconnect(why: string) {
+    if (retryTimer) return;   // a reconnect is already pending — do not add another
+    console.warn(`[memory-sync] ${why} — reconnecting in 30s`);
+    retryTimer = setTimeout(() => { retryTimer = null; connect(); }, 30_000);
   }
 
   function connect() {
@@ -4001,15 +4030,17 @@ function startMemorySyncListener() {
       }
     });
 
+    // Both handlers fire for a single failed connection, so both must route
+    // through scheduleReconnect(), which is idempotent while a retry is pending.
+    // Scheduling directly from either one is what produced the doubling.
     ws.on("error", (e: any) => {
-      console.warn(`[memory-sync] WS error: ${e.message} — reconnecting in 30s`);
       cleanup();
-      retryTimer = setTimeout(connect, 30_000);
+      scheduleReconnect(`WS error: ${e.message}`);
     });
 
     ws.on("close", () => {
       cleanup();
-      retryTimer = setTimeout(connect, 30_000);
+      scheduleReconnect("WS closed");
     });
   }
 
