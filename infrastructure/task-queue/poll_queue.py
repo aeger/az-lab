@@ -2203,11 +2203,20 @@ def notify_cowork_tasks():
         print(f"notify_cowork_tasks failed (non-fatal): {e}", file=sys.stderr)
 
 
+# Which agent identity this process heartbeats as. poll_queue.py is itself the
+# task_poller, but argus.py imports run_claude() from here and run_claude keeps a
+# heartbeat alive for the duration of a task. After claude-queue-poll.timer was
+# retired (2026-09-07) that meant Argus's own workers were writing a
+# `task_poller` row -- a heartbeat for a process that no longer exists, keeping a
+# retired agent looking alive. Argus overrides this to "argus" on import.
+HEARTBEAT_AGENT = "task_poller"
+
+
 def write_heartbeat(status="active", metadata=None):
-    """Write task_poller heartbeat to agent_heartbeat table."""
+    """Write this process's heartbeat to agent_heartbeat (see HEARTBEAT_AGENT)."""
     try:
         payload = json.dumps({
-            "agent": "task_poller",
+            "agent": HEARTBEAT_AGENT,
             "status": status,
             "last_heartbeat": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {"host": HOSTNAME},
