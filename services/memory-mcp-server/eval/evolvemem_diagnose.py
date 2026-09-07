@@ -402,6 +402,34 @@ def sweep_cmd(rec: dict) -> str:
             f'"{knob}":{rec.get("suggested_value")}}}]\')')
 
 
+# The task description used to be `render(report)[:6000]` -- a bare slice with no
+# marker. On 2026-09-07 that cut three descriptions at exactly 6146 chars (146 of
+# prefix + 6000) mid-WORD, and Jeff hit the DECISION row unable to tell what was
+# being asked. Worse than a marked truncation: nothing indicated text was missing,
+# so it read as a malformed request rather than a clipped one.
+#
+# What it destroyed is the part that matters most on a decision row -- the report
+# ends with the per-finding proposals and the "NOTHING ABOVE HAS BEEN APPLIED,
+# validate with tune_ranker.py sweep, ship as a numbered migration" instruction.
+# A head-only clip deletes exactly the ask and the safety rail.
+_TASK_DESC_BUDGET = 12000   # today's report is ~8.7k, so it now fits whole
+_TASK_DESC_HEAD   = 8000
+_TASK_DESC_TAIL   = 3500
+
+
+def _fit_for_task(body: str, md_path) -> str:
+    """Fit a rendered report into a task description without losing the tail."""
+    if len(body) <= _TASK_DESC_BUDGET:
+        return body
+    dropped = len(body) - _TASK_DESC_HEAD - _TASK_DESC_TAIL
+    return (
+        body[:_TASK_DESC_HEAD]
+        + f"\n\n... [{dropped} chars elided from the middle of a {len(body)}-char "
+          f"report; head and tail retained. Full report: {md_path}] ...\n\n"
+        + body[-_TASK_DESC_TAIL:]
+    )
+
+
 def render(report: dict) -> str:
     w, L = report["window"], []
     L.append(f"# EvolveMem recall diagnosis — {report['generated_at'][:10]}")
@@ -499,7 +527,7 @@ def surface(report: dict, md_path: Path) -> None:
             "title": title,
             "description": (f"Weekly EvolveMem read-only recall diagnosis.\n\n"
                             f"Report: {md_path}\n\n"
-                            + render(report)[:6000]),
+                            + _fit_for_task(render(report), md_path)),
             "source": "claude-code", "target": "jeff",
             "status": "pending_jeff_action", "priority": 2,
             "tags": ["memory", "recall", "evolvemem", "analysis"],
