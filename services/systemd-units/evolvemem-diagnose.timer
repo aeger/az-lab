@@ -1,0 +1,27 @@
+[Unit]
+Description=Weekly EvolveMem recall diagnosis timer
+Requires=evolvemem-diagnose.service
+
+[Timer]
+# Mondays 06:00 UTC. AFTER the 05:00 nightly eval, so the window closes on a run
+# from today rather than diagnosing a 7-day window whose last day is missing.
+# Also after Sunday 04:00 weekly-memory-consolidation, so a consolidation that
+# moved the corpus is inside the window being explained rather than landing
+# immediately after the report is written.
+#
+# No single-instance lock here, unlike nightly_eval.sh: this job never calls
+# hybrid_recall and never takes the eval_access_snapshot, so two overlapping runs
+# cannot corrupt each other's measurements. They would only duplicate a review task.
+#
+# Persistent=true + `systemctl --user enable --now` DOES fire the missed trigger
+# immediately -- the same trap nightly_eval.sh documents. Enabling this timer at
+# 09:30 on a Monday ran the 06:00 trigger on the spot, concurrent with a manual
+# run, and filed the review task twice (2026-09-07). Harmless here because the job
+# is read-only, but if you re-enable this outside a Monday-before-06:00 window,
+# expect one immediate run and dedupe the review task.
+OnCalendar=Mon *-*-* 06:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

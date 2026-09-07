@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly EvolveMem recall diagnosis (read-only analysis, surfaces for review)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/almty1/azlab/services/memory-mcp-server/eval
+EnvironmentFile=/home/almty1/azlab/services/memory-mcp-server/.env
+ExecStart=/home/almty1/azlab/services/memory-mcp-server/eval/evolvemem_diagnose.py --days 7 --surface --quiet
+StandardOutput=append:/home/almty1/azlab/services/memory-mcp-server/evolvemem_diagnose.log
+StandardError=append:/home/almty1/azlab/services/memory-mcp-server/evolvemem_diagnose.log
