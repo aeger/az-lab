@@ -49,7 +49,12 @@ PRIOR_TOTAL = sum(PRIOR.values())
 TOTAL = 1.10
 
 KEYS = ["w_recency", "w_access", "w_novelty", "w_importance", "w_relevance",
-        "w_recall_count", "w_lane_trgm", "trgm_floor"]
+        "w_recall_count", "w_lane_trgm", "trgm_floor",
+        # Per-lane fusion weights (recall_weights columns). Absent from KEYS until
+        # 2026-09-07, which silently made any --grid that moved a lane weight a
+        # no-op: build_grid dropped the key and set_weights never wrote it, so the
+        # sweep re-measured baseline under a candidate's name.
+        "w_lane_vec", "w_lane_bm25w", "w_lane_bm25p", "w_lane_topic", "w_lane_entity"]
 
 
 def cfg(relevance, trgm_floor=0.05, w_lane_trgm=0.5, **overrides):
@@ -190,11 +195,13 @@ def load_embeddings(rows, refresh=False):
 
 
 def set_weights(c):
-    body = {k: c[k] for k in KEYS}
-    body["updated_at"] = "now()"
+    # Tolerant of partial configs: the stage_* grids build composite weights only
+    # and say nothing about the lane weights, which then stay at their live values
+    # (and are restored with everything else in cmd_sweep's finally block).
+    body = {k: c[k] for k in KEYS if k in c}
     r = rr.httpx.patch(f"{rr.SUPABASE_URL}/rest/v1/recall_weights?id=eq.true",
                        headers={**rr.SB_HEADERS, "Prefer": "return=representation"},
-                       json={k: c[k] for k in KEYS}, timeout=30)
+                       json=body, timeout=30)
     r.raise_for_status()
 
 
@@ -262,7 +269,19 @@ def run_config(rows, embs, k=10):
 
 def build_grid(args):
     if args.grid:
-        return [(c["name"], {k: c[k] for k in KEYS}) for c in json.loads(Path(args.grid).read_text())]
+        # Overlay onto the LIVE weights so a grid entry only has to name the knobs
+        # it moves -- which is the shape evolvemem_diagnose.py's suggested commands
+        # emit. Unknown keys are fatal rather than ignored: a typo'd knob name
+        # otherwise runs as an unlabelled baseline replicate.
+        live = read_weights()
+        base = {k: live[k] for k in KEYS}
+        out = []
+        for c in json.loads(Path(args.grid).read_text()):
+            unknown = [k for k in c if k not in KEYS and k != "name"]
+            if unknown:
+                rr.die(f"grid config {c.get('name')!r} sets unknown key(s) {unknown}")
+            out.append((c["name"], {**base, **{k: c[k] for k in c if k in KEYS}}))
+        return out
     if args.stage == "relevance":
         return stage_relevance()
     if args.stage == "shape":
@@ -274,6 +293,7 @@ def build_grid(args):
 
 
 def cmd_sweep(args):
+    label = getattr(args, "label", None) or args.stage
     rows = mark_leaky(rr.load_queries())
     embs = load_embeddings(rows, args.refresh_embeddings)
     grid = build_grid(args)
@@ -281,7 +301,7 @@ def cmd_sweep(args):
     print(f"sweeping {len(grid)} configs x {len(rows)} probes …")
 
     out = []
-    with rr.eval_lock(f"tune_ranker sweep --stage {args.stage}"):
+    with rr.eval_lock(f"tune_ranker sweep --stage {label}"):
         snapped = rr.sb_rpc("eval_access_snapshot_take", {})
         print(f"access-stat snapshot taken ({snapped} rows)")
         try:
@@ -305,7 +325,7 @@ def cmd_sweep(args):
 
     # Ranked by the LEAKAGE-CONTROLLED number. See mark_leaky().
     out.sort(key=lambda r: -r["clean_ndcg_at_10"])
-    print(f"\n=== stage {args.stage} — ranked by clean nDCG@10 (n={out[0]['clean_n']}) ===")
+    print(f"\n=== stage {label} — ranked by clean nDCG@10 (n={out[0]['clean_n']}) ===")
     cats = sorted({c for r in out for c in r["by_cat"]})
     print(f"  {'config':<22} {'cln@10':>7} {'clnR@5':>7} {'nDCG@10':>8} {'R@5':>6} {'MRR':>6} "
           + " ".join(f"{c[:9]:>9}" for c in cats))
@@ -315,9 +335,9 @@ def cmd_sweep(args):
               + " ".join(f"{r['by_cat'].get(c, 0):>9.2f}" for c in cats))
 
     RESULTS.mkdir(parents=True, exist_ok=True)
-    dest = RESULTS / f"{args.stage}.json"
+    dest = RESULTS / f"{label}.json"
     dest.write_text(json.dumps(out, indent=2))
-    best = RESULTS / f"{args.stage}-best.json"
+    best = RESULTS / f"{label}-best.json"
     best.write_text(json.dumps(out[0]["config"], indent=2))
     print(f"\nwrote {dest}\nbest config -> {best}")
     return 0
@@ -351,6 +371,9 @@ def main():
                    help="relevance weight to hold fixed in the shape/trgm stages")
     s.add_argument("--shape", help="path to a config json to use as the trgm-stage base")
     s.add_argument("--grid", help="path to an explicit [{name, w_*...}] grid")
+    s.add_argument("--label", help="results filename stem (default: the stage name). "
+                                   "Use with --grid so an ad-hoc sweep does not "
+                                   "overwrite a canonical stage's results.")
     s.add_argument("--k", type=int, default=10)
     s.add_argument("--refresh-embeddings", action="store_true")
     s.set_defaults(fn=cmd_sweep)
