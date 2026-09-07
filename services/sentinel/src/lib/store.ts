@@ -45,7 +45,19 @@ export class NotificationStore {
     return this.seedPromise;
   }
 
-  /** Seed `seen` from undismissed rows so dedup survives a restart. */
+  /**
+   * Rehydrate from Supabase on boot: both the dedup set AND the live store.
+   *
+   * query() reads ONLY this.notifications, never Supabase, so anything not in
+   * memory is invisible in the bell. That used to be masked -- the telemetry
+   * collectors re-emitted dozens of rows within seconds of a restart, so the
+   * bell looked populated (with noise). Removing that telemetry and seeding the
+   * dedup set are each correct on their own, but together they meant a restart
+   * left the bell permanently EMPTY: nothing re-emits, so nothing is ever put
+   * back, and real open notifications become unreachable.
+   *
+   * So the same rows that suppress a re-emit are also restored as live items.
+   */
   private async seedSeenFromSupabase(): Promise<void> {
     const key = config.supabase.serviceKey || config.supabase.anonKey;
     if (!config.supabase.url || !key) return;
@@ -56,18 +68,40 @@ export class NotificationStore {
     const since = new Date(Date.now() - 7 * 86_400_000).toISOString();
     const url = `${config.supabase.url}/rest/v1/sentinel_notifications`
       + `?dismissed_at=is.null&received_at=gte.${encodeURIComponent(since)}`
-      + `&select=source,category,source_id&limit=2000`;
+      + `&order=received_at.desc&limit=500`;
 
     const res = await fetch(url, {
       headers: { 'apikey': key, 'Authorization': `Bearer ${key}` },
     });
     if (!res.ok) throw new Error(`Supabase ${res.status}`);
 
-    const rows = (await res.json()) as Array<{ source: string; category: string; source_id: string | null }>;
+    const rows = (await res.json()) as Array<Record<string, any>>;
     for (const r of rows) {
       this.seen.add(`${r.source}:${r.category}:${r.source_id}`);
+
+      // Restore directly into the Map rather than via add(): add() would fire
+      // the onNew callbacks (re-alerting Discord for every open notification on
+      // every restart) and re-persist rows that are already in the table.
+      this.notifications.set(r.id, {
+        id: r.id,
+        source: r.source,
+        severity: r.severity,
+        urgency: r.urgency ?? severityToUrgency(r.severity, String(r.category)),
+        status: r.status,
+        title: r.title,
+        body: r.body,
+        category: r.category,
+        sourceId: r.source_id,
+        sourceUrl: r.source_url,
+        metadata: r.metadata,
+        timestamp: r.timestamp,
+        receivedAt: r.received_at,
+        readAt: r.read_at,
+        dismissedAt: r.dismissed_at,
+      } as SentinelNotification);
     }
-    console.log(`[store] dedup set seeded with ${rows.length} open notification(s) — restarts no longer re-emit`);
+    console.log(`[store] rehydrated ${rows.length} open notification(s) from Supabase `
+      + `— dedup survives restart, and the bell is not emptied by one`);
   }
 
   stop() {
