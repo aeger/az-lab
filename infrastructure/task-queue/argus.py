@@ -30,6 +30,16 @@ from poll_queue import (
     notify_cowork_tasks, log_activity, discord_notify,
     HOSTNAME, SUPABASE_URL, SUPABASE_KEY,
     _RESULT_MAX_CHARS,
+    # Queue hygiene, moved here 2026-09-07 when claude-queue-poll.timer was
+    # retired. Argus's docstring always claimed it "replaces the 5-min cron
+    # timer", but the timer stayed enabled and both daemons claimed from the
+    # same queue -- task bd2eecfe was dispatched twice, 71 seconds apart, by
+    # poll_queue.py and argus.py respectively.
+    #
+    # These three were the ONLY things poll_queue.main() did that Argus did not.
+    # route_auto_tasks / notify_cowork_tasks / auto_queue_from_goals were already
+    # covered by the loop below, so nothing else was lost with the timer.
+    recover_stuck_tasks, sweep_stale_tasks, sweep_waiting_tasks,
 )
 
 # ── Tuning constants ────────────────────────────────────────────────────────
@@ -37,6 +47,10 @@ from poll_queue import (
 MAX_WORKERS            = 1      # max concurrent claude processes (was 3 — Supabase usage 2026-05-29)
 POLL_INTERVAL          = 60     # seconds between queue polls (was 30 — Supabase usage 2026-05-29)
 HEARTBEAT_INTERVAL     = 300    # write heartbeat every 5 min
+# Queue-hygiene sweeps inherited from the retired claude-queue-poll.timer.
+# They are cheap but not free (several Supabase round trips), and the timer ran
+# them every 5 min, so keep that cadence rather than firing them every 60s poll.
+SWEEP_INTERVAL         = 300    # run recover/stale/waiting sweeps every 5 min
 SIMPLE_STALL_SECS      = 1800   # 30 min — simple tasks
 COMPLEX_STALL_SECS     = 7200   # 2 hr  — complex/CRIT tasks
 SAGE_EVAL_LAG_SECS     = 120    # seconds to wait for Sage to pre-evaluate a new task
@@ -328,6 +342,7 @@ def main() -> None:
     _write_heartbeat("starting")
 
     last_heartbeat = 0.0
+    last_sweep = 0.0
 
     while True:
         try:
@@ -337,6 +352,20 @@ def main() -> None:
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 _write_heartbeat()
                 last_heartbeat = now
+
+            # Queue hygiene, inherited from claude-queue-poll.timer (retired
+            # 2026-09-07). Each sweep is isolated: recover_stuck_tasks() is the
+            # one that matters most -- without it a task wedged in
+            # claimed/in_progress_agent is never released -- so a failure in
+            # sweep_stale_tasks() must not prevent it running next cycle, and no
+            # sweep may take the dispatch loop down with it.
+            if now - last_sweep >= SWEEP_INTERVAL:
+                for _sweep in (recover_stuck_tasks, sweep_stale_tasks, sweep_waiting_tasks):
+                    try:
+                        _sweep()
+                    except Exception as e:
+                        print(f"[Argus] sweep {_sweep.__name__} failed: {e}", file=sys.stderr)
+                last_sweep = now
 
             # Check stalls / post progress
             _check_stalls()
