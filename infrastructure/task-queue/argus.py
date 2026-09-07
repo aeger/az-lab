@@ -41,6 +41,14 @@ from poll_queue import (
     # covered by the loop below, so nothing else was lost with the timer.
     recover_stuck_tasks, sweep_stale_tasks, sweep_waiting_tasks,
 )
+import poll_queue as _pq
+
+# run_claude() keeps a heartbeat alive for the duration of a task, and it writes
+# under poll_queue's identity. With claude-queue-poll.timer retired, that meant
+# Argus's workers were resurrecting a `task_poller` row every time they ran --
+# a live-looking heartbeat for a process that no longer exists. Argus heartbeats
+# as itself.
+_pq.HEARTBEAT_AGENT = "argus"
 
 # ── Tuning constants ────────────────────────────────────────────────────────
 
