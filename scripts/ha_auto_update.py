@@ -114,9 +114,15 @@ def wait_for_site(limit, what):
 
 
 def send_discord(msg):
-    """agent-bus POST /message → the claude-code channel. Discord caps at 2000 chars."""
+    """agent-bus POST /message → #az-lab-infra. notify.send() chunks past 2000 chars."""
     try:
-        payload = json.dumps({"text": msg[:1900]}).encode()
+        payload = json.dumps({
+            "text": msg,
+            # "claude-code" is a misnomer that posts to the Cook Family
+            # #admin-chat; infra alerts belong in #az-lab-infra.
+            "channel": "infra",
+            "username": "Wren · HA Updates",
+        }).encode()
         req = urllib.request.Request(
             f"{AGENT_BUS_URL}/message",
             data=payload,
