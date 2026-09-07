@@ -220,3 +220,40 @@ If a run with verdict=fail comes in, the latest entry in `runs[]` shows `'verdic
 5. Smoke test in the dashboard lab page — the recurring rows should show with `↻ last run Xm ago` and a History panel listing all past fires.
 
 If something breaks, the legacy `INSERT` path still works — `upsert_recurring_task` is just a stored function and not used elsewhere yet, so reverting any single trigger is safe.
+
+---
+
+## 3. Action Index companion — step 4b (migrations 152 / 152a, 2026-09-07)
+
+APPLIED LIVE to `trig_012pickAjxmifxbhMbCe95Em` on 2026-09-07. Recorded here so
+the prompt and the schema stay diffable from one place.
+
+Nothing in a trigger prompt is load-bearing for the companion: the AFTER trigger
+`memories_action_index_companion` on `memories` writes `Action Index - <date>`
+(type=reference, TTL 7d, facts in `extracted_facts.atomic_facts`) for every
+active `research_producers` row, whichever agent wrote it and by whatever path.
+The prompt step only upgrades the FACTS from a deterministic bullet-scrape to
+LLM-extracted claims:
+
+```sql
+SELECT public.record_action_index(
+  p_research_date := '<TODAY_DATE>'::date,
+  p_facts         := '<JSON_ARRAY_OF_FACTS>'::jsonb,
+  p_source_memory := 'AI Memory Research - <TODAY_DATE>'
+);
+```
+
+Notes for whoever edits the other daily-research prompts (Atlas / Wren side):
+- Call it AFTER the research row lands. With no row for the date it returns
+  `{"action":"skipped","reason":"no_source_memory"}` and writes nothing.
+- `p_facts` is a JSON array of strings (`[{"fact": "..."}]` also accepted). Empty
+  or malformed -> it silently falls back to the heuristic; check the returned
+  `fact_method` rather than assuming.
+- Agent-supplied facts are stored per source in `extracted_facts.agent_facts` and
+  survive later heuristic rebuilds triggered by the *other* daily series, as long
+  as that source row's content has not changed. Two series on one day produce one
+  companion with a section per source and `fact_method: "mixed"`.
+- Idempotent by date: calling it three times yields the same document. It rebuilds,
+  it does not append.
+- Do NOT `UPDATE` the Action Index row directly — the RPC maintains the `refines`
+  edges back to every contributing narrative; a manual UPDATE does not.

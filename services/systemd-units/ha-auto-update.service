@@ -1,0 +1,16 @@
+[Unit]
+Description=Home Assistant auto-update (install, reboot if needed, verify)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/home/almty1/dashboard/.env
+# AGENT_BUS_SECRET lives with the agent-bus/memory-mcp config, not the dashboard env.
+EnvironmentFile=/home/almty1/azlab/services/memory-mcp-server/.env
+ExecStart=/usr/bin/python3 /home/almty1/azlab/scripts/ha_auto_update.py
+WorkingDirectory=/home/almty1/azlab/scripts
+# A core+OS update plus a host reboot and health polling can legitimately run long.
+TimeoutStartSec=5400
+StandardOutput=append:/home/almty1/azlab/scripts/ha_auto_update.log
+StandardError=append:/home/almty1/azlab/scripts/ha_auto_update.log
