@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly Home Assistant update window (03:45 America/Phoenix)
+
+[Timer]
+OnCalendar=*-*-* 03:45:00 America/Phoenix
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
