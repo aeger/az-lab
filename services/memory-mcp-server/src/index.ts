@@ -2564,7 +2564,7 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
       target_id: z.string().uuid().describe("UUID of the target memory"),
       relationship: z.string().optional().describe("Relationship label, e.g. 'causes', 'precedes', 'related_to', 'references' (default: related_to)"),
       link_type: z.enum(["semantic", "temporal", "causal", "entity"]).optional().describe("MAGMA link type — semantic: topically related, temporal: time-ordered, causal: A caused B, entity: same entity (default: semantic)"),
-      strength: z.number().min(0).max(1).optional().describe("Link strength 0-1 (default: 1.0)"),
+      strength: z.number().min(0).max(1).optional().describe("Link strength 0-1 (default: 0.5 — below the 0.72 spreading-activation gate. Pass an explicit value for a link you have actually measured or know to be definitional)"),
     },
     async ({ source_id, target_id, relationship, link_type, strength }) => {
       // Validate both memories exist
@@ -2576,7 +2576,20 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
 
       const rel = relationship || "related_to";
       const ltype = link_type || "semantic";
-      const str = strength ?? 1.0;
+      // Default 0.5, NOT 1.0. An omitted strength means "I did not measure this",
+      // and 1.0 meant an unmeasured hand-made edge cleared the 0.72
+      // spreading-activation gate and took the maximum 0.1*strength boost --
+      // outranking edges whose strength is a real cosine similarity.
+      //
+      // Auto-generated semantic links already pass Math.min(similarity, 1.0), and
+      // supersede_memory() writes its own 1.0 for `supersedes` edges, which are
+      // definitional rather than estimated. Neither path goes through here, so
+      // nothing that legitimately deserves 1.0 loses it.
+      //
+      // 0.5 keeps the link visible and queryable while leaving it below the gate,
+      // so an unmeasured guess cannot outrank a measurement. Audited 2026-09-07:
+      // 1580 semantic links, none at 1.0; all 174 rows at 1.0 were supersedes.
+      const str = strength ?? 0.5;
 
       const { error } = await supabase
         .from("memory_links")
