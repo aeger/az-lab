@@ -366,7 +366,10 @@ def route_auto_tasks():
         "GET",
         "task_queue",
         params={
-            "status": "eq.pending",
+            # 'ready' is what the dashboard's New Task form writes; 'pending' is the
+            # legacy status. Filtering on 'pending' alone left dashboard-created
+            # unassigned tasks unrouted forever.
+            "status": "in.(ready,pending)",
             "target": "eq.auto",
             "order": "created_at.asc",
             "limit": "5",
