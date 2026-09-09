@@ -48,6 +48,21 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = (os.environ.get("SUPABASE_SECRET_KEY")
                 or os.environ.get("SUPABASE_PUBLISHABLE_KEY", ""))
 
+# HA REST API — HACS / custom-component updates the `ha` CLI cannot see.
+HA_API_URL   = os.environ.get("HA_URL", "").rstrip("/")
+HA_API_TOKEN = os.environ.get("HA_TOKEN", "")
+# Update entities we must NOT drive over the API: core/OS/supervisor are handled
+# by the CLI pass above (with backups and our own reboot handling), add-ons carry
+# the BACKUP feature flag and are also CLI-managed, and device_class=firmware is
+# real hardware (router, APs) that must never auto-flash unattended.
+HA_SKIP_ENTITIES = {
+    "update.home_assistant_core_update",
+    "update.home_assistant_operating_system_update",
+    "update.home_assistant_supervisor_update",
+}
+UPDATE_BACKUP_FEATURE  = 8      # UpdateEntityFeature.BACKUP -> supervisor-managed
+ENTITY_INSTALL_TIMEOUT = 600
+
 TAG = "[ha_auto_update]"
 
 
@@ -83,6 +98,56 @@ def ha_json(args, timeout=SSH_TIMEOUT):
     except (ValueError, AttributeError) as e:
         log(f"WARN: could not parse JSON from `ha {' '.join(args)}`: {e}")
         return None
+
+
+def ha_api(path, payload=None, timeout=30):
+    """Call the HA REST API. Returns (ok, parsed_body_or_error_string)."""
+    if not (HA_API_URL and HA_API_TOKEN):
+        return False, "HA_URL/HA_TOKEN not set in environment"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        HA_API_URL + path, data=data,
+        headers={"Authorization": "Bearer " + HA_API_TOKEN,
+                 "Content-Type": "application/json"},
+        method="POST" if data is not None else "GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode()
+        return True, (json.loads(body) if body.strip() else [])
+    except Exception as e:
+        return False, str(e)[:300]
+
+
+def find_entity_updates():
+    """HACS / custom-component updates, invisible to the Supervisor CLI.
+
+    Returns [] when nothing is pending, or None if the API is unreachable, so a
+    dead token is never mistaken for "everything is up to date".
+    """
+    ok, states = ha_api("/api/states")
+    if not ok:
+        log(f"WARN: HA REST API unreachable ({states}) - HACS updates not checked")
+        return None
+    out = []
+    for s in states:
+        eid = s.get("entity_id", "")
+        if not eid.startswith("update.") or s.get("state") != "on":
+            continue
+        a = s.get("attributes", {}) or {}
+        if eid in HA_SKIP_ENTITIES:
+            continue
+        if a.get("device_class") == "firmware":
+            continue
+        if (a.get("supported_features") or 0) & UPDATE_BACKUP_FEATURE:
+            continue  # add-on: the CLI pass owns it
+        name = (a.get("friendly_name") or eid)
+        if name.endswith(" Update"):
+            name = name[: -len(" Update")]
+        out.append({"kind": "hacs", "entity_id": eid, "name": name,
+                    "frm": a.get("installed_version"),
+                    "to": a.get("latest_version")})
+    return out
 
 
 def http_ok(url, timeout=10):
@@ -192,6 +257,10 @@ def find_updates():
         pending.append({"kind": "os", "name": "Operating System",
                         "frm": osi.get("version"), "to": osi.get("version_latest")})
 
+    entity_pending = find_entity_updates()
+    if entity_pending:
+        pending.extend(entity_pending)
+
     # If every probe failed we cannot tell "nothing pending" from "cannot reach".
     if sup is None and apps is None and core is None and osi is None:
         return None
@@ -201,6 +270,16 @@ def find_updates():
 def apply_update(u):
     """Apply one update. Returns (ok, detail)."""
     kind = u["kind"]
+    if kind == "hacs":
+        log(f"applying hacs: {u['name']} {u.get('frm')} -> {u.get('to')}")
+        ok, res = ha_api("/api/services/update/install",
+                         {"entity_id": u["entity_id"]},
+                         timeout=ENTITY_INSTALL_TIMEOUT)
+        if not ok:
+            log(f"FAILED hacs {u['name']}: {res}")
+            return False, str(res)[:300]
+        log(f"ok: {u['name']} now {u.get('to')}")
+        return True, ""
     if kind == "supervisor":
         cmd = ["supervisor", "update"]
     elif kind == "app":
@@ -275,7 +354,7 @@ def main():
                    if a.get("state") == "started"}
 
     # 3. Apply in dependency order: supervisor, apps, core, OS.
-    order = {"supervisor": 0, "app": 1, "core": 2, "os": 3}
+    order = {"supervisor": 0, "app": 1, "core": 2, "os": 3, "hacs": 4}
     pending.sort(key=lambda u: order[u["kind"]])
 
     applied, failed, os_updated = [], [], False
@@ -294,6 +373,17 @@ def main():
         # Core and supervisor updates restart services — let them settle.
         if ok and u["kind"] in ("core", "supervisor"):
             wait_for_site(HEALTH_WAIT, f"{u['name']} restart")
+
+    # 3b. HACS custom components only load on a Core restart. Skipped when an OS
+    #     update is about to reboot the whole host anyway.
+    if any(u["kind"] == "hacs" for u in applied) and not os_updated:
+        log("restarting Core so updated custom components load")
+        rc, out, err = ha(["core", "restart"], timeout=UPDATE_TIMEOUT)
+        if rc != 0:
+            detail = (err or out or f"rc={rc}").splitlines()[-1][:300]
+            log(f"FAILED core restart: {detail}")
+            failed.append(({"kind": "hacs", "name": "Core restart"}, detail))
+        wait_for_site(HEALTH_WAIT, "core restart")
 
     # 4. Reboot only if the OS changed.
     reboot_ok = True
