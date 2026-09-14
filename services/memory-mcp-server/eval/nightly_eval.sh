@@ -74,8 +74,8 @@ echo "=== $(date -u +%FT%TZ) nightly eval  tag=$TAG  sha=$GIT_SHA$DIRTY ==="
 python3 retrieval_regression.py run --tag "$TAG" --git-sha "$GIT_SHA" \
   --fail-under-hard-recall1 0.26 \
   --fail-under-hard-ndcg5 0.45 \
-  --notes "nightly automated run${DIRTY}"
-RUN_RC=$?
+  --notes "nightly automated run${DIRTY}" 2>&1 | tee /tmp/nightly_eval_run.log
+RUN_RC=${PIPESTATUS[0]}
 
 # rc=2 is die() — the run REFUSED to record (embedder outage, retrieval failure rate
 # over tolerance). Nothing was written, so there is no run for the gate to read and
@@ -90,7 +90,13 @@ if [ "$RUN_RC" -ge 2 ]; then
   exit "$RUN_RC"
 fi
 if [ "$RUN_RC" -ne 0 ]; then
-  echo "hard-tier floor BREACHED (rc=$RUN_RC) — continuing to gate + refresh, unit will be red" >&2
+  # Extract the actual FAIL reason from the run's output, don't assume the cause
+  fail_msg=$(grep "^  FAIL:" /tmp/nightly_eval_run.log | tail -1)
+  if [ -n "$fail_msg" ]; then
+    echo "$fail_msg — continuing to gate + refresh, unit will be red" >&2
+  else
+    echo "retrieval gate FAILED (rc=$RUN_RC) — continuing to gate + refresh, unit will be red" >&2
+  fi
 fi
 
 # --notify-ok posts the GREEN line too, not just regressions (2026-07-30 REC 1).
