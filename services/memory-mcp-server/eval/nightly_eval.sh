@@ -89,15 +89,6 @@ if [ "$RUN_RC" -ge 2 ]; then
   echo "eval run refused to record (rc=$RUN_RC) — skipping gate" >&2
   exit "$RUN_RC"
 fi
-if [ "$RUN_RC" -ne 0 ]; then
-  # Extract the actual FAIL reason from the run's output, don't assume the cause
-  fail_msg=$(grep "^  FAIL:" /tmp/nightly_eval_run.log | tail -1)
-  if [ -n "$fail_msg" ]; then
-    echo "$fail_msg — continuing to gate + refresh, unit will be red" >&2
-  else
-    echo "retrieval gate FAILED (rc=$RUN_RC) — continuing to gate + refresh, unit will be red" >&2
-  fi
-fi
 
 # --notify-ok posts the GREEN line too, not just regressions (2026-07-30 REC 1).
 # Without it the forgetting lane and the control arm are invisible unless they
@@ -184,6 +175,16 @@ python3 ../refresh_state_memory.py || echo "state-memory refresh failed (non-fat
 # the breach away after going to the trouble of measuring it.
 FINAL_RC="$GATE_RC"
 if [ "$RUN_RC" -ne 0 ]; then FINAL_RC="$RUN_RC"; fi
+
+# Report failures only after FINAL_RC is determined (not prematurely).
+if [ "$RUN_RC" -ne 0 ]; then
+  fail_msg=$(grep "^  FAIL:" /tmp/nightly_eval_run.log | tail -1)
+  if [ -n "$fail_msg" ]; then
+    echo "$fail_msg — unit will be $([ "$FINAL_RC" -ne 0 ] && echo 'red' || echo 'restored')" >&2
+  else
+    echo "retrieval run FAILED (rc=$RUN_RC) — unit will be $([ "$FINAL_RC" -ne 0 ] && echo 'red' || echo 'restored')" >&2
+  fi
+fi
 
 echo "=== done  rc=$FINAL_RC  (run=$RUN_RC gate=$GATE_RC) ==="
 exit "$FINAL_RC"

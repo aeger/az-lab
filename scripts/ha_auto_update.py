@@ -60,6 +60,7 @@ HA_SKIP_ENTITIES = {
     "update.home_assistant_core_update",
     "update.home_assistant_operating_system_update",
     "update.home_assistant_supervisor_update",
+    "update.ssh_update",  # SSH add-on can't self-update over SSH transport
 }
 UPDATE_BACKUP_FEATURE  = 8      # UpdateEntityFeature.BACKUP -> supervisor-managed
 ENTITY_INSTALL_TIMEOUT = 600
@@ -138,6 +139,8 @@ def find_entity_updates():
         a = s.get("attributes", {}) or {}
         if eid in HA_SKIP_ENTITIES:
             continue
+        if "ssh" in eid.lower():
+            continue  # SSH add-on can't self-update over SSH transport
         if a.get("device_class") == "firmware":
             continue
         if (a.get("supported_features") or 0) & UPDATE_BACKUP_FEATURE:
