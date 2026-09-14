@@ -36,6 +36,7 @@ HEALTH_URLS     = [
 AGENT_BUS_URL   = "http://localhost:8765"
 AGENT_BUS_SECRET = os.environ.get("AGENT_BUS_SECRET", "")  # /discord/send is authed
 DISK_FREE_WARN_GB = 10          # HA host free space floor worth flagging
+CLI_SKIP_ADDONS   = {"a0d7b954_ssh"}  # SSH add-on can't self-update over its own transport
 
 SSH_TIMEOUT       = 60          # plain info/query calls
 UPDATE_TIMEOUT    = 1800        # a single core/os/app update
@@ -243,8 +244,11 @@ def find_updates():
     apps = ha_json(["apps"])
     for a in (apps or {}).get("addons", []):
         if a.get("update_available"):
-            pending.append({"kind": "app", "slug": a.get("slug"),
-                            "name": a.get("name", a.get("slug")),
+            slug = a.get("slug")
+            if slug in CLI_SKIP_ADDONS:
+                continue  # Can't self-update over its own transport; skip for now.
+            pending.append({"kind": "app", "slug": slug,
+                            "name": a.get("name", slug),
                             "frm": a.get("version"), "to": a.get("version_latest")})
 
     core = ha_json(["core", "info"])
