@@ -15,6 +15,12 @@ export interface WatchdogConfig {
   proactivePromptLimit: number;
   watchdogDir: string;
   heartbeatFile: string;
+  /** Heartbeat written only by hooks running inside the bridge session. The
+   * shared heartbeatFile is written by every Claude session on the host, so it
+   * cannot distinguish a live bridge from Jeff's own terminal (2026-09-17). */
+  bridgeHeartbeatFile: string;
+  /** When false, fall back to the old shared-heartbeat-only behaviour. */
+  bridgeHeartbeatEnabled: boolean;
   stateFile: string;
   /** Circuit-breaker state — kept in its OWN file so the watchdog StateManager
    * can never clobber the recorded restart history (2026-06-16 loop bug). */
@@ -63,6 +69,21 @@ export interface WatchdogConfig {
   channelDeafThresholdSec: number;
   /** Seconds after any restart during which deafness is expected, not acted on. */
   channelRestartGraceSec: number;
+  /**
+   * Login-wall detector — tells a `/login` wall apart from an unresponsive
+   * session before the canary-timeout path restarts anything. On 2026-09-17 an
+   * expired OAuth token cost five restarts and three breaker trips; no restart
+   * can fix an auth failure. See login-wall.ts.
+   */
+  loginWallDetectionEnabled: boolean;
+  /** Claude Code's OAuth credential file, read for expiry (epoch MS fields). */
+  credentialsFile: string;
+  /** Lines of tmux scrollback to capture when looking for the canary's reply. */
+  loginWallPaneLines: number;
+  /** Seconds between repeat pages while a login wall persists. */
+  authRealertSec: number;
+  /** Warn this far ahead of refresh-token expiry (default 3 days). */
+  authExpiryWarnSec: number;
 }
 
 /** Expand ~ in paths */
@@ -152,6 +173,16 @@ export async function loadConfig(): Promise<WatchdogConfig> {
   ).split(',').map(v => v.trim()).filter(Boolean);
   const channelDeafThresholdSec = parseInt(get('CHANNEL_DEAF_THRESHOLD_SEC', '120'), 10);
   const channelRestartGraceSec = parseInt(get('CHANNEL_RESTART_GRACE_SEC', '180'), 10);
+  // On by default: its only power is to WITHHOLD a restart and page a human,
+  // which is the safe direction to fail in.
+  const loginWallDetectionEnabled = get('LOGIN_WALL_DETECTION_ENABLED', '1') === '1';
+  const credentialsFile = expandHome(
+    get('CLAUDE_CREDENTIALS_FILE', path.join(os.homedir(), '.claude', '.credentials.json')),
+  );
+  const loginWallPaneLines = parseInt(get('LOGIN_WALL_PANE_LINES', '50'), 10);
+  const authRealertSec = parseInt(get('AUTH_REALERT_SEC', '3600'), 10);
+  const authExpiryWarnSec = parseInt(get('AUTH_EXPIRY_WARN_SEC', '259200'), 10);
+  const bridgeHeartbeatEnabled = get('BRIDGE_HEARTBEAT_ENABLED', '1') === '1';
 
   // Discord token: prefer env var, fall back to ~/.claude/channels/discord/.env
   let discordBotToken = process.env['BOT_TOKEN'] ?? envVars['BOT_TOKEN'] ?? '';
@@ -174,6 +205,8 @@ export async function loadConfig(): Promise<WatchdogConfig> {
     proactivePromptLimit,
     watchdogDir,
     heartbeatFile: path.join(watchdogDir, 'heartbeat'),
+    bridgeHeartbeatFile: path.join(watchdogDir, 'heartbeat.bridge'),
+    bridgeHeartbeatEnabled,
     stateFile: path.join(watchdogDir, 'state.json'),
     breakerStateFile: path.join(watchdogDir, 'breaker.json'),
     counterFile: path.join(watchdogDir, 'prompt_count'),
@@ -198,5 +231,10 @@ export async function loadConfig(): Promise<WatchdogConfig> {
     channelMcpMatch,
     channelDeafThresholdSec,
     channelRestartGraceSec,
+    loginWallDetectionEnabled,
+    credentialsFile,
+    loginWallPaneLines,
+    authRealertSec,
+    authExpiryWarnSec,
   };
 }
