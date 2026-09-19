@@ -28,6 +28,7 @@ from poll_queue import (
     mark_completed, mark_failed, mark_pending_eval, mark_pending_jeff_action,
     _needs_jeff_input, auto_queue_from_goals, route_auto_tasks,
     notify_cowork_tasks, log_activity, discord_notify,
+    refresh_container_updates,
     HOSTNAME, SUPABASE_URL, SUPABASE_KEY,
     _RESULT_MAX_CHARS,
     # Queue hygiene, moved here 2026-09-07 when claude-queue-poll.timer was
@@ -221,6 +222,13 @@ def _worker(task: dict, stall_threshold: int = SIMPLE_STALL_SECS) -> None:
             proc_register=_register_proc,
             max_runtime=stall_threshold * 3,
         )
+
+        # Before any terminal-state branching: completed, pending_eval and
+        # pending_jeff_action all mean the image work already ran. Argus is the
+        # sole orchestrator since the 09-07 timer retirement, so the 09-04 fix
+        # (92a5c58) only has teeth if it fires here too -- poll_queue.main()
+        # no longer runs.
+        refresh_container_updates(task)
 
         # JeffLoop: detect if agent is asking Jeff a question
         jeff_needed, jeff_reason = _needs_jeff_input(result)
