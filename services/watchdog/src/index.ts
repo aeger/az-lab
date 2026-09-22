@@ -16,6 +16,7 @@ import { loadConfig } from './config.js';
 import { HeartbeatMonitor } from './heartbeat.js';
 import { CanarySender } from './canary.js';
 import { ChannelHealthChecker, decideChannelAction } from './channel-health.js';
+import { LoginWallDetector, assessExpiryWarning, canaryIdFor } from './login-wall.js';
 import { CircuitBreaker } from './circuit-breaker.js';
 import { DiscordNotifier } from './discord.js';
 import { SupabaseReporter } from './supabase-reporter.js';
@@ -39,6 +40,7 @@ async function main() {
   const heartbeat = new HeartbeatMonitor({
     heartbeatFile: config.heartbeatFile,
     staleThresholdSec: config.staleThresholdSec,
+    bridgeHeartbeatFile: config.bridgeHeartbeatEnabled ? config.bridgeHeartbeatFile : undefined,
   });
   const canary = new CanarySender({
     tmuxSession: config.tmuxSession,
@@ -63,6 +65,11 @@ async function main() {
   const channelHealth = new ChannelHealthChecker({
     bridgeMatch: config.channelBridgeMatch,
     mcpMatch: config.channelMcpMatch,
+  });
+  const loginWall = new LoginWallDetector({
+    tmuxSession: config.tmuxSession,
+    credentialsFile: config.credentialsFile,
+    paneLines: config.loginWallPaneLines,
   });
   const hangDetector = new HangDetector({
     lastPromptAtFile: config.lastPromptAtFile,
@@ -98,7 +105,7 @@ async function main() {
   // Main poll loop
   const poll = async () => {
     try {
-      await tick(config, logger, stateMgr, heartbeat, canary, breaker, discord, supabase, dashboard, hangDetector, channelHealth);
+      await tick(config, logger, stateMgr, heartbeat, canary, breaker, discord, supabase, dashboard, hangDetector, channelHealth, loginWall);
     } catch (err) {
       await logger.log(`Unhandled error in tick: ${err}`).catch(() => {});
     }
@@ -121,6 +128,7 @@ async function tick(
   dashboard: WatchdogDashboard,
   hangDetector: HangDetector,
   channelHealth: ChannelHealthChecker,
+  loginWall: LoginWallDetector,
 ) {
   const now = Math.floor(Date.now() / 1000);
 
@@ -144,6 +152,14 @@ async function tick(
   const state = await stateMgr.load();
   const hbResult = await heartbeat.check();
   const promptCount = await readCounter(config.counterFile);
+
+  // ── Credential warn-ahead ───────────────────────────────────────────────────
+  // Cheap (one file read, no pane scrape) and runs on every path: a refresh
+  // token that is about to die is the one auth failure we can see coming, and
+  // warning after the bridge is already walled is worth much less.
+  if (config.loginWallDetectionEnabled) {
+    await warnAheadOfExpiry(config, logger, stateMgr, state, discord, supabase, loginWall);
+  }
 
   // ── Update dashboard ────────────────────────────────────────────────────────
   const breakerStatus = await breaker.getStatus();
@@ -255,7 +271,12 @@ async function tick(
     const wasUnhealthy = state.lastStatus !== 'healthy';
 
     if (wasUnhealthy) {
-      await logger.log(`Recovered to healthy (was: ${state.lastStatus}, age: ${hbResult.ageSec}s, prompts: ${promptCount})`);
+      // Name the source: a 'shared' recovery is only as trustworthy as the
+      // assumption that no other Claude session on the host wrote that file.
+      await logger.log(
+        `Recovered to healthy (was: ${state.lastStatus}, age: ${hbResult.ageSec}s, ` +
+          `prompts: ${promptCount}, heartbeat source: ${hbResult.source})`,
+      );
       await supabase.updateStatus('healthy', { prompt_count: promptCount, recovered_from: state.lastStatus });
       if (state.lastStatus === 'restarting' || state.lastStatus === 'critical' || state.lastStatus === 'hung') {
         await discord.send(`Wren recovered and responding (prompts: ${promptCount})`, 3066993).catch(() => {});
@@ -264,7 +285,18 @@ async function tick(
       await supabase.updateStatus('healthy', { prompt_count: promptCount });
     }
 
-    await stateMgr.save({ ...trackedState, lastStatus: 'healthy', canarySentAt: null, hangDetectedAt: null, channelDeafSince: null });
+    if (state.authWallSince !== null) {
+      await logger.log('Login wall cleared — bridge is answering again');
+    }
+    await stateMgr.save({
+      ...trackedState,
+      lastStatus: 'healthy',
+      canarySentAt: null,
+      hangDetectedAt: null,
+      channelDeafSince: null,
+      authWallSince: null,
+      authAlertedAt: null,
+    });
     dashboard.updateStatus({ status: 'healthy' });
 
     // Proactive overnight restart
@@ -282,7 +314,10 @@ async function tick(
   }
 
   // ── STALE path ──────────────────────────────────────────────────────────────
-  await logger.log(`Heartbeat stale: ${hbResult.ageSec}s (threshold: ${config.staleThresholdSec}s)`);
+  await logger.log(
+    `Heartbeat stale: ${hbResult.ageSec}s (threshold: ${config.staleThresholdSec}s, ` +
+      `source: ${hbResult.source})`,
+  );
 
   // Count recent journal errors
   const errorCount = await countJournalErrors();
@@ -304,6 +339,25 @@ async function tick(
   if (canaryAge < config.canaryTimeoutSec) {
     await logger.log(`Waiting for canary (${canaryAge}s / ${config.canaryTimeoutSec}s)`);
     return;
+  }
+
+  // ── LOGIN WALL check ────────────────────────────────────────────────────────
+  // An unanswered canary and a canary answered by `Please run /login` look
+  // identical from here: neither runs a model turn, so neither fires the Stop
+  // hook the response detector watches. Ask the pane which one this is BEFORE
+  // calling it unresponsive — restarting an auth failure just burns breaker
+  // slots (2026-09-17: five restarts, three trips, zero effect).
+  if (config.loginWallDetectionEnabled) {
+    const assessment = await loginWall.check(canaryIdFor(state.canarySentAt));
+    if (assessment.wall) {
+      await handleLoginWall(config, logger, stateMgr, state, discord, supabase, dashboard, assessment, canaryAge);
+      return;
+    }
+    if (assessment.evidence.statusLineMarker !== null) {
+      // Worth a line: this is the shape a stale status line takes, and it is
+      // the most likely reason a real wall would be missed.
+      await logger.log(`Login-wall check passed — ${assessment.reason}`);
+    }
   }
 
   // ── UNRESPONSIVE path ────────────────────────────────────────────────────────
@@ -374,6 +428,151 @@ async function tick(
 
   await discord.send(msg, color).catch(() => {});
   await logger.log('Restart issued');
+}
+
+/**
+ * Login-wall handler. The bridge is up, tmux is up, the pane answers — but the
+ * answer is `Please run /login`, so no work can happen and no restart will help.
+ * This path deliberately does THREE things the restart paths do not:
+ *
+ *   - it never calls systemctl restart,
+ *   - it never calls breaker.recordRestart(), so an auth outage cannot eat the
+ *     hourly restart budget the way it did on 2026-09-17, and
+ *   - it clears canarySentAt so the next tick sends a fresh canary. The pane
+ *     evidence is only as current as the last canary, so without this the
+ *     detector would keep re-reading one stale reply and never notice Jeff
+ *     fixing it.
+ *
+ * Reasoning goes to agent_activity BEFORE the page, per wren_constitution
+ * principle 2.
+ */
+async function handleLoginWall(
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  logger: LocalLogger,
+  stateMgr: StateManager,
+  state: WatchdogState,
+  discord: DiscordNotifier,
+  supabase: SupabaseReporter,
+  dashboard: WatchdogDashboard,
+  assessment: import('./login-wall.js').LoginWallAssessment,
+  canaryAgeSec: number,
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  const wallSince = state.authWallSince ?? now;
+  const wallForSec = now - wallSince;
+
+  await logger.log(
+    `LOGIN WALL (${assessment.trigger}) — ${assessment.reason}; ` +
+      `not restarting (walled for ${wallForSec}s)`,
+  );
+
+  const metadata = {
+    trigger: assessment.trigger,
+    detail: assessment.reason,
+    evidence: assessment.evidence,
+    canary_age_sec: canaryAgeSec,
+    walled_for_sec: wallForSec,
+    tmux_session: config.tmuxSession,
+    restart_suppressed: true,
+  };
+
+  await supabase.logActivity(
+    'login_wall',
+    `Bridge is behind a Claude Code login wall, not hung: ${assessment.reason}. ` +
+      `Withholding the restart — only /login clears this.`,
+    metadata,
+  ).catch(() => {});
+
+  const shouldPage =
+    state.authWallSince === null ||
+    state.authAlertedAt === null ||
+    now - state.authAlertedAt >= config.authRealertSec;
+
+  if (shouldPage) {
+    await supabase.emitSentinelNotification(
+      'critical',
+      'Discord bridge needs /login',
+      `The bridge is running and answering the pane, but every turn hits a Claude Code ` +
+        `login wall, so no work can happen.\n\n${assessment.reason}\n\n` +
+        `A restart cannot fix this — run /login in the bridge session.`,
+      `login-wall:${config.tmuxSession}:${wallSince}`,
+      metadata,
+      'agent_auth',
+    ).catch(() => {});
+
+    await discord.send(
+      `AUTH: the Discord bridge is behind a Claude Code login wall — **not** hung, and ` +
+        `**not** restarting (a restart cannot clear an auth failure).\n` +
+        `${assessment.reason}\n` +
+        `Run \`/login\` in the bridge session:\n` +
+        `\`\`\`\nssh almty1@192.168.1.181\ntmux attach -t ${config.tmuxSession}\n/login\n\`\`\``,
+      15158332,
+    ).catch(() => {});
+  }
+
+  await stateMgr.save({
+    ...state,
+    // Cleared so the next tick re-canaries and the pane evidence stays current.
+    canarySentAt: null,
+    lastStatus: 'auth_blocked',
+    authWallSince: wallSince,
+    authAlertedAt: shouldPage ? now : state.authAlertedAt,
+  });
+  await supabase.updateStatus('auth_blocked', metadata).catch(() => {});
+  dashboard.updateStatus({ status: 'auth_blocked' });
+}
+
+/**
+ * The cheap half of the auth story: read the credential file and page ahead of
+ * a refresh-token expiry instead of discovering it from a restart loop. Keyed
+ * on the refresh token only — an expired ACCESS token is routine (Claude Code
+ * refreshes it on the next request), so alerting on that would be noise.
+ * Deduped by the expiry timestamp, so one token warns once.
+ */
+async function warnAheadOfExpiry(
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  logger: LocalLogger,
+  stateMgr: StateManager,
+  state: WatchdogState,
+  discord: DiscordNotifier,
+  supabase: SupabaseReporter,
+  loginWall: LoginWallDetector,
+): Promise<void> {
+  const creds = await loginWall.readCredentials();
+  const warning = assessExpiryWarning(
+    creds,
+    config.authExpiryWarnSec,
+    state.authWarnedForRefreshExpiresAt,
+  );
+  if (!warning.warn) return;
+
+  await logger.log(`Auth expiry warning — ${warning.reason}`);
+
+  const metadata = {
+    reason: warning.reason,
+    credential_verdict: creds.verdict,
+    access_expires_in_sec: creds.accessExpiresInSec,
+    refresh_expires_in_sec: creds.refreshExpiresInSec,
+    refresh_token_expires_at: creds.refreshTokenExpiresAt,
+    credentials_file: config.credentialsFile,
+  };
+
+  await supabase.logActivity('auth_expiry_warning', warning.reason, metadata).catch(() => {});
+  await supabase.emitSentinelNotification(
+    'warning',
+    'Claude Code re-auth needed soon',
+    `${warning.reason}\n\nRun /login in the bridge session before it lapses — once it does, ` +
+      `the bridge answers every prompt with a login wall and only a human can clear it.`,
+    `auth-expiry:${creds.refreshTokenExpiresAt}`,
+    metadata,
+    'agent_auth',
+  ).catch(() => {});
+  await discord.send(`Heads up: ${warning.reason}`, 16776960).catch(() => {});
+
+  // Persisted immediately — several tick paths return without saving, and an
+  // unsaved dedupe key would re-page on every poll.
+  state.authWarnedForRefreshExpiresAt = warning.refreshTokenExpiresAt;
+  await stateMgr.save({ ...state }).catch(() => {});
 }
 
 /**

@@ -21,6 +21,12 @@ export interface WatchdogState {
   hangDetectedAt: number | null;
   /** Channel health — when the bridge first looked deaf (epoch sec). */
   channelDeafSince: number | null;
+  /** Login wall — when the bridge was first seen behind /login (epoch sec). */
+  authWallSince: number | null;
+  /** Login wall — when Jeff was last paged about it (epoch sec), for re-alerts. */
+  authAlertedAt: number | null;
+  /** Warn-ahead dedupe: the refreshTokenExpiresAt (epoch MS) already warned on. */
+  authWarnedForRefreshExpiresAt: number | null;
 }
 
 const DEFAULT_STATE: WatchdogState = {
@@ -35,6 +41,9 @@ const DEFAULT_STATE: WatchdogState = {
   lastSeenActivityAt: null,
   hangDetectedAt: null,
   channelDeafSince: null,
+  authWallSince: null,
+  authAlertedAt: null,
+  authWarnedForRefreshExpiresAt: null,
 };
 
 export class StateManager {
@@ -61,6 +70,9 @@ export class StateManager {
         lastSeenActivityAt: parsed.lastSeenActivityAt ?? null,
         hangDetectedAt: parsed.hangDetectedAt ?? null,
         channelDeafSince: parsed.channelDeafSince ?? null,
+        authWallSince: parsed.authWallSince ?? null,
+        authAlertedAt: parsed.authAlertedAt ?? null,
+        authWarnedForRefreshExpiresAt: parsed.authWarnedForRefreshExpiresAt ?? null,
       };
     } catch {
       return { ...DEFAULT_STATE };

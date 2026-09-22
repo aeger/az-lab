@@ -74,8 +74,8 @@ echo "=== $(date -u +%FT%TZ) nightly eval  tag=$TAG  sha=$GIT_SHA$DIRTY ==="
 python3 retrieval_regression.py run --tag "$TAG" --git-sha "$GIT_SHA" \
   --fail-under-hard-recall1 0.26 \
   --fail-under-hard-ndcg5 0.45 \
-  --notes "nightly automated run${DIRTY}"
-RUN_RC=$?
+  --notes "nightly automated run${DIRTY}" 2>&1 | tee /tmp/nightly_eval_run.log
+RUN_RC=${PIPESTATUS[0]}
 
 # rc=2 is die() — the run REFUSED to record (embedder outage, retrieval failure rate
 # over tolerance). Nothing was written, so there is no run for the gate to read and
@@ -88,9 +88,6 @@ RUN_RC=$?
 if [ "$RUN_RC" -ge 2 ]; then
   echo "eval run refused to record (rc=$RUN_RC) — skipping gate" >&2
   exit "$RUN_RC"
-fi
-if [ "$RUN_RC" -ne 0 ]; then
-  echo "hard-tier floor BREACHED (rc=$RUN_RC) — continuing to gate + refresh, unit will be red" >&2
 fi
 
 # --notify-ok posts the GREEN line too, not just regressions (2026-07-30 REC 1).
@@ -178,6 +175,16 @@ python3 ../refresh_state_memory.py || echo "state-memory refresh failed (non-fat
 # the breach away after going to the trouble of measuring it.
 FINAL_RC="$GATE_RC"
 if [ "$RUN_RC" -ne 0 ]; then FINAL_RC="$RUN_RC"; fi
+
+# Report failures only after FINAL_RC is determined (not prematurely).
+if [ "$RUN_RC" -ne 0 ]; then
+  fail_msg=$(grep "^  FAIL:" /tmp/nightly_eval_run.log | tail -1)
+  if [ -n "$fail_msg" ]; then
+    echo "$fail_msg — unit will be $([ "$FINAL_RC" -ne 0 ] && echo 'red' || echo 'restored')" >&2
+  else
+    echo "retrieval run FAILED (rc=$RUN_RC) — unit will be $([ "$FINAL_RC" -ne 0 ] && echo 'red' || echo 'restored')" >&2
+  fi
+fi
 
 echo "=== done  rc=$FINAL_RC  (run=$RUN_RC gate=$GATE_RC) ==="
 exit "$FINAL_RC"

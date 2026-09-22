@@ -2123,17 +2123,33 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
       // so without this edge a reader of either memory would never see the other.
       let tentativeNote = "";
       if (tentativeTwin && inserted?.id) {
-        const { error: linkErr } = await supabase.from("memory_links").upsert({
-          source_id: inserted.id, target_id: tentativeTwin.id,
-          relationship: "contradicts", link_type: "semantic",
-          strength: Math.min(tentativeTwin.similarity, 1.0),
-        }, { onConflict: "source_id,target_id,relationship" });
-        if (linkErr) console.warn(`[novelty] contradicts-link failed: ${linkErr.message}`);
-        tentativeNote =
-          ` ⚠️ Admitted as TENTATIVE over the novelty gate (cosine=${tentativeTwin.similarity.toFixed(3)}` +
-          ` vs "${tentativeTwin.name}") because it appears to CONTRADICT it. Both rows are` +
-          ` conflict_flagged; the 03:30 contradiction scan will adjudicate. Previously this` +
-          ` write would have been silently rejected.`;
+        // Creation-time liveness gate, mirroring episodic_distill.link_target_is_live.
+        // Retirement-time edge downweighting (migrations 115/148) is one-shot: it can
+        // only touch the edges that exist at that instant, so it is structurally blind
+        // to retire-then-link. match_memories has no is_active predicate, so the twin
+        // here can be a row that was superseded days ago — that is exactly how the
+        // 2026-09-10 "Daily Self-Improvement Research" contradicts edge was minted at
+        // a target whose valid_to was 2026-09-02. activeLinkTargets fails CLOSED.
+        const twinLive = await activeLinkTargets([tentativeTwin.id]);
+        if (!twinLive.has(tentativeTwin.id)) {
+          console.log(`[novelty] contradicts-link skipped: twin ${tentativeTwin.id} is retired/inactive`);
+          tentativeNote =
+            ` ⚠️ Admitted as TENTATIVE over the novelty gate (cosine=${tentativeTwin.similarity.toFixed(3)}` +
+            ` vs "${tentativeTwin.name}"), which appears to CONTRADICT it. No \`contradicts\` edge was` +
+            ` created — that memory is already RETIRED, so there is nothing live to contradict.`;
+        } else {
+          const { error: linkErr } = await supabase.from("memory_links").upsert({
+            source_id: inserted.id, target_id: tentativeTwin.id,
+            relationship: "contradicts", link_type: "semantic",
+            strength: Math.min(tentativeTwin.similarity, 1.0),
+          }, { onConflict: "source_id,target_id,relationship" });
+          if (linkErr) console.warn(`[novelty] contradicts-link failed: ${linkErr.message}`);
+          tentativeNote =
+            ` ⚠️ Admitted as TENTATIVE over the novelty gate (cosine=${tentativeTwin.similarity.toFixed(3)}` +
+            ` vs "${tentativeTwin.name}") because it appears to CONTRADICT it. Both rows are` +
+            ` conflict_flagged; the 03:30 contradiction scan will adjudicate. Previously this` +
+            ` write would have been silently rejected.`;
+        }
       }
 
       const conflicts = await detectConflicts(inserted.id, content, type, memTags, embedding);
