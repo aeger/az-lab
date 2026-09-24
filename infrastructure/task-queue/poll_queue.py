@@ -302,6 +302,30 @@ def discord_notify(message):
         print(f"discord_notify failed (non-fatal): {e}", file=sys.stderr)
 
 
+def agent_message_post(from_agent: str, kind: str, body: str, task_id: str | None = None, to_agent: str | None = None, meta: dict | None = None):
+    """Post to agent_messages table. Best-effort — never raises."""
+    try:
+        if not SUPABASE_KEY:
+            return
+        import uuid
+        payload = {
+            "id": str(uuid.uuid4()),
+            "from_agent": from_agent,
+            "to_agent": to_agent,
+            "kind": kind,
+            "body": body,
+            "task_id": task_id,
+            "thread_id": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "meta": meta or {}
+        }
+        resp = api_request("POST", "/rest/v1/agent_messages", data=payload)
+        if resp.status_code not in (200, 201):
+            print(f"agent_message_post failed: {resp.status_code}", file=sys.stderr)
+    except Exception as e:
+        print(f"agent_message_post failed (non-fatal): {e}", file=sys.stderr)
+
+
 def _get_nvidia_key():
     key = os.environ.get("NVIDIA_API_KEY")
     if key:

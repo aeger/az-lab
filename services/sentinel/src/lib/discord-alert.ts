@@ -54,6 +54,42 @@ export class DiscordAlerter {
     };
 
     await this.post(body);
+
+    if (n.severity === 'critical' || n.severity === 'warning') {
+      this.postToAgentMessages(n).catch(err =>
+        console.error('[agent-message] failed to send:', err.message),
+      );
+    }
+  }
+
+  private async postToAgentMessages(n: SentinelNotification): Promise<void> {
+    const url = config.supabase.url;
+    const key = config.supabase.serviceKey;
+    if (!url || !key) return;
+
+    try {
+      const res = await fetch(`${url}/rest/v1/agent_messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key}`,
+          'Prefer': 'return=minimal',
+        },
+        body: JSON.stringify({
+          from_agent: 'sentinel',
+          kind: 'alert',
+          body: `${n.title}: ${n.body.slice(0, 200)}`,
+          meta: { severity: n.severity, source: n.source, category: n.category },
+        }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`agent_messages send failed ${res.status}: ${text}`);
+      }
+    } catch (err) {
+      console.error('[agent-message] post failed:', err instanceof Error ? err.message : String(err));
+    }
   }
 
   async sendDigest(digest: DigestSummary): Promise<void> {

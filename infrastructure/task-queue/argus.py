@@ -27,7 +27,7 @@ from poll_queue import (
     api_request, build_prompt, run_claude, route_task,
     mark_completed, mark_failed, mark_pending_eval, mark_pending_jeff_action,
     _needs_jeff_input, auto_queue_from_goals, route_auto_tasks,
-    notify_cowork_tasks, log_activity, discord_notify,
+    notify_cowork_tasks, log_activity, discord_notify, agent_message_post,
     refresh_container_updates,
     HOSTNAME, SUPABASE_URL, SUPABASE_KEY,
     _RESULT_MAX_CHARS,
@@ -242,9 +242,11 @@ def _worker(task: dict, stall_threshold: int = SIMPLE_STALL_SECS) -> None:
         if task_priority <= 1:
             mark_pending_eval(task_id, result, goal_id=goal_id)
             discord_notify(f"🔍 **Pending eval:** {title} — {summary}")
+            agent_message_post("argus", "task_pending_eval", f"{title}: {summary}", task_id=task_id)
         else:
             mark_completed(task_id, result, goal_id=goal_id)
             discord_notify(f"✅ **Done:** {title} — {summary}")
+            agent_message_post("argus", "task_complete", f"{title}: {summary}", task_id=task_id)
 
     except Exception as e:
         err = str(e)
@@ -252,6 +254,7 @@ def _worker(task: dict, stall_threshold: int = SIMPLE_STALL_SECS) -> None:
         mark_failed(task_id, err, goal_id=goal_id)
         log_activity("error", err[:200], task_id=task_id)
         discord_notify(f"❌ **Failed:** {title} — {err[:120]}")
+        agent_message_post("argus", "task_failed", f"{title}: {err[:120]}", task_id=task_id)
     finally:
         with _lock:
             _running.pop(task_id, None)
