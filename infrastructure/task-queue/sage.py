@@ -326,6 +326,15 @@ def pre_evaluate_pending(batch: int = PRE_EVAL_BATCH) -> int:
         complexity = _score_complexity_nemotron(task) or _score_complexity_local(task)
         new_tags = _add_tags(new_tags, complexity)
 
+        # Never bounce a task Jeff has already answered (jeff_notes) or a decision
+        # gate back to him as "needs split": the long description is the question's
+        # evidence, not the work's scope. 2026-09-24: an answered EvolveMem decision
+        # was sent back 8s after Jeff's dashboard reply.
+        answered = bool((task.get("context") or {}).get("jeff_notes"))
+        if complexity == "split" and (answered or title.startswith("DECISION NEEDED")):
+            complexity = "complex"
+            new_tags = _add_tags([t for t in new_tags if t != "split"], "complex")
+
         if complexity == "split":
             # Flag for Jeff to define subtasks (auto-split confidence too low for v1)
             new_tags = _add_tags(new_tags, "needs-split")
