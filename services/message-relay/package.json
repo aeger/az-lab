@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Wren realtime listener for the agent Relay pathway (agent_messages + task_queue fast pickup)",
+  "description": "Wren realtime listener for the agent Relay pathway (agent_messages)",
   "main": "index.mjs",
   "dependencies": {
     "ws": "^8.18.0"

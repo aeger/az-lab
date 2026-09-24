@@ -3,19 +3,20 @@
 //
 // Subscribes to Supabase Realtime (raw Phoenix v1.0.0 WebSocket — supabase-js
 // hardcodes vsn=2.0.0 which this project's Realtime server rejects; client
-// pattern copied from memory-mcp-server startMemorySyncListener) for INSERTs on:
-//   • agent_messages — messages addressed to wren (or broadcast) spawn a
-//     headless `claude -p` session whose final output is posted back as the
-//     reply row. kind='task' rows are escalated into task_queue instead.
-//   • task_queue — debounced `systemctl --user start claude-queue-poll.service`,
-//     replacing the zombie realtime_listener.py (broken Python realtime lib).
+// pattern copied from memory-mcp-server startMemorySyncListener) for INSERTs on
+// agent_messages: messages addressed to wren (or broadcast) spawn a headless
+// `claude -p` session whose final output is posted back as the reply row.
+// kind='task' rows are escalated into task_queue, where argus.service picks
+// them up (the old task_queue -> claude-queue-poll.service trigger was removed
+// 2026-09-24; that unit has been masked since 2026-09-07).
 //
 // Concurrency: one claude spawn at a time (FIFO). Missed-while-down messages
 // are drained by a catch-up SELECT on every (re)connect. Kill switch honored
-// via public.check_kill_switch('wren') before every spawn.
+// via public.check_kill_switch('wren') before every spawn. Transient network
+// failures ("fetch failed" right after a reboot) are retried with backoff.
 
 import { WebSocket } from "ws";
-import { spawn, execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const ANON_KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
@@ -33,7 +34,6 @@ const AUTH_FAIL_RE = /Failed to authenticate|OAuth session expired|API Error|Inv
 const MY_NAMES = new Set(["wren", "claude-code"]);
 const CLAUDE_BIN = process.env.RELAY_CLAUDE_BIN || "claude";
 const CLAUDE_TIMEOUT_MS = Number(process.env.RELAY_CLAUDE_TIMEOUT_MS || 300_000);
-const QUEUE_DEBOUNCE_MS = 2_000;
 
 const REST = `${SUPABASE_URL}/rest/v1`;
 const HEADERS = {
@@ -42,15 +42,50 @@ const HEADERS = {
   "Content-Type": "application/json",
 };
 
-async function rest(method, path, body, extraHeaders = {}) {
+// Right after a reboot the network (DNS/routes) can lag the service start, and
+// undici reports that as a bare TypeError "fetch failed". On 2026-09-24 that
+// dropped Atlas reply 6d925e65: claude ran, then the reply POST failed once and
+// was never retried. Retry transient failures (network errors, timeouts, 429,
+// 5xx) with exponential backoff — ~2 min total before giving up.
+const RETRY_DELAYS_MS = [2_000, 4_000, 8_000, 15_000, 30_000, 60_000];
+const REST_TIMEOUT_MS = 20_000;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function isTransient(e) {
+  return e?.transient === true ||
+         e?.message === "fetch failed" ||
+         e?.name === "TimeoutError" || e?.name === "AbortError";
+}
+
+async function restOnce(method, path, body, extraHeaders) {
   const res = await fetch(`${REST}/${path}`, {
     method,
     headers: { ...HEADERS, ...extraHeaders },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(REST_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`${method} ${path} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  if (!res.ok) {
+    const err = new Error(`${method} ${path} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    err.transient = res.status === 429 || res.status >= 500;
+    throw err;
+  }
   const text = await res.text();
   return text ? JSON.parse(text) : null;
+}
+
+async function rest(method, path, body, extraHeaders = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await restOnce(method, path, body, extraHeaders);
+    } catch (e) {
+      if (!isTransient(e) || attempt >= RETRY_DELAYS_MS.length) throw e;
+      const delay = RETRY_DELAYS_MS[attempt];
+      const cause = e.cause?.code ? ` [${e.cause.code}]` : "";
+      console.warn(`[relay] ${method} ${path.split("?")[0]} failed (${e.message}${cause}) — ` +
+                   `retry ${attempt + 1}/${RETRY_DELAYS_MS.length} in ${delay / 1000}s`);
+      await sleep(delay);
+    }
+  }
 }
 
 async function killSwitchHalted() {
@@ -127,6 +162,15 @@ async function pump() {
     await handleMessage(row);
   } catch (e) {
     console.error(`[relay] message ${row.id} failed: ${e.message}`);
+    // Not yet marked delivered (so nothing was spawned or queued): forget it and
+    // let a retried catch-up pick it back up. Past that point a retry could run
+    // claude or insert the task twice, so it is only logged.
+    if (!row.__delivered) {
+      seen.delete(row.id);
+      scheduleCatchUp(CATCHUP_RETRY_MS);
+    } else {
+      logActivity(`Relay failed handling message ${row.id} from ${row.from_agent} after delivery: ${e.message}`);
+    }
   } finally {
     working = false;
     if (workQueue.length > 0) setImmediate(pump);
@@ -136,6 +180,7 @@ async function pump() {
 async function handleMessage(row) {
   console.log(`[relay] message ${row.id} from=${row.from_agent} kind=${row.kind}: ${row.body.slice(0, 80)}`);
   await rest("PATCH", `agent_messages?id=eq.${row.id}`, { delivered_at: new Date().toISOString() });
+  row.__delivered = true;
 
   if (row.kind === "task") {
     // Escalate into the durable queue — existing pipeline takes it from here.
@@ -284,25 +329,17 @@ function runClaude(row) {
   });
 }
 
-// ── task_queue fast pickup (replaces realtime_listener.py) ───────────────────
-
-let queueTimer = null;
-function onTaskInsert(rec) {
-  const target = rec?.target ?? "";
-  const status = rec?.status ?? "";
-  if (!["claude-code", "wren", "auto"].includes(target)) return;
-  if (!["pending", "ready", "delegated"].includes(status)) return;
-  if (queueTimer) return; // debounce window already open
-  queueTimer = setTimeout(() => {
-    queueTimer = null;
-    console.log(`[relay] task_queue INSERT (${rec.id ?? "?"}) — starting claude-queue-poll.service`);
-    execFile("systemctl", ["--user", "start", "--no-block", "claude-queue-poll.service"], (e) => {
-      if (e) console.warn(`[relay] poller start failed: ${e.message}`);
-    });
-  }, QUEUE_DEBOUNCE_MS);
-}
-
 // ── Catch-up on (re)connect ──────────────────────────────────────────────────
+
+// Catch-up must not be one-shot: after a reboot the first attempt can fail
+// before the network is fully up. rest() already backs off; if it still fails,
+// keep rescheduling until one succeeds.
+const CATCHUP_RETRY_MS = 60_000;
+let catchUpTimer = null;
+function scheduleCatchUp(ms) {
+  if (catchUpTimer) return;
+  catchUpTimer = setTimeout(() => { catchUpTimer = null; catchUp(); }, ms);
+}
 
 async function catchUp() {
   try {
@@ -316,7 +353,8 @@ async function catchUp() {
       rows.forEach(enqueueMessage);
     }
   } catch (e) {
-    console.warn(`[relay] catch-up failed: ${e.message}`);
+    console.warn(`[relay] catch-up failed: ${e.message} — retrying in ${CATCHUP_RETRY_MS / 1000}s`);
+    scheduleCatchUp(CATCHUP_RETRY_MS);
   }
 }
 
@@ -342,7 +380,6 @@ function connect() {
       event: "phx_join",
       payload: { config: { broadcast: { self: false }, presence: { key: "" }, postgres_changes: [
         { event: "INSERT", schema: "public", table: "agent_messages" },
-        { event: "INSERT", schema: "public", table: "task_queue" },
       ] } },
       ref: String(++ref),
       join_ref: "1",
@@ -357,7 +394,7 @@ function connect() {
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "phx_reply" && msg.payload?.status === "ok" && msg.topic === TOPIC) {
-      console.log("[relay] Realtime subscription active (agent_messages + task_queue)");
+      console.log("[relay] Realtime subscription active (agent_messages)");
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
       catchUp();
       return;
@@ -368,7 +405,6 @@ function connect() {
       const table = msg.payload?.data?.table || msg.payload?.table;
       if (!rec) return;
       if (table === "agent_messages") enqueueMessage(rec);
-      else if (table === "task_queue") onTaskInsert(rec);
     }
   });
 

@@ -28,13 +28,17 @@ escalated into a `task_queue` row (linked via `agent_messages.task_id`).
    `claude -p` (concurrency 1, 5 min timeout), post the session's final output
    back as the reply row, stamp `acked_at`. `kind='task'` → INSERT task_queue
    row instead. `status`/`system` kinds are informational, ignored.
-2. **task_queue INSERT** (target claude-code/wren/auto, status
-   pending/ready/delegated) → debounced
-   `systemctl --user start claude-queue-poll.service`. This replaces the dead
-   `claude-queue-realtime.service` (`realtime_listener.py`), whose Python
-   `realtime` lib hangs silently on reconnect (zombie since 2026-08-25).
-3. **Catch-up on every (re)connect**: undelivered messages (7-day window) are
-   drained, so downtime loses nothing.
+   Queued tasks are picked up by `argus.service`. (The former task_queue
+   INSERT → `claude-queue-poll.service` trigger was removed 2026-09-24 — that
+   unit has been masked since 2026-09-07 and every start failed.)
+2. **Catch-up on every (re)connect**: undelivered messages (7-day window) are
+   drained, so downtime loses nothing. A failed catch-up reschedules itself
+   every 60s until it succeeds.
+3. **Transient-failure retry**: every REST call retries network errors
+   ("fetch failed"), timeouts, 429 and 5xx with backoff (2s→60s, ~2 min). A
+   message that fails before `delivered_at` is stamped is re-picked by the next
+   catch-up; one that fails after (claude already ran / task already queued) is
+   logged to agent_activity rather than re-run.
 
 ## Ops
 
