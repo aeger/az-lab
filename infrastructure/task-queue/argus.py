@@ -29,6 +29,7 @@ from poll_queue import (
     _needs_jeff_input, auto_queue_from_goals, route_auto_tasks,
     notify_cowork_tasks, log_activity, discord_notify, agent_message_post,
     refresh_container_updates,
+    start_episode, end_episode,
     HOSTNAME, SUPABASE_URL, SUPABASE_KEY,
     _RESULT_MAX_CHARS,
     # Queue hygiene, moved here 2026-09-07 when claude-queue-poll.timer was
@@ -131,8 +132,8 @@ def _write_heartbeat(status: str = "active", metadata: dict | None = None) -> No
             _hb_fail_streak = 0
 
 
-def _reset_task_to_pending(task_id: str, reason: str) -> None:
-    """Reset a stalled task back to pending so it can be retried."""
+def _reset_task_to_pending(task_id: str, reason: str, episode_id: str = None) -> None:
+    """Reset a stalled task back to pending so it can be retried. Close the episode as partial."""
     try:
         rows = api_request("GET", "task_queue",
                            params={"id": f"eq.{task_id}",
@@ -153,6 +154,7 @@ def _reset_task_to_pending(task_id: str, reason: str) -> None:
                 "attempt_count": attempts,
                 "error": f"Stalled after {attempts} attempt(s): {reason[:200]}",
             })
+            end_episode(episode_id, "pending_jeff_action", summary=reason[:200], outcome=f"Stall exhausted {attempts}/{max_att} attempts")
             log_activity("error", f"Stall escalated to Jeff after {attempts} attempts: {reason[:100]}", task_id=task_id)
             discord_notify(
                 f"⚠️ **Stall → Jeff:** {title}\n"
@@ -168,6 +170,7 @@ def _reset_task_to_pending(task_id: str, reason: str) -> None:
                 "attempt_count": attempts,
                 "error": f"Stall retry {attempts}/{max_att}: {reason[:200]}",
             })
+            end_episode(episode_id, "partial", summary=reason[:200], outcome=f"Stall {attempts}/{max_att}: will retry")
             log_activity("error", f"Stall — reset to pending (attempt {attempts}/{max_att}): {reason[:100]}", task_id=task_id)
             discord_notify(
                 f"🔄 **Stall retry {attempts}/{max_att}:** {title}\n"
@@ -197,6 +200,13 @@ def _worker(task: dict, stall_threshold: int = SIMPLE_STALL_SECS) -> None:
 
     log_activity("status", f"Argus dispatched: {title}", task_id=task_id)
     discord_notify(f"🟡 **Argus:** Dispatched `{title}`")
+
+    # Start episode tracing (mirrors poll_queue.py:2735)
+    episode_id = start_episode(task)
+    with _lock:
+        entry = _running.get(task_id)
+        if entry is not None:
+            entry["episode_id"] = episode_id
 
     def _register_proc(p):
         with _lock:
@@ -233,7 +243,9 @@ def _worker(task: dict, stall_threshold: int = SIMPLE_STALL_SECS) -> None:
         # JeffLoop: detect if agent is asking Jeff a question
         jeff_needed, jeff_reason = _needs_jeff_input(result)
         if jeff_needed:
+            summary = result.splitlines()[0][:120] if result else "asking Jeff"
             mark_pending_jeff_action(task_id, result, jeff_reason, title=title, goal_id=goal_id)
+            end_episode(episode_id, "pending_jeff_action", summary=summary, outcome=jeff_reason)
             return
 
         # CRIT/HIGH → pending_eval (Sage will evaluate)
@@ -243,10 +255,12 @@ def _worker(task: dict, stall_threshold: int = SIMPLE_STALL_SECS) -> None:
             mark_pending_eval(task_id, result, goal_id=goal_id)
             discord_notify(f"🔍 **Pending eval:** {title} — {summary}")
             agent_message_post("argus", "task_pending_eval", f"{title}: {summary}", task_id=task_id)
+            end_episode(episode_id, "pending_eval", summary=summary)
         else:
             mark_completed(task_id, result, goal_id=goal_id)
             discord_notify(f"✅ **Done:** {title} — {summary}")
             agent_message_post("argus", "task_complete", f"{title}: {summary}", task_id=task_id)
+            end_episode(episode_id, "completed", summary=summary, outcome=summary)
 
     except Exception as e:
         err = str(e)
@@ -255,6 +269,7 @@ def _worker(task: dict, stall_threshold: int = SIMPLE_STALL_SECS) -> None:
         log_activity("error", err[:200], task_id=task_id)
         discord_notify(f"❌ **Failed:** {title} — {err[:120]}")
         agent_message_post("argus", "task_failed", f"{title}: {err[:120]}", task_id=task_id)
+        end_episode(episode_id, "failed", summary=err[:200], outcome=err[:500])
     finally:
         with _lock:
             _running.pop(task_id, None)
@@ -276,6 +291,7 @@ def _spawn_worker(task: dict) -> None:
             "stall_threshold": threshold,
             "is_complex": is_complex,
             "proc": None,  # populated by worker once subprocess.Popen returns
+            "episode_id": None,  # populated by worker after start_episode()
         }
     t.start()
     kind = "complex" if is_complex else "simple"
@@ -315,6 +331,7 @@ def _check_stalls() -> None:
         age_min = int((now - info["started_at"]) // 60)
         kind = "complex" if info["is_complex"] else "simple"
         reason = f"No completion after {age_min}min ({kind} task, threshold={info['stall_threshold']//60}min)"
+        episode_id = info.get("episode_id")
         print(f"[Argus] Stall detected: {task_id[:8]} '{title}' — {reason}")
 
         # Kill the running claude subprocess BEFORE resetting the task so the
@@ -333,7 +350,7 @@ def _check_stalls() -> None:
         else:
             print(f"[Argus] Stall on {task_id[:8]} but no proc handle registered — relying on run_claude watchdog", file=sys.stderr)
 
-        _reset_task_to_pending(task_id, reason)
+        _reset_task_to_pending(task_id, reason, episode_id=episode_id)
         with _lock:
             _running.pop(task_id, None)
         # Worker thread will now error out (broken pipe / EOF on stdout) and
