@@ -55,12 +55,13 @@ _pq.HEARTBEAT_AGENT = "argus"
 # ── Tuning constants ────────────────────────────────────────────────────────
 
 MAX_WORKERS            = 1      # max concurrent claude processes (was 3 — Supabase usage 2026-05-29)
-POLL_INTERVAL          = 60     # seconds between queue polls (was 30 — Supabase usage 2026-05-29)
+POLL_INTERVAL          = 900    # seconds between queue claims (60 normally; 900 = maint-mode-2026-09, Claude Pro)
+LOOP_TICK              = 60     # loop wakes this often so heartbeat/stall checks never wait on POLL_INTERVAL
 HEARTBEAT_INTERVAL     = 300    # write heartbeat every 5 min
 # Queue-hygiene sweeps inherited from the retired claude-queue-poll.timer.
 # They are cheap but not free (several Supabase round trips), and the timer ran
 # them every 5 min, so keep that cadence rather than firing them every 60s poll.
-SWEEP_INTERVAL         = 300    # run recover/stale/waiting sweeps every 5 min
+SWEEP_INTERVAL         = 1800   # recover/stale/waiting sweeps (300 normally; 1800 = maint-mode-2026-09)
 SIMPLE_STALL_SECS      = 1800   # 30 min — simple tasks
 COMPLEX_STALL_SECS     = 7200   # 2 hr  — complex/CRIT tasks
 SAGE_EVAL_LAG_SECS     = 120    # seconds to wait for Sage to pre-evaluate a new task
@@ -379,6 +380,7 @@ def main() -> None:
 
     last_heartbeat = 0.0
     last_sweep = 0.0
+    last_poll = 0.0
 
     while True:
         try:
@@ -410,7 +412,10 @@ def main() -> None:
             with _lock:
                 active = len(_running)
 
-            if active < MAX_WORKERS:
+            if now - last_poll < POLL_INTERVAL:
+                pass  # between claim polls; heartbeat/sweeps/stalls above still ran
+            elif active < MAX_WORKERS:
+                last_poll = now
                 # Housekeeping (routing, cowork notifications, goal auto-queue)
                 route_auto_tasks()
                 notify_cowork_tasks()
@@ -435,7 +440,7 @@ def main() -> None:
             traceback.print_exc(file=sys.stderr)
             _write_heartbeat("error", {"error": str(e)[:200]})
 
-        time.sleep(POLL_INTERVAL)
+        time.sleep(LOOP_TICK)
 
 
 def _claim_next_for_argus():
