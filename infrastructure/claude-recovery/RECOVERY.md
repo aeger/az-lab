@@ -29,7 +29,7 @@ bash ~/claude/scripts/sync-memory.sh && echo "memory sync OK"
 
 ### Services (Podman / systemd --user)
 - `compose-stack@memory-mcp-server` — MCP server at memory-mcp.az-lab.dev
-- `compose-stack@traefik` — reverse proxy
+- `traefik.service` (quadlet, socket-activated via `traefik-http.socket` + `traefik-https.socket`) — reverse proxy. See infrastructure/traefik/quadlet/README.md
 - `claude-queue-poll.timer` — task queue poller (every 5 min)
 - All other az-lab services (see azlab/services/)
 

@@ -1,0 +1,64 @@
+# Traefik as a podman quadlet with systemd socket activation for :80/:443.
+# Mirrors ../compose.yml except for the published ports: the listeners come
+# from traefik-http.socket / traefik-https.socket (FileDescriptorName matches
+# the entrypoint name, Traefik >= 3.1). Still joins the "proxy" bridge so
+# backends resolve by container name.
+[Unit]
+Description=Traefik reverse proxy (socket-activated)
+Requires=traefik-http.socket traefik-https.socket
+After=traefik-http.socket traefik-https.socket
+
+[Container]
+Image=docker.io/traefik:v3.7
+ContainerName=traefik
+Network=proxy
+EnvironmentFile=/home/almty1/azlab/infrastructure/traefik/cf.env
+Volume=/run/user/1000/podman/podman.sock:/var/run/docker.sock:ro
+Volume=/home/almty1/azlab/infrastructure/traefik/data:/data
+Volume=/home/almty1/azlab/infrastructure/traefik/secrets:/secrets:ro
+Volume=/home/almty1/azlab/infrastructure/traefik/dynamic:/dynamic:ro
+Volume=/home/almty1/azlab/infrastructure/traefik/certs:/certs:ro
+
+Label=traefik.enable=true
+Label="traefik.http.routers.traefik.rule=Host(`traefik.az-lab.dev`)"
+Label=traefik.http.routers.traefik.entrypoints=websecure
+Label=traefik.http.routers.traefik.tls=true
+Label=traefik.http.routers.traefik.tls.certresolver=le
+Label=traefik.http.routers.traefik.service=api@internal
+Label=traefik.http.middlewares.traefik-allow.ipallowlist.sourcerange=192.168.1.0/24,192.168.99.0/24,10.7.0.0/24,10.89.0.0/16
+Label=traefik.http.routers.traefik.middlewares=traefik-allow,authelia-auth@file,strip-www-auth@file
+
+Exec=--log.level=INFO \
+  --accesslog=true \
+  --api.dashboard=true \
+  --entrypoints.web.address=:80 \
+  --entrypoints.websecure.address=:443 \
+  --entrypoints.web.http.redirections.entrypoint.to=websecure \
+  --entrypoints.web.http.redirections.entrypoint.scheme=https \
+  --entrypoints.metrics.address=:8082 \
+  --entrypoints.web.http.aliasheadersstrategy=delete \
+  --entrypoints.websecure.http.aliasheadersstrategy=delete \
+  --entrypoints.metrics.http.aliasheadersstrategy=delete \
+  --metrics.prometheus=true \
+  --metrics.prometheus.addEntryPointsLabels=true \
+  --metrics.prometheus.addRoutersLabels=true \
+  --metrics.prometheus.addServicesLabels=true \
+  --metrics.prometheus.entryPoint=metrics \
+  --providers.docker=true \
+  --providers.docker.endpoint=unix:///var/run/docker.sock \
+  --providers.docker.exposedbydefault=false \
+  --providers.file.directory=/dynamic \
+  --providers.file.watch=true \
+  --certificatesresolvers.le.acme.email=almty1@gmail.com \
+  --certificatesresolvers.le.acme.storage=/data/acme.json \
+  --certificatesresolvers.le.acme.dnschallenge=true \
+  --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare \
+  --certificatesresolvers.le.acme.dnschallenge.propagation.delaybeforechecks=30 \
+  --certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

@@ -6,7 +6,10 @@ http:
           - "192.168.1.0/24"
           - "192.168.99.0/24"
           - "10.7.0.0/24"
-          - "10.89.0.0/16"
+          # 10.89.0.0/16 (podman "proxy" bridge) removed 2026-10-07: Traefik is now
+          # socket-activated and sees real client IPs; container->Traefik calls via
+          # the host IP arrive as 192.168.1.181. Re-adding it would admit nothing new
+          # unless a backend calls Traefik by its bridge IP.
 
     lan-auth:
       basicAuth:

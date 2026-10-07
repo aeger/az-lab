@@ -1,0 +1,14 @@
+# Socket-activated :80 for Traefik (see README.md in this dir).
+# systemd owns the listening socket in the HOST netns and hands the fd to the
+# container, so Traefik sees real client IPs (rootlessport hid them as 10.89.0.6).
+[Unit]
+Description=Traefik HTTP socket (entrypoint "web")
+
+[Socket]
+ListenStream=192.168.1.181:80
+FreeBind=true
+FileDescriptorName=web
+Service=traefik.service
+
+[Install]
+WantedBy=sockets.target

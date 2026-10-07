@@ -1,0 +1,12 @@
+# Socket-activated :443 for Traefik (see README.md in this dir).
+[Unit]
+Description=Traefik HTTPS socket (entrypoint "websecure")
+
+[Socket]
+ListenStream=192.168.1.181:443
+FreeBind=true
+FileDescriptorName=websecure
+Service=traefik.service
+
+[Install]
+WantedBy=sockets.target
