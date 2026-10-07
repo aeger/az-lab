@@ -319,9 +319,8 @@ def agent_message_post(from_agent: str, kind: str, body: str, task_id: str | Non
             "created_at": datetime.now(timezone.utc).isoformat(),
             "meta": meta or {}
         }
-        resp = api_request("POST", "/rest/v1/agent_messages", data=payload)
-        if resp.status_code not in (200, 201):
-            print(f"agent_message_post failed: {resp.status_code}", file=sys.stderr)
+        # api_request() prefixes /rest/v1/ itself and raises on non-2xx.
+        api_request("POST", "agent_messages", data=payload)
     except Exception as e:
         print(f"agent_message_post failed (non-fatal): {e}", file=sys.stderr)
 
