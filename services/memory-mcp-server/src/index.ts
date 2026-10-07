@@ -3896,9 +3896,10 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-  if (sessionId && sessions.has(sessionId)) {
-    const { transport } = sessions.get(sessionId)!;
-    await transport.handleRequest(req, res);
+  if (sessionId) {
+    const entry = sessions.get(sessionId);
+    if (!entry) return sessionNotFound(res);
+    await entry.transport.handleRequest(req, res);
     return;
   }
 
@@ -3920,10 +3921,17 @@ app.post("/mcp", async (req: Request, res: Response) => {
   if (sid) sessions.set(sid, { transport, server });
 });
 
+// MCP Streamable HTTP: an unknown/terminated session ID MUST get 404 so the
+// client re-initializes (e.g. after a container restart wiped `sessions`).
+function sessionNotFound(res: Response) {
+  res.status(404).json({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null });
+}
+
 // Handle GET for SSE streams
 app.get("/mcp", async (req: Request, res: Response) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (sessionId && sessions.has(sessionId)) {
+  if (sessionId && !sessions.has(sessionId)) return sessionNotFound(res);
+  if (sessionId) {
     const { transport } = sessions.get(sessionId)!;
     await transport.handleRequest(req, res);
     return;
@@ -3940,6 +3948,7 @@ app.delete("/mcp", async (req: Request, res: Response) => {
     sessions.delete(sessionId);
     return;
   }
+  if (sessionId) return sessionNotFound(res);
   res.status(400).json({ error: "No session found." });
 });
 
