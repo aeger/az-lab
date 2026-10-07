@@ -1,5 +1,5 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { McpServer, createMcpHandler, isLegacyRequest } from "@modelcontextprotocol/server";
+import { NodeStreamableHTTPServerTransport, toNodeHandler, toWebRequest } from "@modelcontextprotocol/node";
 import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -1729,10 +1729,10 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   });
 
   // ── Tool: remember ──────────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "remember",
-    "Store a new memory or update an existing one. Use this when you learn something worth keeping.",
-    {
+    { description: "Store a new memory or update an existing one. Use this when you learn something worth keeping.",
+    inputSchema: z.object({
       type: z.enum(["user", "feedback", "project", "reference"]).describe(
         "Memory type: user (about the user), feedback (how to work), project (ongoing work), reference (where to find things)"
       ),
@@ -1749,7 +1749,7 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
       memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Memory class: semantic (durable facts/prefs, default), episodic (event log), procedural (how-to/skill), working (short-term context). Defaults to 'semantic' for all existing types."),
       ttl_days: z.number().min(1).optional().describe("Re-verification TTL in days. Set this on records that track LIVE infrastructure state (versions, IPs, deployed config) — they go stale in days, unlike incident write-ups which never do. After this many days the nightly sweep flags the memory +stale and recall discounts its confidence until an agent re-verifies it. Overrides the default 14-day rule. Omit for durable facts."),
       is_point_in_time: z.boolean().optional().describe("True = immutable point-in-time record (dated digest, triage/closeout, incident write-up). Excluded from the stale-review queue AND from the recall staleness discount (migration 089), because its truth cannot drift and re-verifying it is meaningless — such a record is old, not low-confidence. Recurring log-series names (daily research, dreaming, tech-breakthrough, weekly audits) are auto-detected server-side, so only set this for one-off dated records. NEVER set it on a memory asserting live lab state — that would silently exempt it from review forever; use ttl_days for those instead."),
-    },
+    }) },
     async ({ type, name, description, content, tags, source, importance_score, agent_id, visibility, agent_scope, confidence, memory_class, ttl_days, is_point_in_time }) => {
       // Security gate — scan all text fields before touching the DB
       const scanTargets: Array<[string, string]> = [
@@ -2160,10 +2160,10 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: recall ────────────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "recall",
-    "Search memories by text, tags, or type. Uses semantic vector search when Ollama is available, falls back to keyword search. ACTIVE RETRIEVAL (MIRIX, 85.4% LOCOMO): always pass topic_hint — a 3-5 word distilled topic of what you actually need (e.g. 'cox business static ips', 'dashboard build process'). The hint contributes the highest-weight RRF lane and dramatically reduces hallucination on verbose queries.",
-    {
+    { description: "Search memories by text, tags, or type. Uses semantic vector search when Ollama is available, falls back to keyword search. ACTIVE RETRIEVAL (MIRIX, 85.4% LOCOMO): always pass topic_hint — a 3-5 word distilled topic of what you actually need (e.g. 'cox business static ips', 'dashboard build process'). The hint contributes the highest-weight RRF lane and dramatically reduces hallucination on verbose queries.",
+    inputSchema: z.object({
       query: z.string().optional().describe("Free-text or semantic search query — can be verbose/conversational"),
       topic_hint: z.string().optional().describe("ACTIVE RETRIEVAL — a 3-5 word topic phrase you generate before recalling, summarising the core thing you want to find (e.g. 'mikrotik vlan tagging', 'gmail send-as policy'). Strongest ranking signal in the RRF fusion (weight 1.5). Use it on every recall."),
       type: z.enum(["user", "feedback", "project", "reference"]).optional().describe("Filter by memory type"),
@@ -2176,7 +2176,7 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
       min_confidence: z.number().min(0).max(1).optional().describe("Exclude memories with confidence below this threshold (default 0.0 = return all). Use 0.5 to hide speculative/unverified memories."),
       memory_class: z.enum(["episodic", "semantic", "procedural", "working"]).optional().describe("Filter by memory class. episodic=event log, semantic=durable facts (default for most), procedural=skills/how-to, working=short-term context."),
       as_of: z.string().datetime({ offset: true }).optional().describe("BI-TEMPORAL time travel (migration 109). ISO-8601 timestamp — returns what was TRUE AS OF that moment (valid_from <= as_of < valid_to), re-admitting facts that have since been superseded. Omit for normal recall, which already filters to 'true now'. This is VALID time (when the fact held in the world), NOT ingestion time (created_at) — use it to answer 'what did we believe on the 3rd', not 'what did we write on the 3rd'."),
-    },
+    }) },
     async ({ query, topic_hint, type, tags, limit, semantic, recall_mode, agent_id, agent_scope, min_confidence, memory_class, as_of }) => {
       // Adaptive router (RECALL_ROUTER=1). Only consulted when the caller expressed
       // NO preference — an explicit recall_mode, or the legacy `semantic` boolean,
@@ -2515,12 +2515,12 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: forget ────────────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "forget",
-    "Delete a memory by name. The audit log preserves what was deleted.",
-    {
+    { description: "Delete a memory by name. The audit log preserves what was deleted.",
+    inputSchema: z.object({
       name: z.string().describe("Exact name of the memory to delete"),
-    },
+    }) },
     async ({ name }) => {
       const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "forget");
       if (denied) return denied;
@@ -2545,14 +2545,14 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   // links it to the new one. Old row stays in the table for audit/lineage;
   // hybrid_recall filters it out. Use when a fact has been updated and you
   // want history preserved instead of overwritten.
-  server.tool(
+  server.registerTool(
     "supersede_memory",
-    "Mark an old memory as superseded by a new one. The old row stays in the table for audit, but recall ignores it. Use when a fact has been replaced — preferred over forget+remember when history matters.",
-    {
+    { description: "Mark an old memory as superseded by a new one. The old row stays in the table for audit, but recall ignores it. Use when a fact has been replaced — preferred over forget+remember when history matters.",
+    inputSchema: z.object({
       old_name: z.string().describe("Exact name of the memory to retire"),
       new_name: z.string().describe("Exact name of the memory that supersedes it"),
       reason: z.string().optional().describe("Why the supersession (e.g. 'IP address changed', 'service migrated to new host')"),
-    },
+    }) },
     async ({ old_name, new_name, reason }) => {
       const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "supersede_memory");
       if (denied) return denied;
@@ -2572,16 +2572,16 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: add_memory_link ────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "add_memory_link",
-    "Create a typed Zettelkasten link between two memories. Link types: semantic (topically related), temporal (time-ordered sequence), causal (A caused/led to B), entity (same entity referenced). Temporal and causal links receive a recall score boost.",
-    {
+    { description: "Create a typed Zettelkasten link between two memories. Link types: semantic (topically related), temporal (time-ordered sequence), causal (A caused/led to B), entity (same entity referenced). Temporal and causal links receive a recall score boost.",
+    inputSchema: z.object({
       source_id: z.string().uuid().describe("UUID of the source memory"),
       target_id: z.string().uuid().describe("UUID of the target memory"),
       relationship: z.string().optional().describe("Relationship label, e.g. 'causes', 'precedes', 'related_to', 'references' (default: related_to)"),
       link_type: z.enum(["semantic", "temporal", "causal", "entity"]).optional().describe("MAGMA link type — semantic: topically related, temporal: time-ordered, causal: A caused B, entity: same entity (default: semantic)"),
       strength: z.number().min(0).max(1).optional().describe("Link strength 0-1 (default: 0.5 — below the 0.72 spreading-activation gate. Pass an explicit value for a link you have actually measured or know to be definitional)"),
-    },
+    }) },
     async ({ source_id, target_id, relationship, link_type, strength }) => {
       // Validate both memories exist
       const { data: srcMem } = await supabase.from("memories").select("id, name").eq("id", source_id).maybeSingle();
@@ -2638,12 +2638,12 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: list_memories ─────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "list_memories",
-    "List all memories with their names, types, and descriptions. Quick overview of everything stored.",
-    {
+    { description: "List all memories with their names, types, and descriptions. Quick overview of everything stored.",
+    inputSchema: z.object({
       type: z.enum(["user", "feedback", "project", "reference"]).optional().describe("Filter by type"),
-    },
+    }) },
     async ({ type }) => {
       let q = supabase
         .from("memories")
@@ -2676,13 +2676,13 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: memory_log ────────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "memory_log",
-    "View the audit trail of memory changes. See what was created, updated, or deleted and when.",
-    {
+    { description: "View the audit trail of memory changes. See what was created, updated, or deleted and when.",
+    inputSchema: z.object({
       limit: z.number().optional().describe("Max entries (default 20)"),
       memory_name: z.string().optional().describe("Filter by memory name"),
-    },
+    }) },
     async ({ limit, memory_name }) => {
       const maxEntries = limit || 20;
 
@@ -2726,13 +2726,13 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   // Returns memories from a candidate set that have been mutated by another
   // agent since this agent's last_seen_at watermark. Addresses the #1 production
   // failure mode for multi-agent memory: context inconsistency across stores.
-  server.tool(
+  server.registerTool(
     "check_stale_context",
-    "Check whether any of the given memory IDs have been modified by another agent since you last refreshed your view. Returns stale ones with the change action and timestamp. Call update_read_watermark after acting on the result.",
-    {
+    { description: "Check whether any of the given memory IDs have been modified by another agent since you last refreshed your view. Returns stale ones with the change action and timestamp. Call update_read_watermark after acting on the result.",
+    inputSchema: z.object({
       agent_name: z.string().describe("Your agent identity (wren, iris, atlas, volt, hermes, lumen)"),
       memory_ids: z.array(z.string()).describe("UUIDs of memories you intend to rely on"),
-    },
+    }) },
     async ({ agent_name, memory_ids }) => {
       if (!memory_ids?.length) {
         return { content: [{ type: "text" as const, text: "No memory_ids provided." }] };
@@ -2755,12 +2755,12 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: update_read_watermark ─────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "update_read_watermark",
-    "Bump your agent's last_seen_at watermark to now. Call this after you have processed a recall and any stale-context warnings, so future stale-checks compare against this moment.",
-    {
+    { description: "Bump your agent's last_seen_at watermark to now. Call this after you have processed a recall and any stale-context warnings, so future stale-checks compare against this moment.",
+    inputSchema: z.object({
       agent_name: z.string().describe("Your agent identity"),
-    },
+    }) },
     async ({ agent_name }) => {
       const { data, error } = await supabase.rpc("update_read_watermark", { p_agent_name: agent_name });
       if (error) return { content: [{ type: "text" as const, text: `Error: ${error.message}` }] };
@@ -2770,17 +2770,17 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
 
   // ── Tool: remember_file ─────────────────────────────────────────────────────
   if (r2) {
-    server.tool(
+    server.registerTool(
       "remember_file",
-      "Upload a file (image, config, doc, etc.) to persistent storage and link it to a memory. Pass file content as base64.",
-      {
+      { description: "Upload a file (image, config, doc, etc.) to persistent storage and link it to a memory. Pass file content as base64.",
+      inputSchema: z.object({
         filename: z.string().describe("Original filename with extension (e.g. network-diagram.png)"),
         content_base64: z.string().describe("File content encoded as base64"),
         content_type: z.string().optional().describe("MIME type (e.g. image/png, application/pdf). Auto-detected from extension if omitted."),
         memory_name: z.string().optional().describe("Link to an existing memory by name"),
         description: z.string().optional().describe("What this file is — used for searching later"),
         tags: z.array(z.string()).optional().describe("Tags for categorization"),
-      },
+      }) },
       async ({ filename, content_base64, content_type, memory_name, description, tags }) => {
         const mimeMap: Record<string, string> = {
           png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
@@ -2841,15 +2841,15 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
     );
 
     // ── Tool: recall_file ───────────────────────────────────────────────────────
-    server.tool(
+    server.registerTool(
       "recall_file",
-      "Get a download URL for a stored file, or list stored files. URLs are presigned and valid for 1 hour.",
-      {
+      { description: "Get a download URL for a stored file, or list stored files. URLs are presigned and valid for 1 hour.",
+      inputSchema: z.object({
         filename: z.string().optional().describe("Search by filename (partial match)"),
         memory_name: z.string().optional().describe("Get files linked to a memory"),
         tags: z.array(z.string()).optional().describe("Filter by tags"),
         list_only: z.boolean().optional().describe("Just list files without generating URLs (default false)"),
-      },
+      }) },
       async ({ filename, memory_name, tags, list_only }) => {
         let q = supabase
           .from("memory_files")
@@ -2898,12 +2898,12 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
     );
 
     // ── Tool: forget_file ───────────────────────────────────────────────────────
-    server.tool(
+    server.registerTool(
       "forget_file",
-      "Delete a stored file from R2 and its database record.",
-      {
+      { description: "Delete a stored file from R2 and its database record.",
+      inputSchema: z.object({
         filename: z.string().describe("Exact filename to delete"),
-      },
+      }) },
       async ({ filename }) => {
         const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "forget_file");
         if (denied) return denied;
@@ -2932,14 +2932,14 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
     // ── Tool: store_file ─────────────────────────────────────────────────────
     // Large-object convention: use this instead of embedding content in Supabase
     // when the payload exceeds ~8KB. Key format: agent/YYYY-MM-DD/name.md
-    server.tool(
+    server.registerTool(
       "store_file",
-      "Write text content directly to R2 by key — no Supabase record. Use this for large payloads (>8KB) that would bloat memory storage. Key format: agent/YYYY-MM-DD/descriptive-name.md",
-      {
+      { description: "Write text content directly to R2 by key — no Supabase record. Use this for large payloads (>8KB) that would bloat memory storage. Key format: agent/YYYY-MM-DD/descriptive-name.md",
+      inputSchema: z.object({
         key: z.string().describe("R2 object key, e.g. 'wren/2026-03-26/research-notes.md'"),
         content: z.string().describe("Text content to store"),
         content_type: z.string().optional().describe("MIME type (default: text/plain for .txt, text/markdown for .md)"),
-      },
+      }) },
       async ({ key, content, content_type }) => {
         const ext = key.split(".").pop()?.toLowerCase() || "";
         const mime = content_type || (ext === "md" ? "text/markdown" : ext === "json" ? "application/json" : "text/plain");
@@ -2962,12 +2962,12 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
     );
 
     // ── Tool: get_file ───────────────────────────────────────────────────────
-    server.tool(
+    server.registerTool(
       "get_file",
-      "Read text content from R2 by key. Companion to store_file for large-object retrieval. Returns the raw text content.",
-      {
+      { description: "Read text content from R2 by key. Companion to store_file for large-object retrieval. Returns the raw text content.",
+      inputSchema: z.object({
         key: z.string().describe("R2 object key to retrieve, e.g. 'wren/2026-03-26/research-notes.md'"),
-      },
+      }) },
       async ({ key }) => {
         try {
           const response = await r2!.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }));
@@ -2982,10 +2982,10 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   }
 
   // ── Tool: save_skill ────────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "save_skill",
-    "Save a skill — procedural knowledge about how to accomplish a specific type of task. Call this after completing a complex task (5+ steps) to capture the approach for future sessions.",
-    {
+    { description: "Save a skill — procedural knowledge about how to accomplish a specific type of task. Call this after completing a complex task (5+ steps) to capture the approach for future sessions.",
+    inputSchema: z.object({
       name: z.string().describe("Short slug, e.g. 'deploy-podman-compose-service'"),
       title: z.string().describe("Human-readable title, e.g. 'Deploy a Podman Compose Service'"),
       description: z.string().describe("One-line summary shown in skill index — when to use this skill"),
@@ -2993,7 +2993,7 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
       triggers: z.array(z.string()).optional().describe("Phrases that indicate this skill applies, e.g. ['deploy service', 'podman compose']"),
       platforms: z.array(z.string()).optional().describe("Platforms this applies to, e.g. ['linux', 'podman', 'svc-podman-01']"),
       source: z.string().optional().describe("Source interface (default: claude-code)"),
-    },
+    }) },
     async ({ name, title, description, content, triggers, platforms, source }) => {
       // Security gate
       for (const [field, value] of [["name", name], ["title", title], ["description", description], ["content", content]] as Array<[string, string]>) {
@@ -3038,10 +3038,10 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   // ── Tool: record_task_completion ─────────────────────────────────────────────
   // Rec 2: Post-task skill auto-capture hook. Call at the end of any multi-step task.
   // If tool_count >= 5, auto-generates a skill draft and saves it to the skills table.
-  server.tool(
+  server.registerTool(
     "record_task_completion",
-    "Record a completed task for procedural memory capture. If tool_count >= 5, automatically extracts and saves a reusable skill to the skills table. Call this at the end of any complex multi-step task.",
-    {
+    { description: "Record a completed task for procedural memory capture. If tool_count >= 5, automatically extracts and saves a reusable skill to the skills table. Call this at the end of any complex multi-step task.",
+    inputSchema: z.object({
       task_summary: z.string().describe("Brief description of what was accomplished"),
       tool_count: z.number().int().min(0).describe("Number of tool calls made during this task"),
       steps: z.array(z.string()).optional().describe("Key steps taken (ordered) — used to generate skill content"),
@@ -3049,7 +3049,7 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
       skill_name: z.string().optional().describe("Override auto-generated skill name slug (kebab-case)"),
       success: z.boolean().optional().describe("Whether the task succeeded (true) or failed (false). Increments success_count/fail_count on the named skill if provided."),
       outcome_note: z.string().optional().describe("Short note on the outcome — stored as skills.last_outcome for the named skill"),
-    },
+    }) },
     async ({ task_summary, tool_count, steps, agent_id, skill_name, success, outcome_note }) => {
       const src = callerIdentity || agent_id || "claude-code";
 
@@ -3243,14 +3243,14 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   }
 
   // ── Tool: recall_skill ───────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "recall_skill",
-    "Find a skill by semantic search or name. Returns full content of matching skills.",
-    {
+    { description: "Find a skill by semantic search or name. Returns full content of matching skills.",
+    inputSchema: z.object({
       query: z.string().optional().describe("What you're trying to do — semantic search"),
       name: z.string().optional().describe("Exact skill name to retrieve"),
       limit: z.number().optional().describe("Max results (default 3)"),
-    },
+    }) },
     async ({ query, name, limit }) => {
       const maxResults = limit || 3;
 
@@ -3293,10 +3293,10 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: list_skills ────────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "list_skills",
-    "List all saved skills with their names and descriptions. Quick index of what procedural knowledge is available.",
-    {},
+    { description: "List all saved skills with their names and descriptions. Quick index of what procedural knowledge is available.",
+    inputSchema: z.object({}) },
     async () => {
       const { data, error } = await supabase.from("skills")
         .select("name, title, description, triggers, use_count, updated_at")
@@ -3311,12 +3311,12 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: delete_skill ───────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "delete_skill",
-    "Delete a skill by name when it's outdated or replaced by a better approach.",
-    {
+    { description: "Delete a skill by name when it's outdated or replaced by a better approach.",
+    inputSchema: z.object({
       name: z.string().describe("Exact skill name to delete"),
-    },
+    }) },
     async ({ name }) => {
       const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "delete_skill");
       if (denied) return denied;
@@ -3328,10 +3328,10 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: list_conflicts ────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "list_conflicts",
-    "List unresolved memory conflicts — memories that may contradict each other. Review and resolve manually.",
-    { resolved: z.boolean().optional().describe("If true, show resolved conflicts too (default: unresolved only)") },
+    { description: "List unresolved memory conflicts — memories that may contradict each other. Review and resolve manually.",
+    inputSchema: z.object({ resolved: z.boolean().optional().describe("If true, show resolved conflicts too (default: unresolved only)") }) },
     async ({ resolved }) => {
       const q = supabase
         .from("memory_conflicts")
@@ -3358,13 +3358,13 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: find_duplicates ────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "find_duplicates",
-    "Find near-duplicate memories by cosine similarity. Use this to identify redundant memories that could be merged.",
-    {
+    { description: "Find near-duplicate memories by cosine similarity. Use this to identify redundant memories that could be merged.",
+    inputSchema: z.object({
       threshold: z.number().optional().describe("Similarity threshold 0-1 (default 0.90 — very similar)"),
       limit: z.number().optional().describe("Max pairs to return (default 20)"),
-    },
+    }) },
     async ({ threshold = 0.90, limit = 20 }) => {
       const { data, error } = await supabase.rpc("find_duplicate_memories", {
         similarity_threshold: threshold,
@@ -3383,14 +3383,14 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: merge_memories ─────────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "merge_memories",
-    "Merge two memories — keep the primary, absorb tags from secondary, redirect all links, delete secondary. Use after find_duplicates.",
-    {
+    { description: "Merge two memories — keep the primary, absorb tags from secondary, redirect all links, delete secondary. Use after find_duplicates.",
+    inputSchema: z.object({
       primary_name: z.string().describe("Name of the memory to keep"),
       secondary_name: z.string().describe("Name of the memory to absorb and delete"),
       merged_content: z.string().optional().describe("Replacement content for the primary memory after merge. If omitted, primary content is unchanged."),
-    },
+    }) },
     async ({ primary_name, secondary_name, merged_content }) => {
       const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "merge_memories");
       if (denied) return denied;
@@ -3439,13 +3439,13 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: update_memory_verified ─────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "update_memory_verified",
-    "Stamp verified_at=now() on a memory after re-reading it and confirming the content is still accurate. Resets the verification clock used by the weekly audit of high-recall memories. Pass either memory_id (UUID) or name.",
-    {
+    { description: "Stamp verified_at=now() on a memory after re-reading it and confirming the content is still accurate. Resets the verification clock used by the weekly audit of high-recall memories. Pass either memory_id (UUID) or name.",
+    inputSchema: z.object({
       memory_id: z.string().optional().describe("UUID of the memory to mark verified"),
       name: z.string().optional().describe("Exact memory name (used if memory_id not provided)"),
-    },
+    }) },
     async ({ memory_id, name }) => {
       let id = memory_id;
       let resolvedName = name || memory_id;
@@ -3469,14 +3469,14 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: discard_redundant ──────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "discard_redundant",
-    "Find near-duplicate memories (cosine similarity > threshold) and delete the lower-quality one from each pair. Quality = importance_score*0.5 + recall_factor*0.3 + access_factor*0.2. Use dry_run=true to preview without deleting. Implements AgeMem selective discard to prevent memory blindness.",
-    {
+    { description: "Find near-duplicate memories (cosine similarity > threshold) and delete the lower-quality one from each pair. Quality = importance_score*0.5 + recall_factor*0.3 + access_factor*0.2. Use dry_run=true to preview without deleting. Implements AgeMem selective discard to prevent memory blindness.",
+    inputSchema: z.object({
       threshold: z.number().optional().describe("Cosine similarity threshold (default 0.92 — very high overlap). Lower = more aggressive pruning."),
       max_discards: z.number().optional().describe("Max memories to discard in one call (default 10)"),
       dry_run: z.boolean().optional().describe("Preview what would be discarded without deleting (default false)"),
-    },
+    }) },
     async ({ threshold = 0.92, max_discards = 10, dry_run = false }) => {
       const denied = scopeDenied(caller, AIP_SCOPE_ADMIN, "discard_redundant");
       if (denied) return denied;
@@ -3500,14 +3500,14 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: list_stale_memories ────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "list_stale_memories",
-    "Find memories that haven't been accessed recently, have low use counts, and no outgoing links. Candidates for review or deletion.",
-    {
+    { description: "Find memories that haven't been accessed recently, have low use counts, and no outgoing links. Candidates for review or deletion.",
+    inputSchema: z.object({
       days_inactive: z.number().optional().describe("Inactivity threshold in days (default 60)"),
       max_uses: z.number().optional().describe("Max access_count to consider stale (default 1)"),
       limit: z.number().optional().describe("Max results (default 20)"),
-    },
+    }) },
     async ({ days_inactive = 60, max_uses = 1, limit = 20 }) => {
       const { data, error } = await supabase.rpc("find_stale_memories", {
         days_inactive,
@@ -3529,13 +3529,13 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: get_memory_block ───────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "get_memory_block",
-    "Read a named memory block for a specific agent. Used for cross-agent whisper channel (e.g. guidance, pending_items, project_context).",
-    {
+    { description: "Read a named memory block for a specific agent. Used for cross-agent whisper channel (e.g. guidance, pending_items, project_context).",
+    inputSchema: z.object({
       agent: z.string().describe("Agent name, e.g. 'wren', 'iris'"),
       block_name: z.string().describe("Block name: guidance, user_prefs, project_context, session_patterns, pending_items, active_task"),
-    },
+    }) },
     async ({ agent, block_name }) => {
       const { data, error } = await supabase
         .from("memory_blocks")
@@ -3555,15 +3555,15 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: set_memory_block ───────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "set_memory_block",
-    "Upsert a named memory block for a specific agent. Use this for the cross-agent whisper channel — write to another agent's guidance or pending_items block.",
-    {
+    { description: "Upsert a named memory block for a specific agent. Use this for the cross-agent whisper channel — write to another agent's guidance or pending_items block.",
+    inputSchema: z.object({
       agent: z.string().describe("Agent name, e.g. 'wren', 'iris'"),
       block_name: z.string().describe("Block name: guidance, user_prefs, project_context, session_patterns, pending_items, active_task"),
       content: z.string().describe("Full content to store in the block"),
       updated_by: z.string().optional().describe("Who is writing (default: caller identity)"),
-    },
+    }) },
     async ({ agent, block_name, content, updated_by }) => {
       const threat = scanContent(content);
       if (threat) {
@@ -3613,13 +3613,13 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
     };
 
     // ── Tool: ha_get_states ────────────────────────────────────────────────────
-    server.tool(
+    server.registerTool(
       "ha_get_states",
-      "Get Home Assistant entity states. Optionally filter by domain (light, switch, climate, sensor, etc.) or entity_id prefix.",
-      {
+      { description: "Get Home Assistant entity states. Optionally filter by domain (light, switch, climate, sensor, etc.) or entity_id prefix.",
+      inputSchema: z.object({
         domain: z.string().optional().describe("Filter by domain: light, switch, climate, sensor, binary_sensor, media_player, person, device_tracker, etc."),
         search: z.string().optional().describe("Filter by entity_id substring or friendly_name"),
-      },
+      }) },
       async ({ domain, search }) => {
         const states = await haFetch("/states") as Array<{ entity_id: string; state: string; attributes: Record<string, unknown> }>;
         let filtered = states;
@@ -3644,15 +3644,15 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
     );
 
     // ── Tool: ha_call_service ──────────────────────────────────────────────────
-    server.tool(
+    server.registerTool(
       "ha_call_service",
-      "Call a Home Assistant service to control devices. Examples: turn on/off lights, set climate, trigger automations.",
-      {
+      { description: "Call a Home Assistant service to control devices. Examples: turn on/off lights, set climate, trigger automations.",
+      inputSchema: z.object({
         domain: z.string().describe("Service domain: light, switch, climate, automation, script, media_player, etc."),
         service: z.string().describe("Service name: turn_on, turn_off, toggle, set_temperature, trigger, etc."),
         entity_id: z.string().optional().describe("Target entity ID, or comma-separated list. Omit for services that don't need one."),
-        data: z.record(z.unknown()).optional().describe("Additional service data (e.g. temperature, brightness, hvac_mode)"),
-      },
+        data: z.record(z.string(), z.unknown()).optional().describe("Additional service data (e.g. temperature, brightness, hvac_mode)"),
+      }) },
       async ({ domain, service, entity_id, data }) => {
         const denied = scopeDenied(caller, AIP_SCOPE_HA, "ha_call_service");
         if (denied) return denied;
@@ -3665,13 +3665,13 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
     );
 
     // ── Tool: ha_get_history ───────────────────────────────────────────────────
-    server.tool(
+    server.registerTool(
       "ha_get_history",
-      "Get state history for a Home Assistant entity over the past N hours.",
-      {
+      { description: "Get state history for a Home Assistant entity over the past N hours.",
+      inputSchema: z.object({
         entity_id: z.string().describe("Entity ID to get history for"),
         hours: z.number().optional().describe("Hours of history to fetch (default 24, max 168)"),
-      },
+      }) },
       async ({ entity_id, hours = 24 }) => {
         const start = new Date(Date.now() - hours * 3600 * 1000).toISOString();
         const data = await haFetch(`/history/period/${start}?filter_entity_id=${entity_id}`) as Array<Array<{ state: string; last_changed: string }>>;
@@ -3687,10 +3687,10 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   }
 
   // ── Tool: record_episode ───────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "record_episode",
-    "Record or update an agent episode (task execution log). Captures input, actions, outcome, and learnings for episodic self-improvement (MemRL/CoALA pattern).",
-    {
+    { description: "Record or update an agent episode (task execution log). Captures input, actions, outcome, and learnings for episodic self-improvement (MemRL/CoALA pattern).",
+    inputSchema: z.object({
       agent: z.string().describe("Agent name: wren, iris, atlas, volt"),
       task_id: z.string().uuid().optional().describe("task_queue UUID this episode corresponds to"),
       status: z.enum(["in_progress", "completed", "failed", "partial"]).optional().describe("Episode status (default: in_progress)"),
@@ -3701,7 +3701,7 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
       learnings: z.string().optional().describe("Key takeaways for future runs — what to do differently"),
       memories_consulted: z.array(z.string().uuid()).optional().describe("UUIDs of memories recalled during this episode"),
       episode_id: z.string().uuid().optional().describe("Existing episode ID to update (omit to create new)"),
-    },
+    }) },
     async ({ agent, task_id, status, summary, input_summary, actions, outcome, learnings, memories_consulted, episode_id }) => {
       // Security gate (OWASP ASI06). Episodes are embedded and readable by every
       // agent through recall_episodes, and episodic_distill.py promotes them into
@@ -3778,16 +3778,16 @@ function createMcpServer(caller: AipCaller | null = null): McpServer {
   );
 
   // ── Tool: recall_episodes ──────────────────────────────────────────────────
-  server.tool(
+  server.registerTool(
     "recall_episodes",
-    "Recall agent episodes to learn from past task outcomes. Pass a query for semantic search (MemRL pattern — 'what happened last time I did X?'), or use agent/status filters for recency-ordered results. Call at task start to pull similar prior runs with their outcomes and learnings.",
-    {
+    { description: "Recall agent episodes to learn from past task outcomes. Pass a query for semantic search (MemRL pattern — 'what happened last time I did X?'), or use agent/status filters for recency-ordered results. Call at task start to pull similar prior runs with their outcomes and learnings.",
+    inputSchema: z.object({
       query: z.string().optional().describe("Semantic search over episode summaries/outcomes/learnings — describe the task you're about to do. Omit for recency-ordered listing."),
       agent: z.string().optional().describe("Filter by agent name"),
       status: z.enum(["in_progress", "completed", "failed", "partial"]).optional().describe("Filter by status"),
       limit: z.number().optional().describe("Max episodes to return (default 5)"),
       with_learnings_only: z.boolean().optional().describe("Only return episodes that have learnings captured"),
-    },
+    }) },
     async ({ query, agent, status, limit, with_learnings_only }) => {
       let data: any[] | null = null;
       let semantic = false;
@@ -3853,7 +3853,7 @@ app.use((req: Request, res: Response, next: () => void) => {
   if (origin.startsWith("chrome-extension://") || origin.startsWith("moz-extension://") || origin.startsWith("http://localhost") || origin.startsWith("http://127.0.0.1")) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, mcp-session-id, Authorization");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, mcp-session-id, Authorization, MCP-Protocol-Version, Mcp-Method");
     res.setHeader("Access-Control-Expose-Headers", "mcp-session-id");
   }
   if (req.method === "OPTIONS") {
@@ -3876,13 +3876,28 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", service: "memory-mcp-server", version: SERVER_VERSION, tools: toolCount, r2: r2Enabled, ha: haEnabled, aip: !!AIP_SECRET });
 });
 
-// Map to store transports and their servers by session ID
-const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
+// Map to store transports and their servers by session ID (2025-era clients only)
+const sessions = new Map<string, { transport: NodeStreamableHTTPServerTransport; server: McpServer }>();
 
-app.post("/mcp", async (req: Request, res: Response) => {
+// AIP caller rides the request as the SDK's pass-through authInfo, so the
+// modern (2026-07-28) leg — which builds a fresh server per request and so has
+// no session to pin a caller to — re-derives attribution on every request.
+function aipAuthInfo(caller: AipCaller, token: string) {
+  return { token, clientId: caller.sub, scopes: caller.scopes ?? [], extra: { aipCaller: caller } };
+}
+
+// Modern leg: per-request instance from the same factory (v2 ALREADY_CONNECTED
+// rule — an McpServer can never be reused across requests). Legacy traffic is
+// routed in user land below so 2025 clients keep their sessions.
+const modernHandler = createMcpHandler(
+  ({ authInfo }) => createMcpServer((authInfo?.extra?.aipCaller as AipCaller | undefined) ?? null),
+  { legacy: "reject", onerror: (err) => console.warn("[mcp] modern leg:", err.message) }
+);
+const modernNode = toNodeHandler(modernHandler);
+
+app.post("/mcp", express.json({ limit: "4mb" }), async (req: Request, res: Response) => {
   // AIP: extract and verify caller-identity JWT from Authorization header.
-  // Scopes are pinned at session establishment, not re-checked per request —
-  // a token that expires mid-session keeps the session it opened.
+  // Legacy sessions pin scopes at establishment; modern requests verify per request.
   let caller: AipCaller | null = null;
   const authHeader = req.headers.authorization || "";
   if (authHeader.startsWith("Bearer ") && AIP_SECRET) {
@@ -3899,25 +3914,31 @@ app.post("/mcp", async (req: Request, res: Response) => {
   if (sessionId) {
     const entry = sessions.get(sessionId);
     if (!entry) return sessionNotFound(res);
-    await entry.transport.handleRequest(req, res);
+    await entry.transport.handleRequest(req, res, req.body);
     return;
   }
 
-  // New session — new server instance with verified caller identity bound
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
+  if (!(await isLegacyRequest(await toWebRequest(req, req.body), req.body))) {
+    (req as any).auth = caller ? aipAuthInfo(caller, authHeader.slice(7)) : undefined;
+    await modernNode(req, res, req.body);
+    return;
+  }
+
+  // New legacy session — new server instance with verified caller identity bound
+  const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
   const server = createMcpServer(caller);
   if (!cachedToolCount) cachedToolCount = getToolCount(server);
 
   transport.onclose = () => {
-    const sid = (transport as any).sessionId;
+    const sid = transport.sessionId;
     if (sid) sessions.delete(sid);
   };
 
   await server.connect(transport);
-  await transport.handleRequest(req, res);
+  await transport.handleRequest(req, res, req.body);
 
   // Session ID is set during handleRequest, so store after
-  const sid = (transport as any).sessionId;
+  const sid = transport.sessionId;
   if (sid) sessions.set(sid, { transport, server });
 });
 
