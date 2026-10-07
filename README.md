@@ -29,7 +29,6 @@ azlab/
 │   ├── lldap/            # LLDAP directory (LDAP :3890, Web UI :17170)
 │   ├── webtop/           # Linuxserver Webtop
 │   ├── rustdesk/         # RustDesk relay server
-│   ├── changedetect/     # Change detection monitoring
 │   ├── drydock/          # DryDock container monitor
 │   ├── gmail-mcp-server/ # Gmail MCP server
 │   └── website/          # Landing page (Astro + Caddy, www.az-lab.dev)
@@ -81,7 +80,7 @@ Services run as systemd user units under `almty1` (linger enabled).
 - `WorkingDirectory=%h/%i` — resolves to `~/servicename`
 - Mono repo services use drop-in overrides (since `%i` can't handle `/` in paths)
 
-**Overrides exist for:** traefik, cf-ddns, authelia, rustdesk, monitoring, changedetect, lldap, website, drydock
+**Overrides exist for:** traefik, cf-ddns, authelia, rustdesk, monitoring, lldap, website, drydock
 
 ```bash
 # Start a service
